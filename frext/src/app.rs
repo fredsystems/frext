@@ -1,9 +1,11 @@
 //! The frext eframe application: tab bar, editor surface, and the wiring
 //! that keeps swap files and the session index up to date.
 
+use std::path::{Path, PathBuf};
+
 use eframe::egui;
 
-use crate::{persistence::Store, tab::Tab};
+use crate::{persistence::Store, tab::Tab, workspace::Workspace};
 
 /// The top-level application state.
 pub struct FrextApp {
@@ -11,13 +13,15 @@ pub struct FrextApp {
     tabs: Vec<Tab>,
     active: usize,
     next_id: u64,
+    /// The sidebar workspace (root directory + expanded folders), if open.
+    workspace: Option<Workspace>,
 }
 
 impl FrextApp {
     /// Build the app, restoring the previous session from the store.
     #[must_use]
     pub fn new(store: Store) -> Self {
-        Self::with_files(store, &[])
+        Self::with_args(store, &[], None)
     }
 
     /// Build the app, restoring the previous session and then opening any
@@ -25,11 +29,27 @@ impl FrextApp {
     /// restored session is focused rather than opened a second time; the
     /// last successfully opened file becomes the active tab.
     #[must_use]
-    pub fn with_files(store: Store, files: &[std::path::PathBuf]) -> Self {
-        let (mut tabs, active, mut next_id) = store.load().unwrap_or_else(|err| {
+    pub fn with_files(store: Store, files: &[PathBuf]) -> Self {
+        Self::with_args(store, files, None)
+    }
+
+    /// Build the app, restoring the previous session, opening any command
+    /// line `files`, and optionally setting the sidebar workspace to `dir`.
+    ///
+    /// A `dir` passed on the command line replaces any restored workspace
+    /// root (but keeps the previously-expanded folder set when the root is
+    /// unchanged).
+    #[must_use]
+    pub fn with_args(store: Store, files: &[PathBuf], dir: Option<&Path>) -> Self {
+        let restored = store.load().unwrap_or_else(|err| {
             log::error!("failed to load session, starting fresh: {err}");
-            (Vec::new(), 0, 0)
+            crate::persistence::RestoredSession::default()
         });
+
+        let mut tabs = restored.tabs;
+        let active = restored.active;
+        let mut next_id = restored.next_id;
+        let mut workspace = restored.workspace;
 
         // Always guarantee at least one tab to edit.
         if tabs.is_empty() {
@@ -37,17 +57,29 @@ impl FrextApp {
             next_id += 1;
         }
 
+        // A directory argument sets / replaces the workspace root. If it
+        // matches the restored root, keep the expanded set; otherwise start
+        // fresh.
+        if let Some(dir) = dir {
+            let dir = dir.to_path_buf();
+            match workspace.as_ref() {
+                Some(ws) if ws.root == dir => {}
+                _ => workspace = Some(Workspace::new(dir)),
+            }
+        }
+
         let mut app = Self {
             store,
             tabs,
             active,
             next_id,
+            workspace,
         };
 
         for file in files {
             app.open_path(file);
         }
-        if !files.is_empty() {
+        if !files.is_empty() || dir.is_some() {
             app.persist_session();
         }
 
@@ -102,10 +134,12 @@ impl FrextApp {
     /// Persist the session index, logging (but not propagating) failures so
     /// a transient write error never crashes the editor.
     fn persist_session(&self) {
-        if let Err(err) = self
-            .store
-            .save_session(&self.tabs, self.active, self.next_id)
-        {
+        if let Err(err) = self.store.save_session(
+            &self.tabs,
+            self.active,
+            self.next_id,
+            self.workspace.as_ref(),
+        ) {
             log::error!("failed to save session index: {err}");
         }
     }
@@ -187,12 +221,77 @@ impl FrextApp {
         }
         self.persist_session();
     }
+
+    /// Render the contents of one directory in the file tree.
+    ///
+    /// Sub-directories are shown as collapsible headers whose open/closed
+    /// state is driven by (and recorded back into) the workspace's expanded
+    /// set via `expand_changes`. Files are clickable; a click records the
+    /// path in `file_to_open`. The directory contents are read lazily, so a
+    /// large tree only costs what the user expands.
+    fn tree_dir(
+        ui: &mut egui::Ui,
+        ws: &Workspace,
+        dir: &Path,
+        active_canonical: Option<&Path>,
+        file_to_open: &mut Option<PathBuf>,
+        expand_changes: &mut Vec<(PathBuf, bool)>,
+    ) {
+        let (dirs, files) = crate::workspace::read_dir_split(dir);
+
+        for sub in dirs {
+            let name = sub
+                .file_name()
+                .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+            let was_open = ws.is_expanded(&sub);
+
+            // `default_open` seeds the header's state from the persisted
+            // expanded set on first sight; thereafter egui owns the live
+            // open/closed state and a header click toggles it. We mirror
+            // each toggle back into the workspace via `expand_changes`.
+            let response = egui::CollapsingHeader::new(name)
+                .id_salt(&sub)
+                .default_open(was_open)
+                .show(ui, |ui| {
+                    Self::tree_dir(ui, ws, &sub, active_canonical, file_to_open, expand_changes);
+                });
+
+            if response.header_response.clicked() {
+                expand_changes.push((sub.clone(), !was_open));
+            }
+        }
+
+        for file in files {
+            let name = file
+                .file_name()
+                .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+
+            // Highlight the file backing the active tab.
+            let is_active = active_canonical
+                .is_some_and(|active| file.canonicalize().ok().as_deref() == Some(active));
+
+            if ui.selectable_label(is_active, name).clicked() {
+                *file_to_open = Some(file);
+            }
+        }
+    }
 }
 
 impl eframe::App for FrextApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         let mut action = MenuAction::None;
+
+        // Pick up external modifications to the active tab's file (detected
+        // by a change in on-disk size). A clean buffer is reloaded; a dirty
+        // one is left untouched. Keeping the swap file and session index in
+        // step after a reload preserves crash-safety.
+        if let Some(tab) = self.tabs.get_mut(self.active) {
+            if tab.reload_if_changed_on_disk() {
+                self.persist_active_swap();
+                self.persist_session();
+            }
+        }
 
         // Keyboard shortcuts.
         ctx.input_mut(|i| {
@@ -266,18 +365,85 @@ impl eframe::App for FrextApp {
             });
         });
 
+        // Left sidebar: file tree for the open workspace, if any.
+        if self.workspace.is_some() {
+            let mut file_to_open: Option<PathBuf> = None;
+            let mut expand_changes: Vec<(PathBuf, bool)> = Vec::new();
+
+            // The active tab's file, so the tree can highlight it. Compared
+            // canonicalised so a relative tree path matches an absolute tab
+            // path (and vice versa).
+            let active_path = self.tabs.get(self.active).and_then(|tab| tab.path.clone());
+            let active_canonical = active_path.as_ref().and_then(|p| p.canonicalize().ok());
+
+            // Match the sidebar fill to the central panel so the two panes
+            // share one background colour.
+            let panel_frame =
+                egui::Frame::side_top_panel(ui.style()).fill(ui.style().visuals.panel_fill);
+
+            egui::Panel::left("frext_file_tree")
+                .resizable(true)
+                .frame(panel_frame)
+                .show(ui, |ui| {
+                    // `workspace` is Some by the guard above.
+                    if let Some(ws) = self.workspace.as_ref() {
+                        let root = ws.root.clone();
+                        let root_label = root.file_name().map_or_else(
+                            || root.display().to_string(),
+                            |n| n.to_string_lossy().into_owned(),
+                        );
+                        ui.horizontal(|ui| {
+                            ui.strong(root_label);
+                        });
+                        ui.separator();
+                        egui::ScrollArea::vertical().show(ui, |ui| {
+                            Self::tree_dir(
+                                ui,
+                                ws,
+                                &root,
+                                active_canonical.as_deref(),
+                                &mut file_to_open,
+                                &mut expand_changes,
+                            );
+                        });
+                    }
+                });
+
+            for (dir, expanded) in expand_changes {
+                if let Some(ws) = self.workspace.as_mut() {
+                    if ws.set_expanded(&dir, expanded) {
+                        self.persist_session();
+                    }
+                }
+            }
+            if let Some(path) = file_to_open {
+                if self.open_path(&path) {
+                    self.persist_session();
+                }
+            }
+        }
+
         egui::CentralPanel::default().show(ui, |ui| {
             if let Some(tab) = self.tabs.get_mut(self.active) {
                 let language = crate::highlight::language_from_path(tab.path.as_deref());
                 let mut layouter = crate::highlight::layouter(&ctx, &language);
 
-                let response = ui.add_sized(
-                    ui.available_size(),
-                    egui::TextEdit::multiline(&mut tab.text)
-                        .code_editor()
-                        .desired_width(f32::INFINITY)
-                        .layouter(&mut layouter),
-                );
+                // The editor must be wrapped in a ScrollArea: a bare
+                // `add_sized(available_size, ...)` clamps the TextEdit to the
+                // viewport, so content past the bottom is clipped and cannot
+                // be scrolled to. Letting the TextEdit grow to its natural
+                // height inside a scroll area is what makes scrolling work.
+                let response = egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        ui.add(
+                            egui::TextEdit::multiline(&mut tab.text)
+                                .code_editor()
+                                .desired_width(f32::INFINITY)
+                                .layouter(&mut layouter),
+                        )
+                    })
+                    .inner;
 
                 if response.changed() {
                     self.persist_active_swap();
@@ -426,11 +592,36 @@ mod tests {
 
         // A fresh store at the same root must see the opened file restored.
         let store = Store::at(dir.join("state")).unwrap();
-        let (tabs, _active, _next_id) = store.load().unwrap();
+        let restored = store.load().unwrap();
         assert!(
-            tabs.iter()
+            restored
+                .tabs
+                .iter()
                 .any(|tab| tab.path.as_deref() == Some(file.as_path()))
         );
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn directory_argument_opens_a_workspace_and_persists_it() {
+        let dir = temp_dir("ws-arg");
+        let project = dir.join("project");
+        fs::create_dir_all(&project).unwrap();
+
+        {
+            let store = Store::at(dir.join("state")).unwrap();
+            let app = FrextApp::with_args(store, &[], Some(project.as_path()));
+            assert_eq!(
+                app.workspace.as_ref().map(|ws| ws.root.clone()),
+                Some(project.clone())
+            );
+        }
+
+        // The workspace root must survive into the next launch.
+        let store = Store::at(dir.join("state")).unwrap();
+        let restored = store.load().unwrap();
+        assert_eq!(restored.workspace.map(|ws| ws.root), Some(project.clone()));
 
         fs::remove_dir_all(&dir).unwrap();
     }

@@ -21,7 +21,7 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
-use crate::{error::PersistenceError, tab::Tab};
+use crate::{error::PersistenceError, tab::Tab, workspace::Workspace};
 
 /// One entry in the persisted session index.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -44,6 +44,25 @@ pub struct Session {
     pub active: usize,
     /// The next tab id to hand out, so ids stay unique across sessions.
     pub next_id: u64,
+    /// The sidebar workspace (root directory + expanded folders), if one is
+    /// open. `#[serde(default)]` keeps sessions written before this field
+    /// existed loadable.
+    #[serde(default)]
+    pub workspace: Option<Workspace>,
+}
+
+/// The fully-restored session handed back by [`Store::load`]: the live tabs
+/// plus the surrounding editor state.
+#[derive(Debug, Clone, Default)]
+pub struct RestoredSession {
+    /// Tabs in display order, with their buffer contents loaded from swap.
+    pub tabs: Vec<Tab>,
+    /// Index of the active tab.
+    pub active: usize,
+    /// The next unique tab id to hand out.
+    pub next_id: u64,
+    /// The sidebar workspace, if one was open.
+    pub workspace: Option<Workspace>,
 }
 
 /// Owns the on-disk paths used for persistence.
@@ -95,18 +114,18 @@ impl Store {
     /// Load the previous session, restoring each tab's content from its
     /// swap file. Tabs whose swap file is missing are skipped.
     ///
-    /// Returns an empty vector (and `active = 0`, `next_id = 0`) when no
-    /// session exists yet.
+    /// Returns a default (empty) [`RestoredSession`] when no session exists
+    /// yet.
     ///
     /// # Errors
     ///
     /// Returns [`PersistenceError`] on I/O or deserialization failure.
-    pub fn load(&self) -> Result<(Vec<Tab>, usize, u64), PersistenceError> {
+    pub fn load(&self) -> Result<RestoredSession, PersistenceError> {
         let session_path = self.session_path();
         let raw = match fs::read_to_string(&session_path) {
             Ok(raw) => raw,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                return Ok((Vec::new(), 0, 0));
+                return Ok(RestoredSession::default());
             }
             Err(source) => {
                 return Err(PersistenceError::Io {
@@ -132,11 +151,18 @@ impl Store {
                 path: record.path.clone(),
                 text,
                 saved_text: record.saved_text.clone(),
+                // Recomputed lazily on the first external-change check.
+                disk_len: None,
             });
         }
 
         let active = session.active.min(tabs.len().saturating_sub(1));
-        Ok((tabs, active, session.next_id))
+        Ok(RestoredSession {
+            tabs,
+            active,
+            next_id: session.next_id,
+            workspace: session.workspace,
+        })
     }
 
     /// Persist the session index. Call whenever the tab set, ordering, or
@@ -150,6 +176,7 @@ impl Store {
         tabs: &[Tab],
         active: usize,
         next_id: u64,
+        workspace: Option<&Workspace>,
     ) -> Result<(), PersistenceError> {
         let session = Session {
             tabs: tabs
@@ -162,6 +189,7 @@ impl Store {
                 .collect(),
             active,
             next_id,
+            workspace: workspace.cloned(),
         };
 
         let raw = serde_json::to_string_pretty(&session)?;
@@ -199,9 +227,9 @@ impl Store {
 
 #[cfg(test)]
 mod tests {
-    // `unwrap` is acceptable in test code: a panic on an unexpected `Err`
-    // is exactly the failure signal we want from a test.
-    #![allow(clippy::unwrap_used)]
+    // `unwrap`/`expect` are acceptable in test code: a panic on an
+    // unexpected `Err`/`None` is exactly the failure signal we want.
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
 
@@ -234,10 +262,11 @@ mod tests {
     fn load_missing_session_is_empty() {
         let dir = temp_dir("empty");
         let store = store_at(&dir);
-        let (tabs, active, next_id) = store.load().unwrap();
-        assert!(tabs.is_empty());
-        assert_eq!(active, 0);
-        assert_eq!(next_id, 0);
+        let restored = store.load().unwrap();
+        assert!(restored.tabs.is_empty());
+        assert_eq!(restored.active, 0);
+        assert_eq!(restored.next_id, 0);
+        assert!(restored.workspace.is_none());
         fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -251,16 +280,16 @@ mod tests {
 
         store.save_swap(&tab).unwrap();
         store
-            .save_session(std::slice::from_ref(&tab), 0, 8)
+            .save_session(std::slice::from_ref(&tab), 0, 8, None)
             .unwrap();
 
-        let (tabs, active, next_id) = store.load().unwrap();
-        assert_eq!(tabs.len(), 1);
-        assert_eq!(tabs[0].id, 7);
-        assert_eq!(tabs[0].text, "unsaved work");
-        assert!(tabs[0].is_dirty());
-        assert_eq!(active, 0);
-        assert_eq!(next_id, 8);
+        let restored = store.load().unwrap();
+        assert_eq!(restored.tabs.len(), 1);
+        assert_eq!(restored.tabs[0].id, 7);
+        assert_eq!(restored.tabs[0].text, "unsaved work");
+        assert!(restored.tabs[0].is_dirty());
+        assert_eq!(restored.active, 0);
+        assert_eq!(restored.next_id, 8);
 
         fs::remove_dir_all(&dir).unwrap();
     }
@@ -273,15 +302,33 @@ mod tests {
         let tab = Tab::new_untitled(3);
         store.save_swap(&tab).unwrap();
         store
-            .save_session(std::slice::from_ref(&tab), 0, 4)
+            .save_session(std::slice::from_ref(&tab), 0, 4, None)
             .unwrap();
         store.remove_swap(3).unwrap();
 
-        let (tabs, _, _) = store.load().unwrap();
-        assert!(tabs.is_empty());
+        let restored = store.load().unwrap();
+        assert!(restored.tabs.is_empty());
 
         // Removing an already-missing swap file is a no-op.
         store.remove_swap(3).unwrap();
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn workspace_round_trips_through_session() {
+        let dir = temp_dir("workspace");
+        let store = store_at(&dir);
+
+        let mut ws = Workspace::new(PathBuf::from("/projects/demo"));
+        ws.set_expanded(Path::new("/projects/demo/src"), true);
+
+        store.save_session(&[], 0, 0, Some(&ws)).unwrap();
+
+        let restored = store.load().unwrap();
+        let loaded = restored.workspace.expect("workspace persisted");
+        assert_eq!(loaded.root, PathBuf::from("/projects/demo"));
+        assert!(loaded.is_expanded(Path::new("/projects/demo/src")));
 
         fs::remove_dir_all(&dir).unwrap();
     }

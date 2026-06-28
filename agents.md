@@ -19,11 +19,13 @@ persistence, and (stretch goal) syntax highlighting.
 ```text
 frext (binary + library)
   src/
-    main.rs         -- thin eframe entry point
+    main.rs         -- thin eframe entry point; CLI arg parsing
     lib.rs          -- module root (so logic is unit-testable)
-    app.rs          -- FrextApp: tab bar, editor surface, action wiring
-    tab.rs          -- per-tab buffer model (content, dirty state, title)
+    app.rs          -- FrextApp: tab bar, sidebar, editor surface, wiring
+    tab.rs          -- per-tab buffer model (content, dirty, disk reload)
     persistence.rs  -- swap-file autosave + session index (Store)
+    workspace.rs    -- file-tree sidebar model (root + expanded folders)
+    highlight.rs    -- syntect highlighting + extension language detection
     theme.rs        -- Catppuccin Mocha applied to egui::Visuals
     error.rs        -- typed error enums
 
@@ -45,6 +47,15 @@ launch the swap file is the source of truth for a tab's content, so
 unsaved edits always win over what is on disk. UI actions are collected
 into a `MenuAction` enum and applied after the `self.tabs` borrow ends,
 to keep the borrow checker happy.
+
+A directory argument opens a `workspace::Workspace` (root + expanded
+folder set, persisted in `session.json`) shown as a left-panel file
+tree; the editor body is a `TextEdit` wrapped in a `ScrollArea` (the
+wrap is required -- a bare `add_sized` clamps the editor to the viewport
+and breaks scrolling). Each frame the active tab calls
+`Tab::reload_if_changed_on_disk`, which reloads a _clean_ buffer when
+its backing file's on-disk size changed; a dirty buffer is never
+clobbered.
 
 ---
 

@@ -24,10 +24,21 @@ syntax highlighting.
 - **Syntax highlighting.** Powered by syntect (via `egui_extras`), with
   the language auto-detected from the file extension. Untitled or
   extension-less buffers render as plain text.
+- **File-tree sidebar.** Launch `frext path/to/dir` to open a directory
+  in a resizable sidebar. Click a file to open it; the active file is
+  highlighted in the tree. The workspace root and which folders you have
+  expanded persist across sessions.
+- **External-change reload.** If a file's size changes on disk while it
+  is open, frext reloads it automatically — unless the buffer has unsaved
+  edits, which are never overwritten.
 
-### Planned
+## Usage
 
-- File-tree sidebar when launched with a directory.
+```sh
+frext                  # restore the previous session
+frext notes.txt a.rs   # open files (added to the restored session)
+frext path/to/project  # open a directory in the file-tree sidebar
+```
 
 ## Keyboard shortcuts
 
@@ -45,7 +56,7 @@ State lives under the platform state directory (on Linux,
 
 ```text
 frext/
-  session.json     # tab order, ids, paths, active tab
+  session.json     # tab order, ids, paths, active tab, workspace
   swap/
     <id>.swp       # full text of each tab's buffer
 ```

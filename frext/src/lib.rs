@@ -10,3 +10,4 @@ pub mod highlight;
 pub mod persistence;
 pub mod tab;
 pub mod theme;
+pub mod workspace;

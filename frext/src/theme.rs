@@ -22,7 +22,6 @@ mod mocha {
     pub const SURFACE0: Color32 = Color32::from_rgb(0x31, 0x32, 0x44);
     pub const BASE: Color32 = Color32::from_rgb(0x1e, 0x1e, 0x2e);
     pub const MANTLE: Color32 = Color32::from_rgb(0x18, 0x18, 0x25);
-    pub const CRUST: Color32 = Color32::from_rgb(0x11, 0x11, 0x1b);
     pub const RED: Color32 = Color32::from_rgb(0xf3, 0x8b, 0xa8);
 }
 
@@ -33,7 +32,11 @@ pub fn apply(ctx: &egui::Context) {
     visuals.override_text_color = Some(mocha::TEXT);
     visuals.hyperlink_color = mocha::ROSEWATER;
     visuals.faint_bg_color = mocha::SURFACE0;
-    visuals.extreme_bg_color = mocha::CRUST;
+    // `extreme_bg_color` is what egui paints behind text-input widgets,
+    // including the editor `TextEdit`. Use BASE so the editing surface
+    // matches the surrounding panels rather than appearing as a darker
+    // inset box.
+    visuals.extreme_bg_color = mocha::BASE;
     visuals.code_bg_color = mocha::MANTLE;
     visuals.warn_fg_color = mocha::RED;
     visuals.error_fg_color = mocha::RED;
