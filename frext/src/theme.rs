@@ -81,3 +81,9 @@ pub fn apply(ctx: &egui::Context) {
 pub const fn accent() -> Color32 {
     mocha::BLUE
 }
+
+/// The dimmed colour used for the editor's line-number gutter.
+#[must_use]
+pub const fn gutter() -> Color32 {
+    mocha::OVERLAY0
+}

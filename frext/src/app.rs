@@ -153,6 +153,51 @@ impl FrextApp {
         }
     }
 
+    /// Draw the line-number gutter for `text` to the left of the editor.
+    ///
+    /// Numbers are right-aligned, dimmed, and rendered in the same monospace
+    /// font the editor uses, so each number sits on the same baseline as its
+    /// line. The editor never wraps (it uses `desired_width(INFINITY)`), so a
+    /// straight `1..=line_count` sequence aligns row-for-row.
+    fn line_number_gutter(ui: &mut egui::Ui, text: &str) {
+        use egui::text::{LayoutJob, TextFormat};
+
+        let line_count = line_count(text);
+
+        let font_id = egui::TextStyle::Monospace.resolve(ui.style());
+        let color = crate::theme::gutter();
+
+        // Right-align by padding each number to the width of the largest one.
+        let width = line_count.to_string().len();
+        let mut job = LayoutJob::default();
+        for n in 1..=line_count {
+            let line = if n == line_count {
+                format!("{n:>width$}")
+            } else {
+                format!("{n:>width$}\n")
+            };
+            job.append(&line, 0.0, TextFormat::simple(font_id.clone(), color));
+        }
+        let galley = ui.fonts_mut(|f| f.layout_job(job));
+
+        // `TextEdit::multiline` insets its text by `Margin::symmetric(4, 2)`,
+        // so the first line starts 2px below the widget top. Mirror that top
+        // inset so row 1 of the gutter lines up with line 1 of the editor.
+        const TEXT_EDIT_MARGIN_TOP: f32 = 2.0;
+        let (rect, _) = ui.allocate_exact_size(
+            egui::vec2(
+                galley.size().x,
+                galley.size().y + 2.0 * TEXT_EDIT_MARGIN_TOP,
+            ),
+            egui::Sense::hover(),
+        );
+        let text_pos = rect.left_top() + egui::vec2(0.0, TEXT_EDIT_MARGIN_TOP);
+        ui.painter().galley(text_pos, galley, color);
+
+        // A small gap between the gutter and the editor text.
+        ui.add_space(4.0);
+    }
+
     /// Open a new, empty, untitled tab and focus it.
     fn new_tab(&mut self) {
         let id = self.alloc_id();
@@ -433,15 +478,24 @@ impl eframe::App for FrextApp {
                 // viewport, so content past the bottom is clipped and cannot
                 // be scrolled to. Letting the TextEdit grow to its natural
                 // height inside a scroll area is what makes scrolling work.
+                //
+                // A line-number gutter is laid out to the left of the editor,
+                // inside the same scroll area so it scrolls in lockstep. The
+                // editor uses `desired_width(INFINITY)`, so lines never wrap
+                // and a simple `1..=N` gutter stays aligned row-for-row.
                 let response = egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
-                        ui.add(
-                            egui::TextEdit::multiline(&mut tab.text)
-                                .code_editor()
-                                .desired_width(f32::INFINITY)
-                                .layouter(&mut layouter),
-                        )
+                        ui.horizontal_top(|ui| {
+                            Self::line_number_gutter(ui, &tab.text);
+                            ui.add(
+                                egui::TextEdit::multiline(&mut tab.text)
+                                    .code_editor()
+                                    .desired_width(f32::INFINITY)
+                                    .layouter(&mut layouter),
+                            )
+                        })
+                        .inner
                     })
                     .inner;
 
@@ -476,6 +530,14 @@ impl eframe::App for FrextApp {
     }
 }
 
+/// Number of editor lines in `text`.
+///
+/// At least one row, even for an empty buffer. A trailing newline opens a new
+/// (empty) final line in the editor, so this is `newlines + 1`.
+fn line_count(text: &str) -> usize {
+    text.bytes().filter(|&b| b == b'\n').count() + 1
+}
+
 /// A deferred action chosen from the menu/tab bar, applied after the borrow
 /// of `self.tabs` ends.
 enum MenuAction {
@@ -508,6 +570,15 @@ mod tests {
     use std::{fs, path::PathBuf};
 
     use super::*;
+
+    #[test]
+    fn line_count_handles_empty_and_trailing_newlines() {
+        assert_eq!(line_count(""), 1);
+        assert_eq!(line_count("one line"), 1);
+        assert_eq!(line_count("a\nb\nc"), 3);
+        // A trailing newline opens a new empty final line.
+        assert_eq!(line_count("a\nb\n"), 3);
+    }
 
     /// Create an isolated temp directory unique to this test.
     fn temp_dir(tag: &str) -> PathBuf {
