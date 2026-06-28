@@ -268,11 +268,15 @@ impl eframe::App for FrextApp {
 
         egui::CentralPanel::default().show(ui, |ui| {
             if let Some(tab) = self.tabs.get_mut(self.active) {
+                let language = crate::highlight::language_from_path(tab.path.as_deref());
+                let mut layouter = crate::highlight::layouter(&ctx, &language);
+
                 let response = ui.add_sized(
                     ui.available_size(),
                     egui::TextEdit::multiline(&mut tab.text)
                         .code_editor()
-                        .desired_width(f32::INFINITY),
+                        .desired_width(f32::INFINITY)
+                        .layouter(&mut layouter),
                 );
 
                 if response.changed() {

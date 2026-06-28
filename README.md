@@ -18,14 +18,15 @@ syntax highlighting.
   visuals, so there is no theme-crate dependency to drift behind egui
   releases.
 - **Native file dialogs** for open and save.
-
 - **Open from the command line.** `frext file.txt` opens the file on
   launch (alongside any restored session). A file that is already open is
   focused rather than opened twice.
+- **Syntax highlighting.** Powered by syntect (via `egui_extras`), with
+  the language auto-detected from the file extension. Untitled or
+  extension-less buffers render as plain text.
 
 ### Planned
 
-- Syntax highlighting (stretch goal).
 - File-tree sidebar when launched with a directory.
 
 ## Keyboard shortcuts
