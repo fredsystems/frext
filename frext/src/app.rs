@@ -426,7 +426,7 @@ impl eframe::App for FrextApp {
         egui::CentralPanel::default().show(ui, |ui| {
             if let Some(tab) = self.tabs.get_mut(self.active) {
                 let language = crate::highlight::language_from_path(tab.path.as_deref());
-                let mut layouter = crate::highlight::layouter(&ctx, &language);
+                let mut layouter = crate::highlight::layouter(&language);
 
                 // The editor must be wrapped in a ScrollArea: a bare
                 // `add_sized(available_size, ...)` clamps the TextEdit to the
