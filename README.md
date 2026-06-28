@@ -19,9 +19,14 @@ syntax highlighting.
   releases.
 - **Native file dialogs** for open and save.
 
+- **Open from the command line.** `frext file.txt` opens the file on
+  launch (alongside any restored session). A file that is already open is
+  focused rather than opened twice.
+
 ### Planned
 
 - Syntax highlighting (stretch goal).
+- File-tree sidebar when launched with a directory.
 
 ## Keyboard shortcuts
 

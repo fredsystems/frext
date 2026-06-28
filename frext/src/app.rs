@@ -17,6 +17,15 @@ impl FrextApp {
     /// Build the app, restoring the previous session from the store.
     #[must_use]
     pub fn new(store: Store) -> Self {
+        Self::with_files(store, &[])
+    }
+
+    /// Build the app, restoring the previous session and then opening any
+    /// `files` passed on the command line. A file already present in the
+    /// restored session is focused rather than opened a second time; the
+    /// last successfully opened file becomes the active tab.
+    #[must_use]
+    pub fn with_files(store: Store, files: &[std::path::PathBuf]) -> Self {
         let (mut tabs, active, mut next_id) = store.load().unwrap_or_else(|err| {
             log::error!("failed to load session, starting fresh: {err}");
             (Vec::new(), 0, 0)
@@ -28,11 +37,58 @@ impl FrextApp {
             next_id += 1;
         }
 
-        Self {
+        let mut app = Self {
             store,
             tabs,
             active,
             next_id,
+        };
+
+        for file in files {
+            app.open_path(file);
+        }
+        if !files.is_empty() {
+            app.persist_session();
+        }
+
+        app
+    }
+
+    /// Open `path` into a tab and focus it. If a tab with the same path is
+    /// already open it is focused instead of opening a duplicate. Returns
+    /// `true` when a tab is now focused on the path (whether reused or newly
+    /// opened), `false` when the file could not be read.
+    ///
+    /// Does not itself persist the session index; callers batch that.
+    fn open_path(&mut self, path: &std::path::Path) -> bool {
+        // Reuse an already-open tab. Compare canonicalized paths so that
+        // e.g. `./foo.txt` and an absolute `foo.txt` are treated as one.
+        let canonical = path.canonicalize().ok();
+        if let Some(index) = self.tabs.iter().position(|tab| {
+            tab.path.as_ref().is_some_and(|tab_path| {
+                tab_path == path
+                    || (canonical.is_some() && tab_path.canonicalize().ok() == canonical)
+            })
+        }) {
+            self.active = index;
+            return true;
+        }
+
+        match std::fs::read_to_string(path) {
+            Ok(text) => {
+                let id = self.alloc_id();
+                let tab = Tab::from_file(id, path.to_path_buf(), text);
+                if let Err(err) = self.store.save_swap(&tab) {
+                    log::error!("failed to write swap for opened file: {err}");
+                }
+                self.tabs.push(tab);
+                self.active = self.tabs.len() - 1;
+                true
+            }
+            Err(err) => {
+                log::error!("failed to open {}: {err}", path.display());
+                false
+            }
         }
     }
 
@@ -101,18 +157,8 @@ impl FrextApp {
             return;
         };
 
-        match std::fs::read_to_string(&path) {
-            Ok(text) => {
-                let id = self.alloc_id();
-                let tab = Tab::from_file(id, path, text);
-                if let Err(err) = self.store.save_swap(&tab) {
-                    log::error!("failed to write swap for opened file: {err}");
-                }
-                self.tabs.push(tab);
-                self.active = self.tabs.len() - 1;
-                self.persist_session();
-            }
-            Err(err) => log::error!("failed to open {}: {err}", path.display()),
+        if self.open_path(&path) {
+            self.persist_session();
         }
     }
 
@@ -281,4 +327,107 @@ fn rfd_pick_file() -> Option<std::path::PathBuf> {
 /// Show a native "save file" picker. Returns `None` if cancelled.
 fn rfd_save_file() -> Option<std::path::PathBuf> {
     rfd::FileDialog::new().save_file()
+}
+
+#[cfg(test)]
+mod tests {
+    // `unwrap` is acceptable in test code: a panic on an unexpected `Err`
+    // is exactly the failure signal we want from a test.
+    #![allow(clippy::unwrap_used)]
+
+    use std::{fs, path::PathBuf};
+
+    use super::*;
+
+    /// Create an isolated temp directory unique to this test.
+    fn temp_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "frext-app-test-{tag}-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// A fresh app backed by a store rooted in `dir/state`.
+    fn app_in(dir: &std::path::Path) -> FrextApp {
+        let store = Store::at(dir.join("state")).unwrap();
+        FrextApp::new(store)
+    }
+
+    #[test]
+    fn opening_cli_file_loads_its_contents_and_focuses_it() {
+        let dir = temp_dir("cli-open");
+        let file = dir.join("hello.txt");
+        fs::write(&file, "hello from disk").unwrap();
+
+        let store = Store::at(dir.join("state")).unwrap();
+        let app = FrextApp::with_files(store, std::slice::from_ref(&file));
+
+        let active = &app.tabs[app.active];
+        assert_eq!(active.path.as_deref(), Some(file.as_path()));
+        assert_eq!(active.text, "hello from disk");
+        assert!(!active.is_dirty());
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn opening_same_path_twice_reuses_the_tab() {
+        let dir = temp_dir("reuse");
+        let file = dir.join("notes.txt");
+        fs::write(&file, "body").unwrap();
+
+        let mut app = app_in(&dir);
+        let baseline = app.tabs.len();
+
+        assert!(app.open_path(&file));
+        let after_first = app.tabs.len();
+        assert_eq!(after_first, baseline + 1);
+        let first_index = app.active;
+
+        // Opening the same file again must not add a second tab.
+        assert!(app.open_path(&file));
+        assert_eq!(app.tabs.len(), after_first);
+        assert_eq!(app.active, first_index);
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn opening_nonexistent_file_reports_failure_and_adds_no_tab() {
+        let dir = temp_dir("missing");
+        let mut app = app_in(&dir);
+        let before = app.tabs.len();
+
+        assert!(!app.open_path(&dir.join("does-not-exist.txt")));
+        assert_eq!(app.tabs.len(), before);
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn cli_files_persist_into_session_for_next_launch() {
+        let dir = temp_dir("persist");
+        let file = dir.join("restore-me.txt");
+        fs::write(&file, "keep me").unwrap();
+
+        {
+            let store = Store::at(dir.join("state")).unwrap();
+            let _app = FrextApp::with_files(store, std::slice::from_ref(&file));
+        }
+
+        // A fresh store at the same root must see the opened file restored.
+        let store = Store::at(dir.join("state")).unwrap();
+        let (tabs, _active, _next_id) = store.load().unwrap();
+        assert!(
+            tabs.iter()
+                .any(|tab| tab.path.as_deref() == Some(file.as_path()))
+        );
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
 }

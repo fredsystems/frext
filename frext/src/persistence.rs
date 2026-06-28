@@ -69,6 +69,15 @@ impl Store {
             .state_dir()
             .map_or_else(|| dirs.data_dir().to_owned(), Path::to_owned);
 
+        Self::at(root)
+    }
+
+    /// Create a store rooted at `root`, creating the `swap/` layout.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PersistenceError`] if the directory layout cannot be created.
+    pub fn at(root: PathBuf) -> Result<Self, PersistenceError> {
         let swap = root.join("swap");
         fs::create_dir_all(&swap).map_err(|source| PersistenceError::Io { path: swap, source })?;
 
@@ -198,10 +207,7 @@ mod tests {
 
     /// A `Store` rooted at an arbitrary directory, for tests.
     fn store_at(root: &Path) -> Store {
-        fs::create_dir_all(root.join("swap")).unwrap();
-        Store {
-            root: root.to_owned(),
-        }
+        Store::at(root.to_owned()).unwrap()
     }
 
     fn temp_dir(tag: &str) -> PathBuf {
@@ -214,6 +220,14 @@ mod tests {
         ));
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn at_creates_swap_layout() {
+        let dir = temp_dir("layout");
+        let _store = Store::at(dir.clone()).unwrap();
+        assert!(dir.join("swap").is_dir());
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
