@@ -1,0 +1,20 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "instructions": ["agents.md"],
+  "formatter": {
+    "rustfmt": {
+      "command": ["rustfmt", "--edition", "2024", "$FILE"],
+      "extensions": [".rs"]
+    }
+  },
+  "command": {
+    "test": {
+      "template": "Run `cargo test --all`. If any tests fail, diagnose and fix them. Report results.",
+      "description": "Run all tests and fix failures"
+    },
+    "verify": {
+      "template": "Run the full verification suite:\n1. `cargo fmt --all -- --check`\n2. `cargo clippy --all-targets --all-features -- -D warnings`\n3. `cargo test --all`\n4. `cargo machete`\nReport pass/fail for each step. Fix any issues found.",
+      "description": "Run full verification suite"
+    }
+  }
+}
