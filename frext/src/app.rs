@@ -55,6 +55,19 @@ pub struct FrextApp {
     search: SearchState,
 }
 
+/// A reserved line-number gutter column, to be filled by
+/// [`FrextApp::paint_line_numbers`] once the editor has laid out.
+struct Gutter {
+    /// The allocated column rectangle (full available height).
+    rect: egui::Rect,
+    /// The monospace font the numbers are drawn in.
+    font_id: egui::FontId,
+    /// Right edge (x) the numbers are right-aligned to.
+    right_x: f32,
+    /// Number of digits the widest line number needs.
+    digits: usize,
+}
+
 impl FrextApp {
     /// Build the app, restoring the previous session from the store.
     #[must_use]
@@ -197,49 +210,81 @@ impl FrextApp {
         }
     }
 
-    /// Draw the line-number gutter for `text` to the left of the editor.
+    /// Reserve the line-number gutter column to the left of the editor.
     ///
-    /// Numbers are right-aligned, dimmed, and rendered in the same monospace
-    /// font the editor uses, so each number sits on the same baseline as its
-    /// line. The editor never wraps (it uses `desired_width(INFINITY)`), so a
-    /// straight `1..=line_count` sequence aligns row-for-row.
-    fn line_number_gutter(ui: &mut egui::Ui, text: &str) {
-        use egui::text::{LayoutJob, TextFormat};
-
+    /// This only allocates horizontal space (sized for the widest line number)
+    /// and remembers where to paint; the numbers are drawn later by
+    /// [`Self::paint_line_numbers`], aligned to the editor's real rows so
+    /// soft-wrapped continuation rows are left blank.
+    fn reserve_line_number_gutter(ui: &mut egui::Ui, text: &str) -> Gutter {
         let line_count = line_count(text);
-
         let font_id = egui::TextStyle::Monospace.resolve(ui.style());
-        let color = crate::theme::gutter();
+        let digits = line_count.to_string().len();
 
-        // Right-align by padding each number to the width of the largest one.
-        let width = line_count.to_string().len();
-        let mut job = LayoutJob::default();
-        for n in 1..=line_count {
-            let line = if n == line_count {
-                format!("{n:>width$}")
-            } else {
-                format!("{n:>width$}\n")
-            };
-            job.append(&line, 0.0, TextFormat::simple(font_id.clone(), color));
-        }
-        let galley = ui.fonts_mut(|f| f.layout_job(job));
+        // Width of `digits` monospace glyphs, measured from the digit '0'.
+        let digit_w = ui.fonts_mut(|f| f.glyph_width(&font_id, '0'));
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "digit count is tiny; the f32 cast is exact in practice"
+        )]
+        let numbers_w = digit_w * digits as f32;
+        // A small gap between the gutter and the editor text.
+        const GUTTER_GAP: f32 = 4.0;
 
-        // `TextEdit::multiline` insets its text by `Margin::symmetric(4, 2)`,
-        // so the first line starts 2px below the widget top. Mirror that top
-        // inset so row 1 of the gutter lines up with line 1 of the editor.
-        const TEXT_EDIT_MARGIN_TOP: f32 = 2.0;
         let (rect, _) = ui.allocate_exact_size(
-            egui::vec2(
-                galley.size().x,
-                galley.size().y + 2.0 * TEXT_EDIT_MARGIN_TOP,
-            ),
+            egui::vec2(numbers_w + GUTTER_GAP, ui.available_height()),
             egui::Sense::hover(),
         );
-        let text_pos = rect.left_top() + egui::vec2(0.0, TEXT_EDIT_MARGIN_TOP);
-        ui.painter().galley(text_pos, galley, color);
 
-        // A small gap between the gutter and the editor text.
-        ui.add_space(4.0);
+        Gutter {
+            rect,
+            font_id,
+            // Numbers are right-aligned to the inner edge (before the gap).
+            right_x: rect.right() - GUTTER_GAP,
+            digits,
+        }
+    }
+
+    /// Paint line numbers into the reserved `gutter`, aligned to the editor's
+    /// laid-out rows.
+    ///
+    /// A number is drawn only on a row that begins a new logical line; rows
+    /// produced by soft wrapping are left blank. This mirrors the editor's
+    /// actual galley (`output.galley`), so the numbering stays correct
+    /// regardless of wrapping — including right after a newline is typed, which
+    /// previously left a stray number on a wrap-continuation row.
+    fn paint_line_numbers(
+        ui: &egui::Ui,
+        gutter: &Gutter,
+        output: &egui::widgets::text_edit::TextEditOutput,
+    ) {
+        use egui::text::{LayoutJob, TextFormat};
+
+        let color = crate::theme::gutter();
+        let painter = ui.painter().with_clip_rect(gutter.rect);
+        let galley = &output.galley;
+
+        let ends_with_newline = galley.rows.iter().map(|r| r.ends_with_newline);
+        for (row_index, number) in line_numbers_for_rows(ends_with_newline) {
+            let Some(placed) = galley.rows.get(row_index) else {
+                continue;
+            };
+            let digits = gutter.digits;
+            let text = format!("{number:>digits$}");
+            let mut job = LayoutJob::default();
+            job.append(
+                &text,
+                0.0,
+                TextFormat::simple(gutter.font_id.clone(), color),
+            );
+            let num_galley = ui.fonts_mut(|f| f.layout_job(job));
+
+            // Align the number with the editor row: same y as the row,
+            // right-aligned to the gutter's inner edge.
+            let row_top_y = output.galley_pos.y + placed.pos.y;
+            let pos = egui::pos2(gutter.right_x - num_galley.size().x, row_top_y);
+            painter.galley(pos, num_galley, color);
+        }
     }
 
     /// Open a new, empty, untitled tab and focus it.
@@ -908,13 +953,18 @@ impl eframe::App for FrextApp {
                 //
                 // A line-number gutter is laid out to the left of the editor,
                 // inside the same scroll area so it scrolls in lockstep. The
-                // editor uses `desired_width(INFINITY)`, so lines never wrap
-                // and a simple `1..=N` gutter stays aligned row-for-row.
+                // gutter is painted from the editor's own laid-out galley so it
+                // tracks soft-wrapped rows: a number sits only on a row that
+                // begins a logical line, and wrap-continuation rows stay blank.
                 let output = egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
                         ui.horizontal_top(|ui| {
-                            Self::line_number_gutter(ui, &tab.text);
+                            // Reserve the gutter column to the left of the
+                            // editor. The numbers themselves are painted after
+                            // the editor lays out, so they can be aligned to
+                            // the editor's real (possibly soft-wrapped) rows.
+                            let gutter = Self::reserve_line_number_gutter(ui, &tab.text);
                             // Supply an explicit frame so egui does not draw
                             // its focus-stroke (the coloured ring it paints
                             // around a focused text edit from
@@ -932,6 +982,12 @@ impl eframe::App for FrextApp {
                                 .frame(editor_frame)
                                 .layouter(&mut layouter)
                                 .show(ui);
+
+                            // Now that the editor has laid out, paint the line
+                            // numbers aligned to its actual rows: a number only
+                            // on rows that begin a new logical line, so soft-wrap
+                            // continuation rows stay blank.
+                            Self::paint_line_numbers(ui, &gutter, &output);
 
                             // Apply a pending scroll-to-match: select the match
                             // (byte range -> char range) so egui scrolls it
@@ -1024,6 +1080,33 @@ fn line_count(text: &str) -> usize {
     text.bytes().filter(|&b| b == b'\n').count() + 1
 }
 
+/// Decide which visual rows of a laid-out editor galley carry a line number.
+///
+/// `ends_with_newline` yields, in row order, each row's
+/// [`egui::epaint::text::PlacedRow::ends_with_newline`] flag. A row begins a
+/// new logical line — and therefore gets the next line number — when it is the
+/// first row or the previous row ended with a real `\n`. Rows produced by soft
+/// wrapping (whose predecessor did *not* end with a newline) are skipped, so
+/// continuation rows stay blank.
+///
+/// Returns `(row_index, line_number)` pairs, with `line_number` starting at 1.
+/// Splitting this out from the painting keeps the wrap-vs-newline logic — the
+/// part that previously mis-numbered a continuation row right after Enter —
+/// unit-testable without a live `egui::Ui`.
+fn line_numbers_for_rows(ends_with_newline: impl IntoIterator<Item = bool>) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
+    let mut starts_logical_line = true;
+    let mut number = 0usize;
+    for (row_index, row_ends_with_newline) in ends_with_newline.into_iter().enumerate() {
+        if starts_logical_line {
+            number += 1;
+            out.push((row_index, number));
+        }
+        starts_logical_line = row_ends_with_newline;
+    }
+    out
+}
+
 /// A deferred action chosen from the menu/tab bar, applied after the borrow
 /// of `self.tabs` ends.
 enum MenuAction {
@@ -1102,6 +1185,52 @@ mod tests {
         assert_eq!(line_count("a\nb\nc"), 3);
         // A trailing newline opens a new empty final line.
         assert_eq!(line_count("a\nb\n"), 3);
+    }
+
+    #[test]
+    fn line_numbers_unwrapped_rows_number_consecutively() {
+        // Three logical lines, none wrapped: every row ends with a newline
+        // except the last, and each row carries the next number.
+        let rows = [true, true, false];
+        assert_eq!(line_numbers_for_rows(rows), vec![(0, 1), (1, 2), (2, 3)],);
+    }
+
+    #[test]
+    fn line_numbers_skip_soft_wrap_continuation_rows() {
+        // Row 0 is a logical line that soft-wraps into row 1 (row 0 does NOT
+        // end with a newline). Row 1 ends the logical line with a newline, so
+        // row 2 starts the next logical line. The wrap-continuation row 1 must
+        // be left blank.
+        let rows = [false, true, false];
+        assert_eq!(line_numbers_for_rows(rows), vec![(0, 1), (2, 2)]);
+    }
+
+    #[test]
+    fn line_numbers_after_newline_do_not_mark_a_wrapped_row() {
+        // Regression for the reported bug: a wrapped first logical line
+        // (rows 0+1) followed by a freshly typed newline (row 1 ends with a
+        // newline) and then a new empty line (row 2). The wrap-continuation
+        // row 1 must stay blank; only rows 0 and 2 get numbers.
+        let rows = [false, true, false];
+        let numbered: Vec<usize> = line_numbers_for_rows(rows)
+            .into_iter()
+            .map(|(row, _)| row)
+            .collect();
+        assert!(
+            !numbered.contains(&1),
+            "the soft-wrap continuation row must not be numbered"
+        );
+        assert_eq!(numbered, vec![0, 2]);
+    }
+
+    #[test]
+    fn line_numbers_empty_galley_yields_nothing() {
+        assert_eq!(line_numbers_for_rows(std::iter::empty()), vec![]);
+    }
+
+    #[test]
+    fn line_numbers_single_row() {
+        assert_eq!(line_numbers_for_rows([false]), vec![(0, 1)]);
     }
 
     /// Create an isolated temp directory unique to this test.
