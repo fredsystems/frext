@@ -52,6 +52,7 @@
             pkgs.libxkbcommon
           ]
           ++ pkgs.lib.optionals pkgs.stdenv.isLinux [
+            pkgs.dbus.lib
             pkgs.wayland
             pkgs.libGL
           ];
@@ -105,7 +106,8 @@
 
             postInstall = pkgs.lib.optionalString pkgs.stdenv.isLinux ''
               wrapProgram $out/bin/frext \
-                --prefix LD_LIBRARY_PATH : ${runtimeLibPath}
+                --prefix LD_LIBRARY_PATH : ${runtimeLibPath} \
+                --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.zenity ]}
             '';
           };
 
@@ -199,6 +201,13 @@
 
               extraDev = chk.passthru.devPackages or [ ];
 
+              # Runtime tools the editor shells out to. `rfd` uses zenity as
+              # its file-dialog fallback when no XDG desktop portal FileChooser
+              # backend is available on the session.
+              runtimeTools = pkgs.lib.optionals pkgs.stdenv.isLinux [
+                pkgs.zenity
+              ];
+
               libPkgs =
                 (chk.passthru.libPath or [ ])
                 ++ [
@@ -206,13 +215,14 @@
                   pkgs.libxkbcommon
                 ]
                 ++ pkgs.lib.optionals pkgs.stdenv.isLinux [
+                  pkgs.dbus.lib
                   pkgs.wayland
                 ];
 
               mkFrextShell =
                 extraTools:
                 pkgs.mkShell {
-                  buildInputs = extraDev ++ corePkgs ++ ciRustTools ++ extraTools;
+                  buildInputs = extraDev ++ corePkgs ++ ciRustTools ++ runtimeTools ++ extraTools;
 
                   nativeBuildInputs = [ pkgs.pkg-config ];
 
