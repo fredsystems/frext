@@ -488,10 +488,20 @@ impl eframe::App for FrextApp {
                     .show(ui, |ui| {
                         ui.horizontal_top(|ui| {
                             Self::line_number_gutter(ui, &tab.text);
+                            // Supply an explicit frame so egui does not draw
+                            // its focus-stroke (the coloured ring it paints
+                            // around a focused text edit from
+                            // `visuals.selection.stroke`). A custom frame with
+                            // no stroke keeps the editing surface borderless
+                            // whether or not it has focus.
+                            let editor_frame = egui::Frame::new()
+                                .fill(ui.visuals().extreme_bg_color)
+                                .inner_margin(egui::Margin::symmetric(4, 2));
                             ui.add(
                                 egui::TextEdit::multiline(&mut tab.text)
                                     .code_editor()
                                     .desired_width(f32::INFINITY)
+                                    .frame(editor_frame)
                                     .layouter(&mut layouter),
                             )
                         })
