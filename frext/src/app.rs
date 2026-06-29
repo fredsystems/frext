@@ -433,10 +433,10 @@ impl eframe::App for FrextApp {
                     // `workspace` is Some by the guard above.
                     if let Some(ws) = self.workspace.as_ref() {
                         let root = ws.root.clone();
-                        let root_label = root.file_name().map_or_else(
-                            || root.display().to_string(),
-                            |n| n.to_string_lossy().into_owned(),
-                        );
+                        // Show the resolved root with the home directory
+                        // collapsed to `~` (so `frext .` reads as a real
+                        // location, not a bare dot).
+                        let root_label = ws.display_root();
                         ui.horizontal(|ui| {
                             ui.strong(root_label);
                         });

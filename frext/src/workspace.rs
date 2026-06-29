@@ -48,6 +48,61 @@ impl Workspace {
             self.expanded.remove(dir)
         }
     }
+
+    /// The root rendered for the sidebar header: absolute where possible and
+    /// with the user's home directory collapsed to `~`.
+    ///
+    /// A root passed as `.` on the command line is resolved against the
+    /// current working directory so the header shows a real location rather
+    /// than a bare dot.
+    #[must_use]
+    pub fn display_root(&self) -> String {
+        display_path(&self.root)
+    }
+}
+
+/// Render `path` for display: resolve it to an absolute path where possible,
+/// then collapse a leading home-directory prefix to `~`.
+///
+/// `/home/fred` becomes `~`, `/home/fred/test` becomes `~/test`, and a path
+/// outside home (or one that cannot be resolved) is shown as its lossy
+/// absolute (or, failing that, original) form.
+#[must_use]
+pub fn display_path(path: &Path) -> String {
+    let resolved = path.canonicalize().unwrap_or_else(|_| absolutize(path));
+
+    collapse_home(&resolved, home_dir().as_deref())
+}
+
+/// Make `path` absolute by joining it onto the current working directory when
+/// it is relative. Falls back to the path as given if the cwd is unavailable.
+fn absolutize(path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        return path.to_path_buf();
+    }
+    match std::env::current_dir() {
+        Ok(cwd) => cwd.join(path),
+        Err(_) => path.to_path_buf(),
+    }
+}
+
+/// The user's home directory, if the platform exposes one.
+fn home_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME").map(PathBuf::from)
+}
+
+/// Collapse a leading `home` prefix of `path` to `~`. Pure (no I/O) so it is
+/// straightforward to test with synthetic paths.
+fn collapse_home(path: &Path, home: Option<&Path>) -> String {
+    if let Some(home) = home {
+        if path == home {
+            return "~".to_owned();
+        }
+        if let Ok(rest) = path.strip_prefix(home) {
+            return format!("~/{}", rest.display());
+        }
+    }
+    path.display().to_string()
 }
 
 /// Read the immediate children of `dir`, split into sub-directories and
@@ -105,6 +160,41 @@ mod tests {
         assert!(ws.set_expanded(dir, false)); // changed
         assert!(!ws.is_expanded(dir));
         assert!(!ws.set_expanded(dir, false)); // no-op
+    }
+
+    #[test]
+    fn collapse_home_replaces_home_prefix_with_tilde() {
+        let home = Path::new("/home/fred");
+
+        assert_eq!(collapse_home(Path::new("/home/fred"), Some(home)), "~");
+        assert_eq!(
+            collapse_home(Path::new("/home/fred/test"), Some(home)),
+            "~/test"
+        );
+        assert_eq!(
+            collapse_home(Path::new("/home/fred/a/b"), Some(home)),
+            "~/a/b"
+        );
+    }
+
+    #[test]
+    fn collapse_home_leaves_paths_outside_home_untouched() {
+        let home = Path::new("/home/fred");
+
+        assert_eq!(
+            collapse_home(Path::new("/etc/hosts"), Some(home)),
+            "/etc/hosts"
+        );
+        // A path that merely shares a name prefix is not under home.
+        assert_eq!(
+            collapse_home(Path::new("/home/fredrick"), Some(home)),
+            "/home/fredrick"
+        );
+    }
+
+    #[test]
+    fn collapse_home_without_a_home_is_a_passthrough() {
+        assert_eq!(collapse_home(Path::new("/home/fred"), None), "/home/fred");
     }
 
     #[test]
