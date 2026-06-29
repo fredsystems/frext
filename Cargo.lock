@@ -925,6 +925,7 @@ dependencies = [
  "egui",
  "env_logger",
  "log",
+ "regex",
  "rfd",
  "serde",
  "serde_json",

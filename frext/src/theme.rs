@@ -87,3 +87,24 @@ pub const fn accent() -> Color32 {
 pub const fn gutter() -> Color32 {
     mocha::OVERLAY0
 }
+
+/// Background fill for a non-current search match.
+#[must_use]
+pub const fn search_match() -> Color32 {
+    // A muted surface tint so every match is visible without overpowering the
+    // syntax-highlighted foreground.
+    mocha::SURFACE2
+}
+
+/// Background fill for the currently-focused search match.
+#[must_use]
+pub fn search_current_match() -> Color32 {
+    // The accent, dimmed so dark foreground glyphs stay legible on top.
+    mocha::BLUE.linear_multiply(0.55)
+}
+
+/// The colour used for error text (e.g. an invalid search regex).
+#[must_use]
+pub const fn error() -> Color32 {
+    mocha::RED
+}

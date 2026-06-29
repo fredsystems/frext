@@ -9,6 +9,7 @@ pub mod error;
 pub mod highlight;
 pub mod icon;
 pub mod persistence;
+pub mod search;
 pub mod tab;
 pub mod theme;
 pub mod workspace;

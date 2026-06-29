@@ -1,11 +1,47 @@
 //! The frext eframe application: tab bar, editor surface, and the wiring
 //! that keeps swap files and the session index up to date.
 
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 
 use eframe::egui;
 
-use crate::{persistence::Store, tab::Tab, workspace::Workspace};
+use crate::{
+    highlight::MatchHighlights, persistence::Store, search::SearchQuery, tab::Tab,
+    workspace::Workspace,
+};
+
+/// Live state for the find/replace bar, kept separate from the persisted
+/// [`SearchQuery`] (only the query itself survives across sessions).
+#[derive(Default)]
+struct SearchState {
+    /// The query and its toggles (persisted).
+    query: SearchQuery,
+    /// Whether the find/replace bar is currently shown.
+    open: bool,
+    /// Whether the replace row is shown.
+    replace_open: bool,
+    /// The replacement text for find/replace.
+    replacement: String,
+    /// Restrict matches to the editor's current selection when `true`.
+    in_selection: bool,
+    /// The active editor's current selection as a byte range, captured from
+    /// the `TextEdit` each frame, used to scope a search-within-selection.
+    selection: Option<Range<usize>>,
+    /// Cached match byte ranges for the active buffer (recomputed each frame
+    /// the bar is open).
+    matches: Vec<Range<usize>>,
+    /// Index into `matches` of the focused match, if any.
+    current: Option<usize>,
+    /// The most recent regex-compile error message, shown inline in red.
+    error: Option<String>,
+    /// Set when the search box should grab keyboard focus next frame (e.g.
+    /// just after opening with Ctrl+F).
+    focus_requested: bool,
+    /// When `Some`, the editor should select this byte range and scroll it
+    /// into view next frame (the focused match).
+    scroll_to: Option<Range<usize>>,
+}
 
 /// The top-level application state.
 pub struct FrextApp {
@@ -15,6 +51,8 @@ pub struct FrextApp {
     next_id: u64,
     /// The sidebar workspace (root directory + expanded folders), if open.
     workspace: Option<Workspace>,
+    /// Find/replace bar state.
+    search: SearchState,
 }
 
 impl FrextApp {
@@ -50,6 +88,7 @@ impl FrextApp {
         let active = restored.active;
         let mut next_id = restored.next_id;
         let mut workspace = restored.workspace;
+        let restored_search = restored.search;
 
         // Always guarantee at least one tab to edit.
         if tabs.is_empty() {
@@ -74,6 +113,10 @@ impl FrextApp {
             active,
             next_id,
             workspace,
+            search: SearchState {
+                query: restored_search,
+                ..SearchState::default()
+            },
         };
 
         for file in files {
@@ -139,6 +182,7 @@ impl FrextApp {
             self.active,
             self.next_id,
             self.workspace.as_ref(),
+            &self.search.query,
         ) {
             log::error!("failed to save session index: {err}");
         }
@@ -235,6 +279,322 @@ impl FrextApp {
     fn close_workspace(&mut self) {
         if self.workspace.take().is_some() {
             self.persist_session();
+        }
+    }
+
+    /// Open the find bar, seeding the pattern from the editor's current
+    /// selection when there is a non-empty one, and request keyboard focus.
+    fn open_search(&mut self, replace: bool) {
+        if let Some(selected) = self.active_selection_text() {
+            if !selected.is_empty() && !selected.contains('\n') {
+                // A single-line selection is a sensible search seed; multi-line
+                // selections are left alone (they are usually a scope, not a
+                // pattern).
+                self.search.query.pattern = selected;
+                // Plain mode for a seeded literal, so regex metacharacters in
+                // the selected text match literally.
+                self.search.query.regex = false;
+            }
+        }
+        self.search.open = true;
+        self.search.replace_open = replace;
+        self.search.focus_requested = true;
+        self.recompute_matches();
+    }
+
+    /// The active editor's currently-selected text, derived from the selection
+    /// byte range captured from the `TextEdit` on the previous frame.
+    fn active_selection_text(&self) -> Option<String> {
+        let range = self.search.selection.clone()?;
+        if range.start >= range.end {
+            return None;
+        }
+        let tab = self.tabs.get(self.active)?;
+        tab.text.get(range).map(str::to_owned)
+    }
+
+    /// Close the find bar, clearing the live match cache so highlights vanish.
+    fn close_search(&mut self) {
+        self.search.open = false;
+        self.search.matches.clear();
+        self.search.current = None;
+        self.search.scroll_to = None;
+    }
+
+    /// Recompute the match set for the active buffer from the current query.
+    /// Updates the inline error on an invalid regex and clamps `current`.
+    fn recompute_matches(&mut self) {
+        self.search.error = None;
+        self.search.matches.clear();
+
+        if self.search.query.is_empty() {
+            self.search.current = None;
+            return;
+        }
+
+        let Some(tab) = self.tabs.get(self.active) else {
+            self.search.current = None;
+            return;
+        };
+
+        let matcher = match self.search.query.compile() {
+            Ok(matcher) => matcher,
+            Err(err) => {
+                self.search.error = Some(err.to_string());
+                self.search.current = None;
+                return;
+            }
+        };
+
+        // Search-within-selection restricts to the active selection's bytes.
+        let matches = match (self.search.in_selection, self.search.selection.clone()) {
+            (true, Some(scope)) if scope.start < scope.end => {
+                matcher.find_matches_in(&tab.text, scope)
+            }
+            _ => matcher.find_matches(&tab.text),
+        };
+
+        self.search.matches = matches;
+        self.search.current = match self.search.current {
+            Some(i) if i < self.search.matches.len() => Some(i),
+            _ if self.search.matches.is_empty() => None,
+            _ => Some(0),
+        };
+    }
+
+    /// Move to the next (`forward`) or previous match, wrapping around, and
+    /// request that the editor scroll it into view.
+    fn step_match(&mut self, forward: bool) {
+        let len = self.search.matches.len();
+        if len == 0 {
+            return;
+        }
+        let next = match self.search.current {
+            Some(i) if forward => (i + 1) % len,
+            Some(i) => (i + len - 1) % len,
+            None => 0,
+        };
+        self.search.current = Some(next);
+        if let Some(range) = self.search.matches.get(next).cloned() {
+            self.search.scroll_to = Some(range);
+        }
+    }
+
+    /// Replace the currently-focused match with the replacement text, then
+    /// re-find so the highlights and indices stay correct.
+    fn replace_current(&mut self) {
+        let Some(index) = self.search.current else {
+            return;
+        };
+        let Some(range) = self.search.matches.get(index).cloned() else {
+            return;
+        };
+        let matcher = match self.search.query.compile() {
+            Ok(matcher) => matcher,
+            Err(err) => {
+                self.search.error = Some(err.to_string());
+                return;
+            }
+        };
+        let Some(tab) = self.tabs.get_mut(self.active) else {
+            return;
+        };
+
+        if let Some((new_text, _)) =
+            matcher.replace_one_at(&tab.text, range.start, &self.search.replacement)
+        {
+            tab.text = new_text;
+            self.persist_active_swap();
+            // Keep the cursor near where we just replaced.
+            self.recompute_matches();
+            // Focus the match at (or after) the replaced position.
+            if let Some(pos) = self
+                .search
+                .matches
+                .iter()
+                .position(|m| m.start >= range.start)
+            {
+                self.search.current = Some(pos);
+            }
+        }
+    }
+
+    /// Replace every match in the active buffer with the replacement text.
+    fn replace_all(&mut self) {
+        if self.search.query.is_empty() {
+            return;
+        }
+        let matcher = match self.search.query.compile() {
+            Ok(matcher) => matcher,
+            Err(err) => {
+                self.search.error = Some(err.to_string());
+                return;
+            }
+        };
+        let Some(tab) = self.tabs.get_mut(self.active) else {
+            return;
+        };
+
+        let new_text = matcher.replace_all(&tab.text, &self.search.replacement);
+        if new_text != tab.text {
+            tab.text = new_text;
+            self.persist_active_swap();
+        }
+        self.search.current = None;
+        self.recompute_matches();
+    }
+
+    /// The match highlights to hand to the editor layouter.
+    fn match_highlights(&self) -> MatchHighlights {
+        if self.search.open {
+            MatchHighlights {
+                ranges: self.search.matches.clone(),
+                current: self.search.current,
+            }
+        } else {
+            MatchHighlights::default()
+        }
+    }
+
+    /// Render the find / replace bar. Pushes the chosen action into `action`
+    /// and recomputes matches when the query or toggles change so highlights
+    /// track typing live.
+    fn search_bar_ui(&mut self, ui: &mut egui::Ui, action: &mut SearchAction) {
+        let panel_frame =
+            egui::Frame::side_top_panel(ui.style()).fill(ui.style().visuals.panel_fill);
+
+        egui::Panel::top("frext_search_bar")
+            .frame(panel_frame)
+            .show(ui, |ui| {
+                let mut query_changed = false;
+
+                ui.horizontal(|ui| {
+                    ui.label("Find");
+                    let field = ui.add(
+                        egui::TextEdit::singleline(&mut self.search.query.pattern)
+                            .desired_width(220.0)
+                            .hint_text("search…"),
+                    );
+                    if self.search.focus_requested {
+                        field.request_focus();
+                        self.search.focus_requested = false;
+                    }
+                    if field.changed() {
+                        query_changed = true;
+                    }
+                    // Enter / Shift+Enter step matches while the field is
+                    // focused.
+                    if field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                        let forward = !ui.input(|i| i.modifiers.shift);
+                        *action = SearchAction::Step { forward };
+                        field.request_focus();
+                    }
+
+                    // Toggles.
+                    if ui
+                        .selectable_label(self.search.query.case_sensitive, "Aa")
+                        .on_hover_text("Match case")
+                        .clicked()
+                    {
+                        self.search.query.case_sensitive = !self.search.query.case_sensitive;
+                        query_changed = true;
+                    }
+                    if ui
+                        .selectable_label(self.search.query.whole_word, "W")
+                        .on_hover_text("Whole word")
+                        .clicked()
+                    {
+                        self.search.query.whole_word = !self.search.query.whole_word;
+                        query_changed = true;
+                    }
+                    if ui
+                        .selectable_label(self.search.query.regex, ".*")
+                        .on_hover_text("Regular expression")
+                        .clicked()
+                    {
+                        self.search.query.regex = !self.search.query.regex;
+                        query_changed = true;
+                    }
+                    if ui
+                        .selectable_label(self.search.in_selection, "In sel")
+                        .on_hover_text("Search within the current selection")
+                        .clicked()
+                    {
+                        self.search.in_selection = !self.search.in_selection;
+                        query_changed = true;
+                    }
+
+                    // Navigation + count. Plain-text labels because egui's
+                    // default fonts (Ubuntu-Light + NotoEmoji) do not cover the
+                    // geometric triangle glyphs, which render as tofu squares.
+                    if ui
+                        .button("Prev")
+                        .on_hover_text("Previous match (Shift+F3)")
+                        .clicked()
+                    {
+                        *action = SearchAction::Step { forward: false };
+                    }
+                    if ui
+                        .button("Next")
+                        .on_hover_text("Next match (F3 / Enter)")
+                        .clicked()
+                    {
+                        *action = SearchAction::Step { forward: true };
+                    }
+                    ui.label(self.match_count_label());
+
+                    if ui
+                        .selectable_label(self.search.replace_open, "Replace")
+                        .on_hover_text("Toggle replace")
+                        .clicked()
+                    {
+                        self.search.replace_open = !self.search.replace_open;
+                    }
+                    if ui.button("\u{00d7}").on_hover_text("Close (Esc)").clicked() {
+                        *action = SearchAction::Close;
+                    }
+                });
+
+                if let Some(err) = &self.search.error {
+                    ui.colored_label(crate::theme::error(), format!("regex: {err}"));
+                }
+
+                if self.search.replace_open {
+                    ui.horizontal(|ui| {
+                        ui.label("With");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.search.replacement)
+                                .desired_width(220.0)
+                                .hint_text(if self.search.query.regex {
+                                    "replacement ($1 for groups)…"
+                                } else {
+                                    "replacement…"
+                                }),
+                        );
+                        if ui.button("Replace").clicked() {
+                            *action = SearchAction::ReplaceCurrent;
+                        }
+                        if ui.button("Replace all").clicked() {
+                            *action = SearchAction::ReplaceAll;
+                        }
+                    });
+                }
+
+                if query_changed && matches!(action, SearchAction::None) {
+                    *action = SearchAction::Recompute;
+                }
+            });
+    }
+
+    /// A short "current/total" (or "no results") label for the find bar.
+    fn match_count_label(&self) -> String {
+        if self.search.query.is_empty() {
+            String::new()
+        } else if self.search.matches.is_empty() {
+            "no results".to_owned()
+        } else {
+            let current = self.search.current.map_or(0, |i| i + 1);
+            format!("{current}/{}", self.search.matches.len())
         }
     }
 
@@ -346,7 +706,9 @@ impl eframe::App for FrextApp {
             }
         }
 
-        // Keyboard shortcuts.
+        // Keyboard shortcuts. Search actions are deferred like menu actions so
+        // they run after the editor borrow ends.
+        let mut search_action = SearchAction::None;
         ctx.input_mut(|i| {
             if i.consume_shortcut(&egui::KeyboardShortcut::new(
                 egui::Modifiers::COMMAND,
@@ -371,6 +733,37 @@ impl eframe::App for FrextApp {
                 egui::Key::W,
             )) {
                 action = MenuAction::CloseActive;
+            }
+            if i.consume_shortcut(&egui::KeyboardShortcut::new(
+                egui::Modifiers::COMMAND,
+                egui::Key::F,
+            )) {
+                search_action = SearchAction::Open { replace: false };
+            }
+            if i.consume_shortcut(&egui::KeyboardShortcut::new(
+                egui::Modifiers::COMMAND,
+                egui::Key::H,
+            )) {
+                search_action = SearchAction::Open { replace: true };
+            }
+            // While the bar is open, F3 / Shift+F3 cycle matches and Esc
+            // closes it.
+            if self.search.open {
+                if i.consume_shortcut(&egui::KeyboardShortcut::new(
+                    egui::Modifiers::NONE,
+                    egui::Key::F3,
+                )) {
+                    search_action = SearchAction::Step { forward: true };
+                }
+                if i.consume_shortcut(&egui::KeyboardShortcut::new(
+                    egui::Modifiers::SHIFT,
+                    egui::Key::F3,
+                )) {
+                    search_action = SearchAction::Step { forward: false };
+                }
+                if i.key_pressed(egui::Key::Escape) {
+                    search_action = SearchAction::Close;
+                }
             }
         });
 
@@ -417,6 +810,11 @@ impl eframe::App for FrextApp {
                 }
             });
         });
+
+        // Find / replace bar, shown directly under the tab bar.
+        if self.search.open {
+            self.search_bar_ui(ui, &mut search_action);
+        }
 
         // Left sidebar: file tree for the open workspace, if any.
         if self.workspace.is_some() {
@@ -490,10 +888,17 @@ impl eframe::App for FrextApp {
             }
         }
 
+        let highlights = self.match_highlights();
+        // A scroll-to-match request becomes a cursor selection on the editor;
+        // converted from byte to char indices below.
+        let scroll_to = self.search.scroll_to.take();
+        let mut new_selection: Option<Range<usize>> = None;
+        let mut changed = false;
+
         egui::CentralPanel::default().show(ui, |ui| {
             if let Some(tab) = self.tabs.get_mut(self.active) {
                 let language = crate::highlight::language_from_path(tab.path.as_deref());
-                let mut layouter = crate::highlight::layouter(&language);
+                let mut layouter = crate::highlight::layouter(&language, &highlights);
 
                 // The editor must be wrapped in a ScrollArea: a bare
                 // `add_sized(available_size, ...)` clamps the TextEdit to the
@@ -505,7 +910,7 @@ impl eframe::App for FrextApp {
                 // inside the same scroll area so it scrolls in lockstep. The
                 // editor uses `desired_width(INFINITY)`, so lines never wrap
                 // and a simple `1..=N` gutter stays aligned row-for-row.
-                let response = egui::ScrollArea::vertical()
+                let output = egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
                         ui.horizontal_top(|ui| {
@@ -519,23 +924,57 @@ impl eframe::App for FrextApp {
                             let editor_frame = egui::Frame::new()
                                 .fill(ui.visuals().extreme_bg_color)
                                 .inner_margin(egui::Margin::symmetric(4, 2));
-                            ui.add(
-                                egui::TextEdit::multiline(&mut tab.text)
-                                    .code_editor()
-                                    .desired_width(f32::INFINITY)
-                                    .frame(editor_frame)
-                                    .layouter(&mut layouter),
-                            )
+                            let editor_id = egui::Id::new(("frext_editor", tab.id));
+                            let mut output = egui::TextEdit::multiline(&mut tab.text)
+                                .id(editor_id)
+                                .code_editor()
+                                .desired_width(f32::INFINITY)
+                                .frame(editor_frame)
+                                .layouter(&mut layouter)
+                                .show(ui);
+
+                            // Apply a pending scroll-to-match: select the match
+                            // (byte range -> char range) so egui scrolls it
+                            // into view on this frame.
+                            if let Some(range) = &scroll_to {
+                                let start = char_index(&tab.text, range.start);
+                                let end = char_index(&tab.text, range.end);
+                                let ccursor_range = egui::text::CCursorRange::two(
+                                    egui::text::CCursor::new(start),
+                                    egui::text::CCursor::new(end),
+                                );
+                                output.state.cursor.set_char_range(Some(ccursor_range));
+                                output.state.clone().store(ui.ctx(), editor_id);
+                                output.response.scroll_to_me(Some(egui::Align::Center));
+                            }
+
+                            // Capture the live selection (char -> byte) so a
+                            // search-within-selection can scope to it.
+                            new_selection = output.cursor_range.map(|range| {
+                                let lo = range.primary.index.0.min(range.secondary.index.0);
+                                let hi = range.primary.index.0.max(range.secondary.index.0);
+                                byte_index(&tab.text, lo)..byte_index(&tab.text, hi)
+                            });
+
+                            output.response
                         })
                         .inner
                     })
                     .inner;
 
-                if response.changed() {
-                    self.persist_active_swap();
-                }
+                changed = output.changed();
             }
         });
+
+        if changed {
+            self.persist_active_swap();
+            // The buffer was edited this frame: refresh matches and the count
+            // so the search bar tracks live edits, not just query changes.
+            if self.search.open {
+                self.recompute_matches();
+            }
+        }
+        self.search.selection = new_selection;
 
         match action {
             MenuAction::None => {}
@@ -547,7 +986,22 @@ impl eframe::App for FrextApp {
             MenuAction::Select(index) => {
                 self.active = index;
                 self.persist_session();
+                self.recompute_matches();
             }
+        }
+
+        match search_action {
+            SearchAction::None => {}
+            SearchAction::Open { replace } => self.open_search(replace),
+            SearchAction::Close => {
+                self.close_search();
+                // Persist the (possibly edited) query when the bar closes.
+                self.persist_session();
+            }
+            SearchAction::Step { forward } => self.step_match(forward),
+            SearchAction::Recompute => self.recompute_matches(),
+            SearchAction::ReplaceCurrent => self.replace_current(),
+            SearchAction::ReplaceAll => self.replace_all(),
         }
     }
 
@@ -582,6 +1036,44 @@ enum MenuAction {
     Select(usize),
 }
 
+/// A deferred find/replace action, applied after the editor borrow ends.
+enum SearchAction {
+    None,
+    /// Open the find bar; `replace` also opens the replace row.
+    Open {
+        replace: bool,
+    },
+    /// Close the find bar.
+    Close,
+    /// Move to the next (`forward`) or previous match.
+    Step {
+        forward: bool,
+    },
+    /// Re-run the search (query or toggles changed).
+    Recompute,
+    /// Replace the focused match.
+    ReplaceCurrent,
+    /// Replace every match.
+    ReplaceAll,
+}
+
+/// The byte offset of char index `char_idx` within `text` (clamped to the
+/// end). Used to convert egui char-cursor positions to the byte ranges the
+/// search model speaks.
+fn byte_index(text: &str, char_idx: usize) -> usize {
+    text.char_indices()
+        .nth(char_idx)
+        .map_or_else(|| text.len(), |(b, _)| b)
+}
+
+/// The char index of byte offset `byte` within `text` (clamped). The inverse
+/// of [`byte_index`], for handing byte ranges back to egui's char cursors.
+fn char_index(text: &str, byte: usize) -> usize {
+    text.char_indices()
+        .position(|(b, _)| b >= byte)
+        .unwrap_or_else(|| text.chars().count())
+}
+
 /// Show a native "open file" picker. Returns `None` if cancelled or if no
 /// picker backend is available.
 fn rfd_pick_file() -> Option<std::path::PathBuf> {
@@ -595,9 +1087,9 @@ fn rfd_save_file() -> Option<std::path::PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    // `unwrap` is acceptable in test code: a panic on an unexpected `Err`
-    // is exactly the failure signal we want from a test.
-    #![allow(clippy::unwrap_used)]
+    // `unwrap`/`expect` are acceptable in test code: a panic on an unexpected
+    // `Err`/`None` is exactly the failure signal we want from a test.
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use std::{fs, path::PathBuf};
 
@@ -752,6 +1244,171 @@ mod tests {
         let store = Store::at(dir.join("state")).unwrap();
         let restored = store.load().unwrap();
         assert_eq!(restored.workspace.map(|ws| ws.root), Some(project.clone()));
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Give `app` two file-backed tabs with distinct contents and focus the
+    /// one holding `first`. (A fresh app always starts with an empty untitled
+    /// tab, so the file tabs land after it.)
+    fn app_with_two_tabs(dir: &std::path::Path, first: &str, second: &str) -> FrextApp {
+        let a = dir.join("a.txt");
+        let b = dir.join("b.txt");
+        fs::write(&a, first).unwrap();
+        fs::write(&b, second).unwrap();
+        let store = Store::at(dir.join("state")).unwrap();
+        let mut app = FrextApp::with_files(store, &[a, b]);
+        // Focus the tab backed by a.txt (its content is `first`).
+        app.active = app
+            .tabs
+            .iter()
+            .position(|t| t.text == first)
+            .expect("a tab holding the first content");
+        app
+    }
+
+    #[test]
+    fn search_targets_only_the_active_tab() {
+        let dir = temp_dir("search-active");
+        let mut app = app_with_two_tabs(&dir, "foo here foo", "foo and foo and foo");
+
+        app.search.query.pattern = "foo".to_owned();
+        app.recompute_matches();
+
+        // The active tab ("foo here foo") has two "foo"s; the other tab's
+        // three are never considered.
+        assert_eq!(app.search.matches, vec![0..3, 9..12]);
+
+        // Switching the active tab re-scopes the search to that buffer.
+        app.active = app
+            .tabs
+            .iter()
+            .position(|t| t.text == "foo and foo and foo")
+            .unwrap();
+        app.recompute_matches();
+        assert_eq!(app.search.matches.len(), 3);
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn stepping_matches_wraps_around() {
+        let dir = temp_dir("search-step");
+        let mut app = app_with_two_tabs(&dir, "x x x", "");
+        app.search.query.pattern = "x".to_owned();
+        app.recompute_matches();
+        assert_eq!(app.search.current, Some(0));
+
+        app.step_match(true);
+        assert_eq!(app.search.current, Some(1));
+        app.step_match(true);
+        assert_eq!(app.search.current, Some(2));
+        // Wrap forward to the first.
+        app.step_match(true);
+        assert_eq!(app.search.current, Some(0));
+        // Wrap backward to the last.
+        app.step_match(false);
+        assert_eq!(app.search.current, Some(2));
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn replace_all_only_changes_the_active_tab() {
+        let dir = temp_dir("search-replace-all");
+        // Distinct contents so we can tell the two file tabs apart.
+        let mut app = app_with_two_tabs(&dir, "cat cat", "cat in tab two");
+        let active = app.active;
+        let other = app
+            .tabs
+            .iter()
+            .position(|t| t.text == "cat in tab two")
+            .unwrap();
+
+        app.search.query.pattern = "cat".to_owned();
+        app.search.replacement = "dog".to_owned();
+        app.recompute_matches();
+        app.replace_all();
+
+        assert_eq!(app.tabs[active].text, "dog dog");
+        // The inactive tab is untouched.
+        assert_eq!(app.tabs[other].text, "cat in tab two");
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn replace_current_replaces_one_match_and_advances() {
+        let dir = temp_dir("search-replace-one");
+        let mut app = app_with_two_tabs(&dir, "cat cat cat", "");
+        app.search.query.pattern = "cat".to_owned();
+        app.search.replacement = "dog".to_owned();
+        app.recompute_matches();
+
+        // Replace the first match only.
+        app.search.current = Some(0);
+        app.replace_current();
+        let active = app.active;
+        assert_eq!(app.tabs[active].text, "dog cat cat");
+        // Two "cat" matches remain.
+        assert_eq!(app.search.matches.len(), 2);
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn regex_replace_expands_capture_groups() {
+        let dir = temp_dir("search-regex-replace");
+        let mut app = app_with_two_tabs(&dir, "user@host", "");
+        app.search.query.pattern = r"(\w+)@(\w+)".to_owned();
+        app.search.query.regex = true;
+        app.search.replacement = "$2.$1".to_owned();
+        app.recompute_matches();
+        app.replace_all();
+
+        let active = app.active;
+        assert_eq!(app.tabs[active].text, "host.user");
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn matches_refresh_after_the_buffer_is_edited() {
+        let dir = temp_dir("search-live-edit");
+        let mut app = app_with_two_tabs(&dir, "foo", "");
+        app.search.open = true;
+        app.search.query.pattern = "foo".to_owned();
+        app.recompute_matches();
+        assert_eq!(app.search.matches.len(), 1);
+
+        // Simulate a buffer edit that adds two more occurrences, the way the
+        // editor mutates the active tab in place.
+        let active = app.active;
+        app.tabs[active].text = "foo foo foo".to_owned();
+        // The same recompute the edit path triggers.
+        app.recompute_matches();
+
+        assert_eq!(app.search.matches, vec![0..3, 4..7, 8..11]);
+
+        // And removing all occurrences clears the count.
+        app.tabs[active].text = "nothing here".to_owned();
+        app.recompute_matches();
+        assert!(app.search.matches.is_empty());
+        assert_eq!(app.search.current, None);
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn invalid_regex_sets_inline_error_and_no_matches() {
+        let dir = temp_dir("search-bad-regex");
+        let mut app = app_with_two_tabs(&dir, "anything", "");
+        app.search.query.pattern = "(".to_owned();
+        app.search.query.regex = true;
+        app.recompute_matches();
+
+        assert!(app.search.error.is_some());
+        assert!(app.search.matches.is_empty());
 
         fs::remove_dir_all(&dir).unwrap();
     }

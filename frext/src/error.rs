@@ -22,3 +22,11 @@ pub enum PersistenceError {
     #[error("failed to (de)serialize session state: {0}")]
     Serde(#[from] serde_json::Error),
 }
+
+/// Errors that can occur while compiling a search query into a matcher.
+#[derive(Debug, thiserror::Error)]
+pub enum SearchError {
+    /// The user-supplied regular expression failed to compile.
+    #[error("invalid regular expression: {0}")]
+    InvalidRegex(String),
+}

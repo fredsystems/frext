@@ -21,7 +21,7 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
-use crate::{error::PersistenceError, tab::Tab, workspace::Workspace};
+use crate::{error::PersistenceError, search::SearchQuery, tab::Tab, workspace::Workspace};
 
 /// One entry in the persisted session index.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -49,6 +49,11 @@ pub struct Session {
     /// existed loadable.
     #[serde(default)]
     pub workspace: Option<Workspace>,
+    /// The last search query and its toggles, restored so the search bar
+    /// reopens with the user's previous pattern. `#[serde(default)]` keeps
+    /// older sessions loadable.
+    #[serde(default)]
+    pub search: SearchQuery,
 }
 
 /// The fully-restored session handed back by [`Store::load`]: the live tabs
@@ -63,6 +68,8 @@ pub struct RestoredSession {
     pub next_id: u64,
     /// The sidebar workspace, if one was open.
     pub workspace: Option<Workspace>,
+    /// The last search query and its toggles.
+    pub search: SearchQuery,
 }
 
 /// Owns the on-disk paths used for persistence.
@@ -162,6 +169,7 @@ impl Store {
             active,
             next_id: session.next_id,
             workspace: session.workspace,
+            search: session.search,
         })
     }
 
@@ -177,6 +185,7 @@ impl Store {
         active: usize,
         next_id: u64,
         workspace: Option<&Workspace>,
+        search: &SearchQuery,
     ) -> Result<(), PersistenceError> {
         let session = Session {
             tabs: tabs
@@ -190,6 +199,7 @@ impl Store {
             active,
             next_id,
             workspace: workspace.cloned(),
+            search: search.clone(),
         };
 
         let raw = serde_json::to_string_pretty(&session)?;
@@ -280,7 +290,13 @@ mod tests {
 
         store.save_swap(&tab).unwrap();
         store
-            .save_session(std::slice::from_ref(&tab), 0, 8, None)
+            .save_session(
+                std::slice::from_ref(&tab),
+                0,
+                8,
+                None,
+                &SearchQuery::default(),
+            )
             .unwrap();
 
         let restored = store.load().unwrap();
@@ -302,7 +318,13 @@ mod tests {
         let tab = Tab::new_untitled(3);
         store.save_swap(&tab).unwrap();
         store
-            .save_session(std::slice::from_ref(&tab), 0, 4, None)
+            .save_session(
+                std::slice::from_ref(&tab),
+                0,
+                4,
+                None,
+                &SearchQuery::default(),
+            )
             .unwrap();
         store.remove_swap(3).unwrap();
 
@@ -323,12 +345,34 @@ mod tests {
         let mut ws = Workspace::new(PathBuf::from("/projects/demo"));
         ws.set_expanded(Path::new("/projects/demo/src"), true);
 
-        store.save_session(&[], 0, 0, Some(&ws)).unwrap();
+        store
+            .save_session(&[], 0, 0, Some(&ws), &SearchQuery::default())
+            .unwrap();
 
         let restored = store.load().unwrap();
         let loaded = restored.workspace.expect("workspace persisted");
         assert_eq!(loaded.root, PathBuf::from("/projects/demo"));
         assert!(loaded.is_expanded(Path::new("/projects/demo/src")));
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn search_query_round_trips_through_session() {
+        let dir = temp_dir("search");
+        let store = store_at(&dir);
+
+        let query = SearchQuery {
+            pattern: r"\bfoo\b".to_owned(),
+            case_sensitive: true,
+            regex: true,
+            whole_word: false,
+        };
+
+        store.save_session(&[], 0, 0, None, &query).unwrap();
+
+        let restored = store.load().unwrap();
+        assert_eq!(restored.search, query);
 
         fs::remove_dir_all(&dir).unwrap();
     }
