@@ -47,6 +47,7 @@ fn main() -> eframe::Result<()> {
         "frext",
         native_options,
         Box::new(move |cc| {
+            frext::font::apply(&cc.egui_ctx);
             frext::theme::apply(&cc.egui_ctx);
             Ok(Box::new(FrextApp::with_args(store, &files, dir.as_deref())))
         }),

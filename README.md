@@ -17,6 +17,11 @@ syntax highlighting.
 - **Catppuccin Mocha theme.** The palette is applied directly to egui's
   visuals, so there is no theme-crate dependency to drift behind egui
   releases.
+- **Bundled coding font with ligatures.** frext embeds the CaskaydiaCove
+  Nerd Font (Cascadia Code) and installs it as the editor's monospace
+  face, so coding ligatures (`->`, `=>`, `!=`, …) and a broad glyph set
+  render out of the box, independent of what fonts the host has
+  installed.
 - **Native file dialogs** for open and save.
 - **Open from the command line.** `frext file.txt` opens the file on
   launch (alongside any restored session). A file that is already open is
@@ -107,6 +112,10 @@ cargo machete
 ## License
 
 MIT. See [LICENSE](LICENSE).
+
+frext bundles the CaskaydiaCove Nerd Font under the SIL Open Font
+License 1.1. See [ATTRIBUTIONS.md](ATTRIBUTIONS.md) for the full
+attribution and license details.
 
 [egui]: https://github.com/emilk/egui
 [eframe]: https://github.com/emilk/egui/tree/master/crates/eframe

@@ -136,6 +136,9 @@
 
             extraExcludes = [
               "Cargo.lock"
+              # Bundled font binaries: the whitespace / line-ending fixer hooks
+              # would corrupt these (they edit them as if they were text).
+              "\\.ttf$"
             ];
 
             baseModule = precommit.lib.mkBaseCheck { inherit system extraExcludes; };

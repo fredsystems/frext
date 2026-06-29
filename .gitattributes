@@ -3,3 +3,6 @@
 
 # Binary recording files — never apply text fixers
 *.bin binary
+
+# Bundled font binaries — never apply text fixers
+*.ttf binary

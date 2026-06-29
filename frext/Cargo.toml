@@ -25,5 +25,8 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 two-face = { workspace = true }
 
+[dev-dependencies]
+harfrust = { workspace = true }
+
 [lints]
 workspace = true

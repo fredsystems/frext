@@ -6,6 +6,7 @@
 
 pub mod app;
 pub mod error;
+pub mod font;
 pub mod highlight;
 pub mod icon;
 pub mod persistence;
