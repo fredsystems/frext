@@ -7,6 +7,7 @@
 pub mod app;
 pub mod error;
 pub mod highlight;
+pub mod icon;
 pub mod persistence;
 pub mod tab;
 pub mod theme;

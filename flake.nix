@@ -108,6 +108,14 @@
               wrapProgram $out/bin/frext \
                 --prefix LD_LIBRARY_PATH : ${runtimeLibPath} \
                 --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.zenity ]}
+
+              # Install the hicolor icon tree the `.desktop` entry's
+              # `icon = "frext"` resolves against: sized PNGs at every standard
+              # size plus a scalable SVG. Sized PNGs are required because some
+              # taskbars resolve a window's icon by app_id and only consult the
+              # sized PNG directories, skipping scalable/.
+              mkdir -p $out/share/icons/hicolor
+              cp -r ${./assets/icons/hicolor}/. $out/share/icons/hicolor/
             '';
           };
 

@@ -1,0 +1,50 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="128 84 768 768" role="img" aria-labelledby="title desc">
+  <title id="title">Frext icon</title>
+  <desc id="desc">A Catppuccin Mocha inspired app icon for the Frext text editor, featuring a large F, colorful text, and a cursor bracket.</desc>
+
+  <defs>
+    <linearGradient id="bg" x1="128" y1="64" x2="896" y2="960" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#1e1e2e"/>
+      <stop offset="1" stop-color="#11111b"/>
+    </linearGradient>
+
+    <linearGradient id="panel" x1="196" y1="120" x2="840" y2="884" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#313244"/>
+      <stop offset="1" stop-color="#181825"/>
+    </linearGradient>
+
+    <linearGradient id="letterF" x1="260" y1="240" x2="540" y2="680" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#cba6f7"/>
+      <stop offset="1" stop-color="#b4befe"/>
+    </linearGradient>
+
+    <linearGradient id="cursor" x1="714" y1="342" x2="714" y2="714" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#f5c2e7"/>
+      <stop offset="1" stop-color="#f38ba8"/>
+    </linearGradient>
+
+    <filter id="softShadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="18" stdDeviation="24" flood-color="#000000" flood-opacity="0.35"/>
+    </filter>
+  </defs>
+
+  <rect x="128" y="84" width="768" height="768" fill="url(#bg)"/>
+
+  <g filter="url(#softShadow)">
+    <rect x="168" y="124" width="688" height="688" rx="132" fill="url(#panel)" stroke="#585b70" stroke-width="14"/>
+
+    <!-- Large F mark -->
+    <path d="M284 674 V360 C284 296 336 244 400 244 H544 C556 244 566 254 566 266 V316 C566 328 556 338 544 338 H408 C382 338 360 360 360 386 V438 H506 C518 438 528 448 528 460 V508 C528 520 518 530 506 530 H360 V674 C360 686 350 696 338 696 H306 C294 696 284 686 284 674 Z" fill="url(#letterF)"/>
+
+    <!-- Cursor / editor bracket -->
+    <path d="M724 344 V674 C724 696 706 714 684 714 H604" fill="none" stroke="url(#cursor)" stroke-width="22" stroke-linecap="round" stroke-linejoin="round"/>
+
+    <!-- Frext wordmark -->
+    <g font-family="JetBrains Mono, Fira Code, Cascadia Mono, monospace" font-size="92" font-weight="700">
+      <text x="394" y="650" fill="#f38ba8">r</text>
+      <text x="476" y="650" fill="#f9e2af">e</text>
+      <text x="558" y="650" fill="#a6e3a1">x</text>
+      <text x="640" y="650" fill="#89b4fa">t</text>
+    </g>
+  </g>
+</svg>

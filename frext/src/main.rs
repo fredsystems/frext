@@ -30,11 +30,16 @@ fn main() -> eframe::Result<()> {
         }
     };
 
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_app_id("frext")
+        .with_title("frext")
+        .with_inner_size([900.0, 640.0]);
+    if let Some(icon) = frext::icon::window_icon() {
+        viewport = viewport.with_icon(icon);
+    }
+
     let native_options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_app_id("frext")
-            .with_title("frext")
-            .with_inner_size([900.0, 640.0]),
+        viewport,
         ..Default::default()
     };
 
