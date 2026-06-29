@@ -230,6 +230,14 @@ impl FrextApp {
         self.persist_session();
     }
 
+    /// Close the sidebar workspace, removing it from the persisted session so
+    /// it stays closed on the next launch. A no-op when no workspace is open.
+    fn close_workspace(&mut self) {
+        if self.workspace.take().is_some() {
+            self.persist_session();
+        }
+    }
+
     /// Show a native open-file dialog and load the chosen file into a tab.
     fn open_file(&mut self) {
         let Some(path) = rfd_pick_file() else {
@@ -414,6 +422,7 @@ impl eframe::App for FrextApp {
         if self.workspace.is_some() {
             let mut file_to_open: Option<PathBuf> = None;
             let mut expand_changes: Vec<(PathBuf, bool)> = Vec::new();
+            let mut close_workspace = false;
 
             // The active tab's file, so the tree can highlight it. Compared
             // canonicalised so a relative tree path matches an absolute tab
@@ -438,6 +447,13 @@ impl eframe::App for FrextApp {
                         // location, not a bare dot).
                         let root_label = ws.display_root();
                         ui.horizontal(|ui| {
+                            if ui
+                                .small_button("\u{00d7}")
+                                .on_hover_text("Close file tree")
+                                .clicked()
+                            {
+                                close_workspace = true;
+                            }
                             ui.strong(root_label);
                         });
                         ui.separator();
@@ -454,16 +470,22 @@ impl eframe::App for FrextApp {
                     }
                 });
 
-            for (dir, expanded) in expand_changes {
-                if let Some(ws) = self.workspace.as_mut() {
-                    if ws.set_expanded(&dir, expanded) {
-                        self.persist_session();
+            if close_workspace {
+                // Drop the sidebar and remove it from the persisted session
+                // so it stays closed on the next launch.
+                self.close_workspace();
+            } else {
+                for (dir, expanded) in expand_changes {
+                    if let Some(ws) = self.workspace.as_mut() {
+                        if ws.set_expanded(&dir, expanded) {
+                            self.persist_session();
+                        }
                     }
                 }
-            }
-            if let Some(path) = file_to_open {
-                if self.open_path(&path) {
-                    self.persist_session();
+                if let Some(path) = file_to_open {
+                    if self.open_path(&path) {
+                        self.persist_session();
+                    }
                 }
             }
         }
@@ -680,6 +702,33 @@ mod tests {
                 .iter()
                 .any(|tab| tab.path.as_deref() == Some(file.as_path()))
         );
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn closing_the_workspace_drops_it_from_the_session() {
+        let dir = temp_dir("ws-close");
+        let project = dir.join("project");
+        fs::create_dir_all(&project).unwrap();
+
+        {
+            let store = Store::at(dir.join("state")).unwrap();
+            let mut app = FrextApp::with_args(store, &[], Some(project.as_path()));
+            assert!(app.workspace.is_some());
+
+            app.close_workspace();
+            assert!(app.workspace.is_none());
+
+            // Closing again is a harmless no-op.
+            app.close_workspace();
+            assert!(app.workspace.is_none());
+        }
+
+        // The closed workspace must not come back on the next launch.
+        let store = Store::at(dir.join("state")).unwrap();
+        let restored = store.load().unwrap();
+        assert!(restored.workspace.is_none());
 
         fs::remove_dir_all(&dir).unwrap();
     }
