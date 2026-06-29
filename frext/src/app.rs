@@ -53,6 +53,9 @@ pub struct FrextApp {
     workspace: Option<Workspace>,
     /// Find/replace bar state.
     search: SearchState,
+    /// Index of a tab awaiting unsaved-changes close confirmation, if any.
+    /// While set, a modal dialog asks whether to save, discard, or cancel.
+    pending_close: Option<usize>,
 }
 
 /// A reserved line-number gutter column, to be filled by
@@ -130,6 +133,7 @@ impl FrextApp {
                 query: restored_search,
                 ..SearchState::default()
             },
+            pending_close: None,
         };
 
         for file in files {
@@ -294,6 +298,89 @@ impl FrextApp {
         self.active = self.tabs.len() - 1;
         self.persist_active_swap();
         self.persist_session();
+    }
+
+    /// Request to close the tab at `index`.
+    ///
+    /// A clean buffer is closed immediately. A buffer with unsaved changes
+    /// instead opens the confirmation modal (save / discard / cancel) by
+    /// recording `index` in `pending_close`; the actual close happens when the
+    /// user chooses save or discard.
+    fn request_close_tab(&mut self, index: usize) {
+        let Some(tab) = self.tabs.get(index) else {
+            return;
+        };
+        if tab.is_dirty() {
+            self.pending_close = Some(index);
+        } else {
+            self.close_tab(index);
+        }
+    }
+
+    /// Render and resolve the unsaved-changes confirmation modal.
+    ///
+    /// A no-op when no close is pending. Otherwise it shows a modal with
+    /// "Save and close", "Discard changes", and "Cancel". Clicking the
+    /// backdrop or pressing Escape cancels (keeping the tab open). A
+    /// "Save and close" that is itself cancelled (an untitled tab whose
+    /// save-as dialog is dismissed, or a write error) leaves the tab open and
+    /// dismisses the modal rather than silently discarding the buffer.
+    fn resolve_pending_close(&mut self, ctx: &egui::Context) {
+        let Some(index) = self.pending_close else {
+            return;
+        };
+
+        // The tab may have been removed out from under a stale request.
+        let Some(title) = self.tabs.get(index).map(Tab::display_name) else {
+            self.pending_close = None;
+            return;
+        };
+
+        let mut choice = CloseChoice::Pending;
+        let modal =
+            egui::Modal::new(egui::Id::new(("frext_confirm_close", index))).show(ctx, |ui| {
+                ui.set_min_width(320.0);
+                ui.heading("Unsaved changes");
+                ui.add_space(4.0);
+                ui.label(format!(
+                    "\u{201c}{title}\u{201d} has unsaved changes. \
+                     What would you like to do?"
+                ));
+                ui.add_space(12.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Save and close").clicked() {
+                        choice = CloseChoice::Save;
+                    }
+                    if ui.button("Discard changes").clicked() {
+                        choice = CloseChoice::Discard;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        choice = CloseChoice::Cancel;
+                    }
+                });
+            });
+
+        // Clicking outside the dialog, or pressing Escape, cancels the close.
+        if modal.should_close() {
+            choice = CloseChoice::Cancel;
+        }
+
+        match choice {
+            CloseChoice::Pending => {}
+            CloseChoice::Cancel => self.pending_close = None,
+            CloseChoice::Discard => {
+                self.pending_close = None;
+                self.close_tab(index);
+            }
+            CloseChoice::Save => {
+                self.pending_close = None;
+                // Only close if the save actually succeeded; a cancelled
+                // save-as or a write error keeps the buffer open.
+                if self.save_tab(index) {
+                    self.close_tab(index);
+                }
+            }
+        }
     }
 
     /// Close the tab at `index`, removing its swap file.
@@ -656,28 +743,37 @@ impl FrextApp {
 
     /// Save the active tab. Prompts for a path when the buffer is untitled.
     fn save_active(&mut self) {
-        let Some(tab) = self.tabs.get(self.active) else {
-            return;
+        self.save_tab(self.active);
+    }
+
+    /// Save the tab at `index` to disk, prompting for a path when the tab is
+    /// untitled. Returns `true` when the buffer was written (so it is now
+    /// clean), and `false` when the save did not happen — an out-of-range
+    /// index, a cancelled save-as dialog, or an I/O error.
+    fn save_tab(&mut self, index: usize) -> bool {
+        let Some(tab) = self.tabs.get(index) else {
+            return false;
         };
 
         let path = match tab.path.clone() {
             Some(path) => path,
             None => match rfd_save_file() {
                 Some(path) => path,
-                None => return,
+                None => return false,
             },
         };
 
         if let Err(err) = std::fs::write(&path, &tab.text) {
             log::error!("failed to save {}: {err}", path.display());
-            return;
+            return false;
         }
 
-        if let Some(tab) = self.tabs.get_mut(self.active) {
+        if let Some(tab) = self.tabs.get_mut(index) {
             tab.path = Some(path);
             tab.saved_text = tab.text.clone();
         }
         self.persist_session();
+        true
     }
 
     /// Render the contents of one directory in the file tree.
@@ -1037,8 +1133,8 @@ impl eframe::App for FrextApp {
             MenuAction::NewTab => self.new_tab(),
             MenuAction::Open => self.open_file(),
             MenuAction::Save => self.save_active(),
-            MenuAction::CloseActive => self.close_tab(self.active),
-            MenuAction::Close(index) => self.close_tab(index),
+            MenuAction::CloseActive => self.request_close_tab(self.active),
+            MenuAction::Close(index) => self.request_close_tab(index),
             MenuAction::Select(index) => {
                 self.active = index;
                 self.persist_session();
@@ -1059,6 +1155,10 @@ impl eframe::App for FrextApp {
             SearchAction::ReplaceCurrent => self.replace_current(),
             SearchAction::ReplaceAll => self.replace_all(),
         }
+
+        // Unsaved-changes confirmation modal, shown when a dirty tab's close
+        // was requested. Resolved after rendering to keep the borrow simple.
+        self.resolve_pending_close(&ctx);
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
@@ -1117,6 +1217,19 @@ enum MenuAction {
     CloseActive,
     Close(usize),
     Select(usize),
+}
+
+/// The user's choice in the unsaved-changes confirmation modal, collected
+/// while the modal is borrowed and applied afterwards.
+enum CloseChoice {
+    /// No button pressed yet this frame.
+    Pending,
+    /// Save the buffer, then close the tab.
+    Save,
+    /// Close the tab without saving.
+    Discard,
+    /// Keep the tab open.
+    Cancel,
 }
 
 /// A deferred find/replace action, applied after the editor borrow ends.
@@ -1231,6 +1344,80 @@ mod tests {
     #[test]
     fn line_numbers_single_row() {
         assert_eq!(line_numbers_for_rows([false]), vec![(0, 1)]);
+    }
+
+    #[test]
+    fn requesting_close_of_a_clean_tab_closes_immediately() {
+        let dir = temp_dir("close-clean");
+        let mut app = app_in(&dir);
+
+        // Two clean tabs so closing one does not hit the "always keep one"
+        // replacement path.
+        app.new_tab();
+        let before = app.tabs.len();
+        assert!(!app.tabs[0].is_dirty());
+
+        app.request_close_tab(0);
+
+        assert!(app.pending_close.is_none(), "a clean close needs no prompt");
+        assert_eq!(app.tabs.len(), before - 1);
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn requesting_close_of_a_dirty_tab_prompts_instead_of_closing() {
+        let dir = temp_dir("close-dirty");
+        let mut app = app_in(&dir);
+        app.new_tab();
+        let before = app.tabs.len();
+
+        // Make tab 0 dirty.
+        app.tabs[0].text.push_str("unsaved work");
+        assert!(app.tabs[0].is_dirty());
+
+        app.request_close_tab(0);
+
+        assert_eq!(
+            app.pending_close,
+            Some(0),
+            "a dirty close must open the confirmation prompt"
+        );
+        assert_eq!(app.tabs.len(), before, "the tab must not be closed yet");
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn saving_a_dirty_tab_clears_its_dirty_state() {
+        let dir = temp_dir("save-clears-dirty");
+        let file = dir.join("doc.txt");
+        fs::write(&file, "original").unwrap();
+
+        let mut app = app_in(&dir);
+        assert!(app.open_path(&file));
+        let index = app.active;
+
+        app.tabs[index].text = "edited".to_owned();
+        assert!(app.tabs[index].is_dirty());
+
+        // save_tab is what "Save and close" calls; it must succeed and clean
+        // the buffer, gating the subsequent close.
+        assert!(app.save_tab(index));
+        assert!(!app.tabs[index].is_dirty());
+        assert_eq!(fs::read_to_string(&file).unwrap(), "edited");
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn save_tab_on_out_of_range_index_is_a_noop_failure() {
+        let dir = temp_dir("save-oob");
+        let mut app = app_in(&dir);
+
+        assert!(!app.save_tab(app.tabs.len() + 5));
+
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     /// Create an isolated temp directory unique to this test.

@@ -105,14 +105,22 @@ impl Tab {
         self.text != self.saved_text
     }
 
+    /// The buffer's display name: the backing file's name, or "untitled" for
+    /// a buffer that has never been saved. Unlike [`Self::title`] this carries
+    /// no dirty marker, so it reads naturally inside a sentence.
+    #[must_use]
+    pub fn display_name(&self) -> String {
+        self.path.as_ref().and_then(|p| p.file_name()).map_or_else(
+            || "untitled".to_owned(),
+            |name| name.to_string_lossy().into_owned(),
+        )
+    }
+
     /// The short title to display on the tab (file name or "untitled"),
     /// with a leading marker when the buffer is dirty.
     #[must_use]
     pub fn title(&self) -> String {
-        let base = self.path.as_ref().and_then(|p| p.file_name()).map_or_else(
-            || "untitled".to_owned(),
-            |name| name.to_string_lossy().into_owned(),
-        );
+        let base = self.display_name();
 
         if self.is_dirty() {
             format!("\u{2022} {base}")
