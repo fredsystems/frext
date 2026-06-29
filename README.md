@@ -22,6 +22,10 @@ syntax highlighting.
   face, so coding ligatures (`->`, `=>`, `!=`, …) and a broad glyph set
   render out of the box, independent of what fonts the host has
   installed.
+- **Emoji.** frext discovers a usable system emoji font at startup and
+  slots it into the font fallback chain, so emoji in a file render
+  (monochrome — egui cannot draw colour emoji). Colour-bitmap fonts that
+  egui cannot rasterise are skipped automatically.
 - **Native file dialogs** for open and save.
 - **Open from the command line.** `frext file.txt` opens the file on
   launch (alongside any restored session). A file that is already open is
