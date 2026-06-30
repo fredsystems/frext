@@ -799,18 +799,30 @@ impl FrextApp {
                 .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
             let was_open = ws.is_expanded(&sub);
 
-            // `default_open` seeds the header's state from the persisted
-            // expanded set on first sight; thereafter egui owns the live
-            // open/closed state and a header click toggles it. We mirror
-            // each toggle back into the workspace via `expand_changes`.
-            let response = egui::CollapsingHeader::new(name)
-                .id_salt(&sub)
-                .default_open(was_open)
-                .show(ui, |ui| {
+            // Drive a `CollapsingState` directly (rather than the simpler
+            // `CollapsingHeader`) so the folder's type-specific icon can sit
+            // in the header next to its name. The persisted expanded set seeds
+            // the state on first sight; thereafter egui owns the live
+            // open/closed state and a header click toggles it, which we mirror
+            // back into the workspace via `expand_changes`.
+            let id = ui.make_persistent_id(&sub);
+            let state = egui::collapsing_header::CollapsingState::load_with_default_open(
+                ui.ctx(),
+                id,
+                was_open,
+            );
+            let is_open = state.is_open();
+
+            let (_toggle, header, _body) = state
+                .show_header(ui, |ui| {
+                    Self::file_icon(ui, crate::file_icon::icon_for_dir(&name, is_open));
+                    ui.label(name);
+                })
+                .body(|ui| {
                     Self::tree_dir(ui, ws, &sub, active_canonical, file_to_open, expand_changes);
                 });
 
-            if response.header_response.clicked() {
+            if header.response.clicked() {
                 expand_changes.push((sub.clone(), !was_open));
             }
         }
@@ -824,9 +836,30 @@ impl FrextApp {
             let is_active = active_canonical
                 .is_some_and(|active| file.canonicalize().ok().as_deref() == Some(active));
 
-            if ui.selectable_label(is_active, name).clicked() {
+            let clicked = ui
+                .horizontal(|ui| {
+                    Self::file_icon(ui, crate::file_icon::icon_for_file(&name));
+                    ui.selectable_label(is_active, name).clicked()
+                })
+                .inner;
+            if clicked {
                 *file_to_open = Some(file);
             }
+        }
+    }
+
+    /// Draw the file-type icon for `stem` inline, sized to the current text
+    /// row. A stem with no embedded artwork (which should not occur for stems
+    /// produced by [`crate::file_icon`]) simply renders nothing, leaving the
+    /// row icon-less rather than failing.
+    fn file_icon(ui: &mut egui::Ui, stem: &'static str) {
+        let size = ui.text_style_height(&egui::TextStyle::Body);
+        if let Some(source) = crate::file_icon::image_source(stem) {
+            ui.add(
+                egui::Image::new(source)
+                    .fit_to_exact_size(egui::vec2(size, size))
+                    .maintain_aspect_ratio(true),
+            );
         }
     }
 }

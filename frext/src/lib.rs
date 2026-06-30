@@ -6,6 +6,9 @@
 
 pub mod app;
 pub mod error;
+pub mod file_icon;
+mod file_icon_bytes;
+mod file_icon_table;
 pub mod font;
 pub mod highlight;
 pub mod icon;

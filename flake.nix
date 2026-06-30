@@ -139,6 +139,13 @@
               # Bundled font binaries: the whitespace / line-ending fixer hooks
               # would corrupt these (they edit them as if they were text).
               "\\.ttf$"
+              # Vendored Catppuccin file-type icon assets and the Rust lookup
+              # tables generated from them: third-party / machine-generated, so
+              # they are not ours to lint (codespell trips on icon names like
+              # the `ags` and `tese` file extensions).
+              "^assets/file-icons/"
+              "^frext/src/file_icon_table\\.rs$"
+              "^frext/src/file_icon_bytes\\.rs$"
             ];
 
             baseModule = precommit.lib.mkBaseCheck { inherit system extraExcludes; };
