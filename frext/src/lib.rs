@@ -10,6 +10,7 @@ pub mod file_icon;
 mod file_icon_bytes;
 mod file_icon_table;
 pub mod font;
+pub mod fs_ops;
 pub mod highlight;
 pub mod icon;
 pub mod persistence;

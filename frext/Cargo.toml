@@ -25,6 +25,7 @@ rfd = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+trash = { workspace = true }
 ttf-parser = { workspace = true }
 two-face = { workspace = true }
 
