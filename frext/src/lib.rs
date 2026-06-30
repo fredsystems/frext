@@ -5,6 +5,8 @@
 //! backend.
 
 pub mod app;
+pub mod clipboard;
+pub mod edit_ops;
 pub mod error;
 pub mod file_icon;
 mod file_icon_bytes;
