@@ -49,6 +49,9 @@ fn main() -> eframe::Result<()> {
         Box::new(move |cc| {
             frext::font::apply(&cc.egui_ctx);
             frext::theme::apply(&cc.egui_ctx);
+            // Register egui_extras' image loaders (SVG) so the sidebar's
+            // file-type icons render.
+            egui_extras::install_image_loaders(&cc.egui_ctx);
             Ok(Box::new(FrextApp::with_args(store, &files, dir.as_deref())))
         }),
     )
