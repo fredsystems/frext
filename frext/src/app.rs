@@ -444,6 +444,120 @@ impl FrextApp {
         }
     }
 
+    /// Apply a deferred editor context-menu action after the editor borrow has
+    /// ended.
+    ///
+    /// Clipboard text edits (cut/copy/paste) act on the captured char
+    /// `selection` over the active buffer, then store the resulting caret back
+    /// into the live `TextEdit` state under `editor_id` so the cursor follows
+    /// the edit. Find/replace and save reuse the existing deferred actions.
+    ///
+    /// Returns `true` when the buffer changed (so the caller can persist and
+    /// refresh matches), matching how the editor's own `changed()` is handled.
+    fn apply_editor_action(
+        &mut self,
+        ctx: &egui::Context,
+        action: EditorAction,
+        editor_id: Option<egui::Id>,
+        selection: Option<Range<usize>>,
+    ) -> bool {
+        let selection = selection.unwrap_or(0..0);
+
+        match action {
+            EditorAction::None => false,
+            EditorAction::Copy => {
+                if let Some(tab) = self.tabs.get(self.active) {
+                    let text =
+                        crate::edit_ops::selected_text(&tab.text, selection.start, selection.end);
+                    if !text.is_empty() {
+                        crate::clipboard::write_text(text);
+                    }
+                }
+                false
+            }
+            EditorAction::Cut => {
+                let Some(tab) = self.tabs.get_mut(self.active) else {
+                    return false;
+                };
+                let text =
+                    crate::edit_ops::selected_text(&tab.text, selection.start, selection.end);
+                if text.is_empty() {
+                    return false;
+                }
+                crate::clipboard::write_text(text);
+                let caret =
+                    crate::edit_ops::delete_range(&mut tab.text, selection.start, selection.end);
+                Self::store_caret(ctx, editor_id, caret);
+                true
+            }
+            EditorAction::Paste => {
+                let Some(clip) = crate::clipboard::read_text() else {
+                    return false;
+                };
+                if clip.is_empty() {
+                    return false;
+                }
+                let Some(tab) = self.tabs.get_mut(self.active) else {
+                    return false;
+                };
+                let caret = crate::edit_ops::replace_range(
+                    &mut tab.text,
+                    selection.start,
+                    selection.end,
+                    &clip,
+                );
+                Self::store_caret(ctx, editor_id, caret);
+                true
+            }
+            EditorAction::SelectAll => {
+                if let (Some(tab), Some(id)) = (self.tabs.get(self.active), editor_id) {
+                    let len = tab.text.chars().count();
+                    if let Some(mut state) = egui::text_edit::TextEditState::load(ctx, id) {
+                        state
+                            .cursor
+                            .set_char_range(Some(egui::text::CCursorRange::two(
+                                egui::text::CCursor::new(0),
+                                egui::text::CCursor::new(len),
+                            )));
+                        state.store(ctx, id);
+                    }
+                    ctx.memory_mut(|m| m.request_focus(id));
+                }
+                false
+            }
+            EditorAction::Find => {
+                self.open_search(false);
+                false
+            }
+            EditorAction::FindReplace => {
+                self.open_search(true);
+                false
+            }
+            EditorAction::Save => {
+                self.save_active();
+                false
+            }
+        }
+    }
+
+    /// Store `caret` (a character index) as a collapsed selection into the
+    /// `TextEdit` state under `editor_id`, and refocus the editor, so the
+    /// cursor tracks a programmatic edit. A no-op when there is no id or no
+    /// stored state yet.
+    fn store_caret(ctx: &egui::Context, editor_id: Option<egui::Id>, caret: usize) {
+        let Some(id) = editor_id else {
+            return;
+        };
+        if let Some(mut state) = egui::text_edit::TextEditState::load(ctx, id) {
+            let cursor = egui::text::CCursor::new(caret);
+            state
+                .cursor
+                .set_char_range(Some(egui::text::CCursorRange::one(cursor)));
+            state.store(ctx, id);
+        }
+        ctx.memory_mut(|m| m.request_focus(id));
+    }
+
     /// Apply a deferred sidebar context-menu action after the tree borrow has
     /// ended. The mutating actions (rename, create, trash) open a modal or
     /// touch the filesystem and reconcile any affected open tabs.
@@ -1226,6 +1340,52 @@ impl FrextApp {
         }
     }
 
+    /// The right-click menu for the editor surface. `has_selection` greys out
+    /// Cut/Copy when there is nothing selected. Choices are recorded in
+    /// `editor_action` and applied after the editor borrow ends.
+    fn editor_context_menu(
+        ui: &mut egui::Ui,
+        has_selection: bool,
+        editor_action: &mut EditorAction,
+    ) {
+        if ui
+            .add_enabled(has_selection, egui::Button::new("Cut"))
+            .clicked()
+        {
+            *editor_action = EditorAction::Cut;
+            ui.close();
+        }
+        if ui
+            .add_enabled(has_selection, egui::Button::new("Copy"))
+            .clicked()
+        {
+            *editor_action = EditorAction::Copy;
+            ui.close();
+        }
+        if ui.button("Paste").clicked() {
+            *editor_action = EditorAction::Paste;
+            ui.close();
+        }
+        if ui.button("Select all").clicked() {
+            *editor_action = EditorAction::SelectAll;
+            ui.close();
+        }
+        ui.separator();
+        if ui.button("Find\u{2026}").clicked() {
+            *editor_action = EditorAction::Find;
+            ui.close();
+        }
+        if ui.button("Find and replace\u{2026}").clicked() {
+            *editor_action = EditorAction::FindReplace;
+            ui.close();
+        }
+        ui.separator();
+        if ui.button("Save").clicked() {
+            *editor_action = EditorAction::Save;
+            ui.close();
+        }
+    }
+
     /// Draw the file-type icon for `stem` inline, sized to the current text
     /// row. A stem with no embedded artwork (which should not occur for stems
     /// produced by [`crate::file_icon`]) simply renders nothing, leaving the
@@ -1461,6 +1621,12 @@ impl eframe::App for FrextApp {
         let scroll_to = self.search.scroll_to.take();
         let mut new_selection: Option<Range<usize>> = None;
         let mut changed = false;
+        // Editor context-menu plumbing: the chosen action plus what applying
+        // it needs (the editor's id and the live char selection), captured
+        // inside the closure and applied after the borrow ends.
+        let mut editor_action = EditorAction::None;
+        let mut editor_char_selection: Option<Range<usize>> = None;
+        let mut editor_id_out: Option<egui::Id> = None;
 
         egui::CentralPanel::default().show(ui, |ui| {
             if let Some(tab) = self.tabs.get_mut(self.active) {
@@ -1526,12 +1692,32 @@ impl eframe::App for FrextApp {
                                 output.response.scroll_to_me(Some(egui::Align::Center));
                             }
 
-                            // Capture the live selection (char -> byte) so a
-                            // search-within-selection can scope to it.
-                            new_selection = output.cursor_range.map(|range| {
+                            // Capture the live selection as char and byte
+                            // ranges: the byte range scopes a
+                            // search-within-selection, the char range drives
+                            // the cut/copy/paste menu (egui cursors are
+                            // char-based).
+                            if let Some(range) = output.cursor_range {
                                 let lo = range.primary.index.0.min(range.secondary.index.0);
                                 let hi = range.primary.index.0.max(range.secondary.index.0);
-                                byte_index(&tab.text, lo)..byte_index(&tab.text, hi)
+                                editor_char_selection = Some(lo..hi);
+                                new_selection =
+                                    Some(byte_index(&tab.text, lo)..byte_index(&tab.text, hi));
+                            } else {
+                                editor_char_selection = None;
+                                new_selection = None;
+                            }
+                            editor_id_out = Some(editor_id);
+
+                            // Right-click menu for the editing surface. egui's
+                            // `TextEdit` ships no context menu of its own, so
+                            // this adds one; choices are deferred like the menu
+                            // bar's and applied after the borrow ends.
+                            let has_selection = editor_char_selection
+                                .as_ref()
+                                .is_some_and(|r| r.start != r.end);
+                            output.response.context_menu(|ui| {
+                                Self::editor_context_menu(ui, has_selection, &mut editor_action);
                             });
 
                             output.response
@@ -1543,6 +1729,16 @@ impl eframe::App for FrextApp {
                 changed = output.changed();
             }
         });
+
+        // Apply a deferred editor context-menu action (cut/copy/paste/select
+        // all/find/save). A clipboard edit that mutates the buffer is folded
+        // into `changed` so it persists and refreshes matches just like a
+        // typed edit.
+        if !matches!(editor_action, EditorAction::None) {
+            let edited =
+                self.apply_editor_action(&ctx, editor_action, editor_id_out, editor_char_selection);
+            changed = changed || edited;
+        }
 
         if changed {
             self.persist_active_swap();
@@ -1690,6 +1886,26 @@ enum CloseChoice {
     Discard,
     /// Keep the tab open.
     Cancel,
+}
+
+/// A deferred editor context-menu action, collected while the editor is
+/// borrowed and applied after the borrow ends (mirroring [`MenuAction`]).
+enum EditorAction {
+    None,
+    /// Copy the selection to the clipboard, then delete it from the buffer.
+    Cut,
+    /// Copy the selection to the clipboard.
+    Copy,
+    /// Replace the selection (or insert at the caret) with the clipboard text.
+    Paste,
+    /// Select the entire buffer.
+    SelectAll,
+    /// Open the find bar.
+    Find,
+    /// Open the find-and-replace bar.
+    FindReplace,
+    /// Save the active buffer.
+    Save,
 }
 
 /// A deferred sidebar context-menu action, collected while the file tree is
@@ -2329,6 +2545,69 @@ mod tests {
             app.relative_to_root(&outside),
             outside.display().to_string()
         );
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn cut_deletes_the_selection_from_the_buffer() {
+        let dir = temp_dir("editor-cut");
+        let mut app = app_in(&dir);
+        app.tabs[app.active].text = "hello world".to_owned();
+
+        // Cut "hello " (chars 0..6). The clipboard write may be unavailable in
+        // a headless test environment, but the buffer deletion is independent
+        // of that and must happen.
+        let ctx = egui::Context::default();
+        let changed = app.apply_editor_action(&ctx, EditorAction::Cut, None, Some(0..6));
+
+        assert!(changed);
+        assert_eq!(app.tabs[app.active].text, "world");
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn copy_does_not_mutate_the_buffer() {
+        let dir = temp_dir("editor-copy");
+        let mut app = app_in(&dir);
+        app.tabs[app.active].text = "keep me".to_owned();
+
+        let ctx = egui::Context::default();
+        let changed = app.apply_editor_action(&ctx, EditorAction::Copy, None, Some(0..4));
+
+        assert!(!changed);
+        assert_eq!(app.tabs[app.active].text, "keep me");
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn find_action_opens_the_search_bar() {
+        let dir = temp_dir("editor-find");
+        let mut app = app_in(&dir);
+        assert!(!app.search.open);
+
+        let ctx = egui::Context::default();
+        let changed = app.apply_editor_action(&ctx, EditorAction::Find, None, None);
+
+        assert!(!changed);
+        assert!(app.search.open);
+        assert!(!app.search.replace_open);
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn find_replace_action_opens_the_replace_row() {
+        let dir = temp_dir("editor-replace");
+        let mut app = app_in(&dir);
+
+        let ctx = egui::Context::default();
+        app.apply_editor_action(&ctx, EditorAction::FindReplace, None, None);
+
+        assert!(app.search.open);
+        assert!(app.search.replace_open);
 
         fs::remove_dir_all(&dir).unwrap();
     }

@@ -13,6 +13,7 @@ keywords.workspace = true
 categories.workspace = true
 
 [dependencies]
+arboard = { workspace = true }
 directories = { workspace = true }
 eframe = { workspace = true }
 egui = { workspace = true }

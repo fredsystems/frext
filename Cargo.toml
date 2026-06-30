@@ -16,6 +16,7 @@ keywords = ["editor", "text-editor", "gui", "egui"]
 categories = ["text-editors", "gui"]
 
 [workspace.dependencies]
+arboard = { version = "3.6.1", default-features = false }
 directories = "6.0.0"
 eframe = { version = "0.35.0", default-features = false, features = ["default_fonts", "glow", "persistence", "wayland", "x11"] }
 egui = { version = "0.35.0", default-features = false }
