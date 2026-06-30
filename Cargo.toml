@@ -23,7 +23,7 @@ egui = { version = "0.35.0", default-features = false }
 egui_extras = { version = "0.35.0", default-features = false, features = ["svg"] }
 env_logger = "0.11.11"
 fontdb = "0.23.0"
-harfrust = "0.7.0"
+harfrust = "0.11.0"
 log = "0.4.33"
 regex = "1.12.4"
 rfd = "0.17.2"

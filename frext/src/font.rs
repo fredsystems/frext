@@ -240,7 +240,7 @@ mod tests {
         Color32, FontFamily, FontId,
         epaint::text::{Fonts, TextOptions},
     };
-    use harfrust::{Feature, ShaperData, Tag, UnicodeBuffer};
+    use harfrust::{Feature, ShapeOptions, ShaperData, Tag, UnicodeBuffer};
 
     /// The embedded face must be non-empty. A truncated/zero-length copy is
     /// the most likely asset accident; a malformed TTF is caught instead when
@@ -307,7 +307,7 @@ mod tests {
             Feature::new(Tag::new(b"clig"), value, ..),
             Feature::new(Tag::new(b"rclt"), value, ..),
         ];
-        let glyphs = shaper.shape(buffer, &off);
+        let glyphs = shaper.shape(buffer, ShapeOptions::new().features(&off));
         glyphs
             .glyph_infos()
             .iter()
