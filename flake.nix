@@ -51,7 +51,7 @@
           runtimeLibs = [
             pkgs.libxkbcommon
           ]
-          ++ pkgs.lib.optionals pkgs.stdenv.isLinux [
+          ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [
             pkgs.dbus.lib
             pkgs.wayland
             pkgs.libGL
@@ -94,17 +94,17 @@
               pkgs.pkg-config
               pkgs.makeWrapper
             ]
-            ++ pkgs.lib.optionals pkgs.stdenv.isLinux [
+            ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [
               pkgs.copyDesktopItems
             ];
 
             buildInputs = runtimeLibs;
 
-            desktopItems = pkgs.lib.optionals pkgs.stdenv.isLinux [
+            desktopItems = pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [
               desktopItem
             ];
 
-            postInstall = pkgs.lib.optionalString pkgs.stdenv.isLinux ''
+            postInstall = pkgs.lib.optionalString pkgs.stdenv.hostPlatform.isLinux ''
               wrapProgram $out/bin/frext \
                 --prefix LD_LIBRARY_PATH : ${runtimeLibPath} \
                 --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.zenity ]}
@@ -213,7 +213,7 @@
                 pkgs.typos
                 pkgs.markdownlint-cli2
               ]
-              ++ pkgs.lib.optionals pkgs.stdenv.isLinux [
+              ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [
                 pkgs.cargo-llvm-cov
               ];
 
@@ -222,7 +222,7 @@
               # Runtime tools the editor shells out to. `rfd` uses zenity as
               # its file-dialog fallback when no XDG desktop portal FileChooser
               # backend is available on the session.
-              runtimeTools = pkgs.lib.optionals pkgs.stdenv.isLinux [
+              runtimeTools = pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [
                 pkgs.zenity
               ];
 
@@ -232,7 +232,7 @@
                   pkgs.libGL
                   pkgs.libxkbcommon
                 ]
-                ++ pkgs.lib.optionals pkgs.stdenv.isLinux [
+                ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [
                   pkgs.dbus.lib
                   pkgs.wayland
                 ];
