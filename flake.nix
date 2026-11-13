@@ -98,7 +98,7 @@
               pkgs.copyDesktopItems
             ];
 
-            buildInputs = runtimeLibs;
+            buildInputs = runtimeLibs ++ [ pkgs.oniguruma ];
 
             desktopItems = pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [
               desktopItem
