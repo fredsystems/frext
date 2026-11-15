@@ -33,6 +33,10 @@ jobs:
           use-gha-cache: false
 
       - name: Run pre-commit in devShell
+        env:
+          # Lets the lychee link check use the GitHub API for github.com links
+          # instead of being rate limited.
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
           nix develop --impure --command bash -e -c '
             set -euxo pipefail
