@@ -35,6 +35,7 @@ impl Editor {
             })
         }) {
             self.active = index;
+            self.recompute_matches();
             return true;
         }
 
@@ -47,6 +48,7 @@ impl Editor {
                 }
                 self.tabs.push(tab);
                 self.active = self.tabs.len() - 1;
+                self.recompute_matches();
                 true
             }
             Err(err) => {
@@ -73,6 +75,7 @@ impl Editor {
         let id = self.alloc_id();
         self.tabs.push(Tab::new_untitled(id));
         self.active = self.tabs.len() - 1;
+        self.recompute_matches();
         self.persist_active_swap();
         self.persist_session();
     }
@@ -248,6 +251,7 @@ impl Editor {
         } else if self.active >= self.tabs.len() {
             self.active = self.tabs.len() - 1;
         }
+        self.recompute_matches();
 
         self.persist_session();
     }

@@ -174,6 +174,7 @@ impl Editor {
         if let Some(tab) = self.tabs.get_mut(self.active)
             && tab.reload_if_changed_on_disk()
         {
+            self.recompute_matches();
             self.persist_active_swap();
             self.persist_session();
         }

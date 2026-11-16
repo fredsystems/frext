@@ -799,4 +799,131 @@ mod tests {
 
         fs::remove_dir_all(&dir).unwrap();
     }
+
+    /// Write `text` to `dir/name`, returning the path.
+    fn file(dir: &Path, name: &str, text: &str) -> PathBuf {
+        let path = dir.join(name);
+        fs::write(&path, text).unwrap();
+        path
+    }
+
+    /// An editor with `files` open (the last one active), the find bar open
+    /// and "foo" searched in the active buffer.
+    fn searching_foo(dir: &Path, files: &[PathBuf]) -> Editor {
+        let store = Store::at(dir.join("state")).unwrap();
+        let mut editor = Editor::open(store, Box::new(MemoryClipboard::default()), files, None);
+        editor.apply(Command::OpenSearch(SearchBar::Find));
+        *editor.search_pattern_mut() = "foo".to_owned();
+        editor.apply(Command::RecomputeMatches);
+        editor
+    }
+
+    #[test]
+    fn opening_a_path_refreshes_matches_for_the_new_buffer() {
+        let dir = temp_dir("open-path");
+        let a = file(&dir, "a.txt", "foo xxxx");
+        let b = file(&dir, "b.txt", "xxxx foo");
+        let mut editor = searching_foo(&dir, &[a]);
+        assert_eq!(editor.search().matches(), [Range { start: 0, end: 3 }]);
+
+        editor.apply(Command::OpenPath(b));
+
+        assert_eq!(editor.active_tab().unwrap().text, "xxxx foo");
+        assert_eq!(editor.search().matches(), [Range { start: 5, end: 8 }]);
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn focusing_an_already_open_path_refreshes_matches() {
+        let dir = temp_dir("refocus-path");
+        let a = file(&dir, "a.txt", "foo xxxx");
+        let b = file(&dir, "b.txt", "xxxx foo");
+        let mut editor = searching_foo(&dir, &[b.clone(), a]);
+        assert_eq!(editor.active_tab().unwrap().text, "foo xxxx");
+        assert_eq!(editor.search().matches(), [Range { start: 0, end: 3 }]);
+
+        editor.apply(Command::OpenPath(b));
+
+        assert_eq!(editor.active_tab().unwrap().text, "xxxx foo");
+        assert_eq!(editor.search().matches(), [Range { start: 5, end: 8 }]);
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_new_tab_has_no_stale_matches() {
+        let dir = temp_dir("new-tab");
+        let a = file(&dir, "a.txt", "foo foo");
+        let mut editor = searching_foo(&dir, &[a]);
+        assert_eq!(editor.search().matches(), [0..3, 4..7]);
+
+        editor.apply(Command::NewTab);
+
+        assert!(editor.search().matches().is_empty());
+        assert_eq!(editor.search().current(), None);
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn closing_a_tab_refreshes_matches_for_the_next_active_buffer() {
+        let dir = temp_dir("close-tab");
+        let a = file(&dir, "a.txt", "foo xxxx");
+        let b = file(&dir, "b.txt", "xxxx foo");
+        let mut editor = searching_foo(&dir, &[a, b]);
+        let a_index = editor
+            .tabs()
+            .iter()
+            .position(|t| t.text == "foo xxxx")
+            .unwrap();
+        editor.apply(Command::SelectTab(a_index));
+        assert_eq!(editor.search().matches(), [Range { start: 0, end: 3 }]);
+
+        // Closing the clean active tab focuses "xxxx foo" in its slot.
+        editor.apply(Command::RequestClose(a_index));
+
+        assert_eq!(editor.active_tab().unwrap().text, "xxxx foo");
+        assert_eq!(editor.search().matches(), [Range { start: 5, end: 8 }]);
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn an_external_reload_refreshes_matches() {
+        let dir = temp_dir("reload");
+        let a = file(&dir, "a.txt", "foo x");
+        let mut editor = searching_foo(&dir, std::slice::from_ref(&a));
+        assert_eq!(editor.search().matches(), [Range { start: 0, end: 3 }]);
+
+        // An external writer changes the file's length.
+        fs::write(&a, "xx foo").unwrap();
+        editor.begin_frame(|| {});
+
+        assert_eq!(editor.active_tab().unwrap().text, "xx foo");
+        assert_eq!(editor.search().matches(), [Range { start: 3, end: 6 }]);
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn stale_matches_never_split_a_multi_byte_char() {
+        let dir = temp_dir("multi-byte");
+        let a = file(&dir, "a.txt", "foo");
+        let b = file(&dir, "b.txt", "éé");
+        let mut editor = searching_foo(&dir, &[a]);
+        assert_eq!(editor.search().matches(), [Range { start: 0, end: 3 }]);
+
+        editor.apply(Command::OpenPath(b));
+
+        let text = &editor.active_tab().unwrap().text;
+        assert_eq!(text, "éé");
+        for range in editor.search().matches() {
+            assert!(text.is_char_boundary(range.start), "{range:?}");
+            assert!(text.is_char_boundary(range.end), "{range:?}");
+        }
+        assert!(editor.search().matches().is_empty());
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
 }
