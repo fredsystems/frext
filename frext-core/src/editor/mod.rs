@@ -95,7 +95,8 @@ impl Editor {
     /// than opened a second time; the last successfully opened file becomes
     /// the active tab. A `dir` replaces any restored workspace root (but
     /// keeps the previously-expanded folder set when the root is
-    /// unchanged).
+    /// unchanged). When there was nothing to restore, the fallback untitled
+    /// tab is persisted straight away so edits to it survive a crash.
     #[must_use]
     pub fn open(
         store: Store,
@@ -125,7 +126,8 @@ impl Editor {
         };
 
         // Always guarantee at least one tab to edit.
-        if tabs.is_empty() {
+        let created_fallback = tabs.is_empty();
+        if created_fallback {
             tabs.push(Tab::new_untitled(next_id));
             next_id += 1;
         }
@@ -155,10 +157,14 @@ impl Editor {
             selection: None,
         };
 
+        if created_fallback {
+            // The fallback is the only tab, so it is the active one.
+            editor.persist_active_swap();
+        }
         for file in files {
             editor.open_path(file);
         }
-        if !files.is_empty() || dir.is_some() {
+        if created_fallback || !files.is_empty() || dir.is_some() {
             editor.persist_session();
         }
 
@@ -552,6 +558,45 @@ mod tests {
             let tab = restored.tabs.iter().find(|t| t.id == *id).unwrap();
             assert_eq!(tab.text, format!("tab {i}"));
         }
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_first_launch_fallback_tab_survives_a_crash() {
+        let dir = temp_dir("first-launch-crash");
+        let mut editor = open_in(&dir, &[], None);
+        let id = editor.active_tab().unwrap().id;
+
+        editor
+            .active_view_mut()
+            .unwrap()
+            .tab
+            .text
+            .push_str("typed before a crash");
+        editor.commit_edit();
+        // A crash: no `shutdown`.
+        drop(editor);
+
+        let restored = Store::at(dir.join("state")).unwrap().load().unwrap();
+        let tab = restored.tabs.iter().find(|t| t.id == id).unwrap();
+        assert_eq!(tab.text, "typed before a crash");
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn reopening_an_existing_session_does_not_add_a_fallback_tab() {
+        let dir = temp_dir("reopen-no-fallback");
+        let mut editor = open_in(&dir, &[], None);
+        editor.apply(Command::NewTab);
+        editor.shutdown();
+        let count = editor.tabs().len();
+        drop(editor);
+
+        let reopened = open_in(&dir, &[], None);
+
+        assert_eq!(reopened.tabs().len(), count);
 
         fs::remove_dir_all(&dir).unwrap();
     }
