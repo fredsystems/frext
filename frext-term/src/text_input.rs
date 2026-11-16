@@ -2,12 +2,14 @@
 //!
 //! The text itself is not owned here, because the text of a name prompt
 //! lives in core. [`TextInput`] only holds the view state: the cursor and
-//! the horizontal scroll, both as char indices.
+//! the horizontal scroll, both as char indices that always sit on a
+//! grapheme boundary.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Position, Rect};
-use unicode_width::UnicodeWidthChar;
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 use crate::theme;
 
@@ -33,9 +35,65 @@ pub struct TextInput {
     scroll: usize,
 }
 
-/// The display width of a char, zero for non-printing chars.
-fn char_width(c: char) -> usize {
-    UnicodeWidthChar::width(c).unwrap_or(0)
+/// One extended grapheme cluster of the text, in char indices.
+#[derive(Debug, Clone, Copy)]
+struct Grapheme {
+    start: usize,
+    len: usize,
+    width: usize,
+}
+
+impl Grapheme {
+    const fn end(self) -> usize {
+        self.start + self.len
+    }
+}
+
+/// The grapheme clusters of `text`, in order.
+fn split_graphemes(text: &str) -> Vec<Grapheme> {
+    let mut start = 0;
+    text.graphemes(true)
+        .map(|g| {
+            let len = g.chars().count();
+            let grapheme = Grapheme {
+                start,
+                len,
+                width: UnicodeWidthStr::width(g),
+            };
+            start += len;
+            grapheme
+        })
+        .collect()
+}
+
+/// The char count of the text `graphemes` was built from.
+fn char_len(graphemes: &[Grapheme]) -> usize {
+    graphemes.last().map_or(0, |g| g.end())
+}
+
+/// The index of the first grapheme starting at or after char `index`
+/// (`graphemes.len()` if none does).
+fn grapheme_index(graphemes: &[Grapheme], index: usize) -> usize {
+    graphemes.partition_point(|g| g.start < index)
+}
+
+/// Char `index` snapped down to the start of the grapheme containing it.
+fn snap_down(graphemes: &[Grapheme], index: usize) -> usize {
+    let after = graphemes.partition_point(|g| g.start <= index);
+    after
+        .checked_sub(1)
+        .and_then(|i| graphemes.get(i))
+        .map_or(0, |g| if index >= g.end() { g.end() } else { g.start })
+}
+
+/// Char `index` snapped up to the next grapheme boundary at or after it.
+fn snap_up(graphemes: &[Grapheme], index: usize) -> usize {
+    graphemes
+        .iter()
+        .find(|g| g.end() >= index)
+        .map_or(char_len(graphemes), |g| {
+            if g.start == index { g.start } else { g.end() }
+        })
 }
 
 /// The byte offset of char index `index` in `text`, or `text.len()` past
@@ -44,6 +102,13 @@ fn byte_offset(text: &str, index: usize) -> usize {
     text.char_indices()
         .nth(index)
         .map_or(text.len(), |(byte, _)| byte)
+}
+
+/// Removes chars `start..end` from `text`.
+fn remove_chars(text: &mut String, start: usize, end: usize) {
+    let from = byte_offset(text, start);
+    let to = byte_offset(text, end);
+    text.replace_range(from..to, "");
 }
 
 /// The key code `key` is handled as.
@@ -82,20 +147,22 @@ impl TextInput {
     }
 
     /// Clamps the cursor and scroll to `text`, which may have changed
-    /// since the last call.
-    fn clamp(&mut self, text: &str) -> usize {
-        let len = text.chars().count();
-        self.cursor = self.cursor.min(len);
-        self.scroll = self.scroll.min(self.cursor);
-        len
+    /// since the last call, snapping both to grapheme starts, and returns
+    /// the graphemes of `text`.
+    fn clamp(&mut self, text: &str) -> Vec<Grapheme> {
+        let graphemes = split_graphemes(text);
+        self.cursor = snap_down(&graphemes, self.cursor.min(char_len(&graphemes)));
+        self.scroll = snap_down(&graphemes, self.scroll.min(self.cursor));
+        graphemes
     }
 
     /// Handles one key event against `text`.
     pub fn handle_key(&mut self, text: &mut String, key: KeyEvent) -> InputOutcome {
-        let len = self.clamp(text);
+        let graphemes = self.clamp(text);
         if key.kind == KeyEventKind::Release {
             return InputOutcome::Ignored;
         }
+        let at = grapheme_index(&graphemes, self.cursor);
         match normalise(key) {
             KeyCode::Char(c) => {
                 if key
@@ -106,30 +173,37 @@ impl TextInput {
                     return InputOutcome::Ignored;
                 }
                 text.insert(byte_offset(text, self.cursor), c);
-                self.cursor += 1;
+                // A combining mark joins the grapheme before it, so the
+                // cursor goes to the end of whichever grapheme now holds
+                // the inserted char.
+                self.cursor = snap_up(&split_graphemes(text), self.cursor + 1);
                 InputOutcome::Edited
             }
             KeyCode::Backspace => {
-                if self.cursor == 0 {
+                let Some(before) = at.checked_sub(1).and_then(|i| graphemes.get(i)) else {
                     return InputOutcome::Moved;
-                }
-                self.cursor -= 1;
-                text.remove(byte_offset(text, self.cursor));
+                };
+                remove_chars(text, before.start, self.cursor);
+                self.cursor = before.start;
                 InputOutcome::Edited
             }
             KeyCode::Delete => {
-                if self.cursor >= len {
+                let Some(under) = graphemes.get(at) else {
                     return InputOutcome::Moved;
-                }
-                text.remove(byte_offset(text, self.cursor));
+                };
+                remove_chars(text, under.start, under.end());
                 InputOutcome::Edited
             }
             KeyCode::Left => {
-                self.cursor = self.cursor.saturating_sub(1);
+                if let Some(before) = at.checked_sub(1).and_then(|i| graphemes.get(i)) {
+                    self.cursor = before.start;
+                }
                 InputOutcome::Moved
             }
             KeyCode::Right => {
-                self.cursor = (self.cursor + 1).min(len);
+                if let Some(under) = graphemes.get(at) {
+                    self.cursor = under.end();
+                }
                 InputOutcome::Moved
             }
             KeyCode::Home => {
@@ -137,7 +211,7 @@ impl TextInput {
                 InputOutcome::Moved
             }
             KeyCode::End => {
-                self.cursor = len;
+                self.cursor = char_len(&graphemes);
                 InputOutcome::Moved
             }
             KeyCode::Enter => InputOutcome::Submit,
@@ -156,36 +230,40 @@ impl TextInput {
             .map(|c| if c == '\n' || c == '\r' { ' ' } else { c })
             .collect();
         text.insert_str(byte_offset(text, self.cursor), &cleaned);
-        self.cursor += cleaned.chars().count();
+        self.cursor = snap_up(
+            &split_graphemes(text),
+            self.cursor + cleaned.chars().count(),
+        );
     }
 
     /// Moves the cursor past the last char of `text`.
     pub fn move_to_end(&mut self, text: &str) {
-        self.cursor = self.clamp(text);
+        let graphemes = self.clamp(text);
+        self.cursor = char_len(&graphemes);
     }
 
     /// Places the cursor for a click at `column`, relative to the field's
-    /// left edge as last rendered: before the char whose cells contain
-    /// the column, or at the end when the click is past the text.
+    /// left edge as last rendered: before the grapheme whose cells
+    /// contain the column, or at the end when the click is past the text.
     pub fn click(&mut self, text: &str, column: u16) {
-        let len = self.clamp(text);
+        let graphemes = self.clamp(text);
         let column = usize::from(column);
         let mut acc = 0;
-        for (i, c) in text.chars().enumerate().skip(self.scroll) {
-            acc += char_width(c);
-            if acc > column {
-                self.cursor = i;
+        for g in &graphemes[grapheme_index(&graphemes, self.scroll)..] {
+            if acc + g.width > column {
+                self.cursor = g.start;
                 return;
             }
+            acc += g.width;
         }
-        self.cursor = len;
+        self.cursor = char_len(&graphemes);
     }
 
     /// Draws `text` into the first row of `area` with [`theme::input`],
     /// scrolling horizontally so the cursor stays inside the row, and
     /// returns the cursor's cell (`None` if `area` is empty).
     pub fn render(&mut self, text: &str, area: Rect, buf: &mut Buffer) -> Option<Position> {
-        self.clamp(text);
+        let graphemes = self.clamp(text);
         let area = area.intersection(buf.area);
         if area.is_empty() {
             return None;
@@ -194,25 +272,23 @@ impl TextInput {
         buf.set_style(row, theme::input());
 
         let width = usize::from(area.width);
-        let widths: Vec<usize> = text.chars().map(char_width).collect();
+        let mut first = grapheme_index(&graphemes, self.scroll);
+        let cursor_index = grapheme_index(&graphemes, self.cursor);
+        let mut cursor_col: usize = graphemes
+            .get(first..cursor_index)
+            .map_or(0, |gs| gs.iter().map(|g| g.width).sum());
         // Reserve the last column for a cursor that sits past the text.
-        while self.scroll < self.cursor
-            && widths[self.scroll..self.cursor].iter().sum::<usize>() >= width
-        {
-            self.scroll += 1;
-        }
-        let cursor_col: usize = widths[self.scroll..self.cursor].iter().sum();
-
-        let mut visible = String::new();
-        let mut used = 0;
-        for (c, w) in text.chars().zip(&widths).skip(self.scroll) {
-            if used + w > width {
+        while self.scroll < self.cursor && cursor_col >= width {
+            let Some(g) = graphemes.get(first) else {
                 break;
-            }
-            used += w;
-            visible.push(c);
+            };
+            cursor_col -= g.width;
+            self.scroll = g.end();
+            first += 1;
         }
-        buf.set_stringn(area.x, area.y, &visible, width, theme::input());
+
+        let visible = &text[byte_offset(text, self.scroll)..];
+        buf.set_stringn(area.x, area.y, visible, width, theme::input());
 
         let col = u16::try_from(cursor_col).ok()?;
         Some(Position::new(area.x + col, area.y))
@@ -545,6 +621,144 @@ mod tests {
         assert_eq!(pos, Position::new(4, 0));
         assert_eq!(buf[(0, 0)].symbol(), "本");
         assert_eq!(buf[(2, 0)].symbol(), "語");
+    }
+
+    const ZWJ_CODER: &str = "\u{1F469}\u{200D}\u{1F4BB}";
+
+    #[test]
+    fn zwj_sequence_end_cursor_matches_rendered_width() {
+        let mut input = TextInput::new();
+        let mut text = format!("{ZWJ_CODER}x");
+        input.handle_key(&mut text, press(KeyCode::End));
+        assert_eq!(input.cursor(), 4);
+        let area = Rect::new(0, 0, 10, 1);
+        let mut buf = Buffer::empty(area);
+        let pos = input.render(&text, area, &mut buf);
+        assert_eq!(pos, Some(Position::new(3, 0)));
+        assert_eq!(buf[(0, 0)].symbol(), ZWJ_CODER);
+        assert_eq!(buf[(2, 0)].symbol(), "x");
+    }
+
+    #[test]
+    fn left_right_and_backspace_step_over_whole_graphemes() {
+        let mut input = TextInput::new();
+        let mut text = format!("a{ZWJ_CODER}b");
+        input.handle_key(&mut text, press(KeyCode::End));
+        assert_eq!(input.cursor(), 5);
+        input.handle_key(&mut text, press(KeyCode::Left));
+        assert_eq!(input.cursor(), 4);
+        input.handle_key(&mut text, press(KeyCode::Left));
+        assert_eq!(input.cursor(), 1);
+        input.handle_key(&mut text, press(KeyCode::Left));
+        assert_eq!(input.cursor(), 0);
+        input.handle_key(&mut text, press(KeyCode::Right));
+        assert_eq!(input.cursor(), 1);
+        input.handle_key(&mut text, press(KeyCode::Right));
+        assert_eq!(input.cursor(), 4);
+        assert_eq!(
+            input.handle_key(&mut text, press(KeyCode::Backspace)),
+            InputOutcome::Edited
+        );
+        assert_eq!(text, "ab");
+        assert_eq!(input.cursor(), 1);
+
+        let mut input = TextInput::new();
+        let mut text = String::from("e\u{301}x");
+        input.handle_key(&mut text, press(KeyCode::Right));
+        assert_eq!(input.cursor(), 2);
+        input.handle_key(&mut text, press(KeyCode::Right));
+        assert_eq!(input.cursor(), 3);
+        input.handle_key(&mut text, press(KeyCode::Left));
+        input.handle_key(&mut text, press(KeyCode::Left));
+        assert_eq!(input.cursor(), 0);
+        assert_eq!(
+            input.handle_key(&mut text, press(KeyCode::Delete)),
+            InputOutcome::Edited
+        );
+        assert_eq!(text, "x");
+
+        let mut text = String::from("e\u{301}");
+        input.move_to_end(&text);
+        assert_eq!(input.cursor(), 2);
+        assert_eq!(
+            input.handle_key(&mut text, press(KeyCode::Backspace)),
+            InputOutcome::Edited
+        );
+        assert_eq!(text, "");
+        assert_eq!(input.cursor(), 0);
+    }
+
+    #[test]
+    fn click_after_zwj_sequence_lands_before_x() {
+        let mut input = TextInput::new();
+        let text = format!("{ZWJ_CODER}x");
+        input.click(&text, 0);
+        assert_eq!(input.cursor(), 0);
+        input.click(&text, 1);
+        assert_eq!(input.cursor(), 0);
+        input.click(&text, 2);
+        assert_eq!(input.cursor(), 3);
+        input.click(&text, 3);
+        assert_eq!(input.cursor(), 4);
+    }
+
+    #[test]
+    fn scroll_never_starts_inside_a_grapheme() {
+        // Scrolling over multi-char graphemes advances a grapheme at a time.
+        let mut input = TextInput::new();
+        let text = "e\u{301}".repeat(10);
+        input.move_to_end(&text);
+        let area = Rect::new(0, 0, 5, 1);
+        let mut buf = Buffer::empty(area);
+        let pos = input.render(&text, area, &mut buf);
+        assert_eq!(pos, Some(Position::new(4, 0)));
+        assert_eq!(input.scroll(), 12);
+
+        // A scroll left inside a grapheme by an external edit snaps down.
+        let mut input = TextInput::new();
+        let text = "abcdefghij";
+        input.move_to_end(text);
+        let mut buf = Buffer::empty(area);
+        input.render(text, area, &mut buf);
+        assert_eq!(input.scroll(), 6);
+        let text = "abcdef\u{301}ghij";
+        let mut buf = Buffer::empty(area);
+        input.render(text, area, &mut buf);
+        assert_eq!(input.scroll(), 5);
+        assert_eq!(input.cursor(), 10);
+        assert_eq!(buf[(0, 0)].symbol(), "f\u{301}");
+    }
+
+    #[test]
+    fn long_paste_render_is_linear() {
+        let mut input = TextInput::new();
+        let mut text = String::new();
+        input.insert_str(&mut text, &"a".repeat(100_000));
+        assert_eq!(input.cursor(), 100_000);
+        let area = Rect::new(0, 0, 80, 1);
+        let mut buf = Buffer::empty(area);
+        let pos = input.render(&text, area, &mut buf);
+        assert_eq!(pos, Some(Position::new(79, 0)));
+        assert_eq!(input.scroll(), 100_000 - 79);
+        assert_eq!(row_text(&buf), format!("{} ", "a".repeat(79)));
+    }
+
+    #[test]
+    fn combining_mark_typed_after_base_joins_its_grapheme() {
+        let mut input = TextInput::new();
+        let mut text = String::new();
+        type_str(&mut input, &mut text, "e\u{301}");
+        assert_eq!(text, "e\u{301}");
+        assert_eq!(input.cursor(), 2);
+        input.handle_key(&mut text, press(KeyCode::Left));
+        assert_eq!(input.cursor(), 0);
+
+        let mut text = String::from("ex");
+        input.handle_key(&mut text, press(KeyCode::Home));
+        input.handle_key(&mut text, press(KeyCode::Right));
+        type_str(&mut input, &mut text, "\u{301}");
+        assert_eq!(text, "e\u{301}x");
+        assert_eq!(input.cursor(), 2);
     }
 
     #[test]
