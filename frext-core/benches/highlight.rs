@@ -3,13 +3,18 @@
 //! Measures [`frext_core::highlight::highlight`] -- syntect highlighting into
 //! [`StyledSpan`]s, with no front-end conversion -- over a deterministic
 //! 5,000-line synthetic Rust source: highlighted as Rust and as plain text.
+//! The `incremental_*` rows measure
+//! [`IncrementalHighlighter`] on a 50-line viewport of the same source.
 //!
 //! [`StyledSpan`]: frext_core::highlight::StyledSpan
 
 use std::hint::black_box;
 
 use criterion::{Criterion, criterion_group, criterion_main};
-use frext_core::highlight::highlight;
+use frext_core::highlight::{highlight, incremental::IncrementalHighlighter};
+
+/// The viewport the warm incremental bench requests: 50 lines around the edit.
+const VIEWPORT: std::ops::Range<usize> = 2_480..2_530;
 
 /// A fixed 50-line Rust template; repeated [`REPEATS`] times to build the
 /// benchmark source. `frobnicate` occurs exactly twice per template.
@@ -84,6 +89,29 @@ fn bench_highlight(c: &mut Criterion) {
     });
     group.bench_function("full_plain_5k_lines", |b| {
         b.iter(|| highlight(black_box(&src), black_box("")));
+    });
+
+    // A warm highlighter, as the TUI uses it per keystroke: each iteration
+    // types and then deletes one char at line 2,500, requesting the viewport
+    // after each of the two edits.
+    group.bench_function("incremental_viewport_after_edit_rust_5k_lines", |b| {
+        let mut text = src.clone();
+        let edit_at: usize = text.split_inclusive('\n').take(2_500).map(str::len).sum();
+        let mut hl = IncrementalHighlighter::new();
+        let _ = hl.spans(&text, "rs", VIEWPORT);
+        b.iter(|| {
+            text.insert(edit_at, 'x');
+            let typed = hl.spans(black_box(&text), black_box("rs"), VIEWPORT);
+            text.remove(edit_at);
+            let deleted = hl.spans(black_box(&text), black_box("rs"), VIEWPORT);
+            (typed, deleted)
+        });
+    });
+    group.bench_function("incremental_cold_viewport_rust_5k_lines", |b| {
+        b.iter(|| {
+            let mut hl = IncrementalHighlighter::new();
+            hl.spans(black_box(&src), black_box("rs"), 4_950..5_000)
+        });
     });
     group.finish();
 }
