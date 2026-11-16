@@ -1,6 +1,6 @@
 # 01 -- Core extraction (`frext-core`)
 
-- **Status:** active
+- **Status:** pending merge
 - **Depends on:** none
 - **Branch:** `refactor/frext-core` (one branch, one commit per
   subtask, one PR)
