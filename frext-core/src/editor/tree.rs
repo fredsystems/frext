@@ -169,22 +169,43 @@ impl Editor {
     /// Returns the rename result so the caller can keep the prompt open and
     /// show the error on failure.
     fn rename_path(&mut self, from: &Path, new_name: &str) -> Result<(), FsError> {
+        // Find the affected tabs (with their path relative to `from`) before
+        // renaming: afterwards the old path no longer exists, so a tab opened
+        // through another spelling of it could not be canonicalized.
+        let from_canonical = from.canonicalize().ok();
+        let affected: Vec<(usize, PathBuf)> = self
+            .tabs
+            .iter()
+            .enumerate()
+            .filter_map(|(index, tab)| {
+                let tab_path = tab.path.as_ref()?;
+                if let Ok(rest) = tab_path.strip_prefix(from) {
+                    return Some((index, rest.to_path_buf()));
+                }
+                let from_canonical = from_canonical.as_ref()?;
+                let tab_canonical = tab_path.canonicalize().ok()?;
+                tab_canonical
+                    .strip_prefix(from_canonical)
+                    .ok()
+                    .map(|rest| (index, rest.to_path_buf()))
+            })
+            .collect();
+
         let to = fs_ops::rename(from, new_name)?;
         if to == from {
             return Ok(());
         }
 
-        // Repoint any open tab whose path was `from` or lived beneath it.
+        // Repoint every open tab whose file was `from` or lived beneath it.
         let mut touched_tabs = false;
-        for tab in &mut self.tabs {
-            if let Some(tab_path) = tab.path.as_ref() {
-                if tab_path == from {
-                    tab.path = Some(to.clone());
-                    touched_tabs = true;
-                } else if let Ok(rest) = tab_path.strip_prefix(from) {
-                    tab.path = Some(to.join(rest));
-                    touched_tabs = true;
-                }
+        for (index, rest) in affected {
+            if let Some(tab) = self.tabs.get_mut(index) {
+                tab.path = Some(if rest.as_os_str().is_empty() {
+                    to.clone()
+                } else {
+                    to.join(rest)
+                });
+                touched_tabs = true;
             }
         }
 
@@ -738,6 +759,79 @@ mod tests {
 
         assert!(project.join("lib").is_dir());
         assert_eq!(editor.workspace().unwrap().root, project);
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The open tab paths, in tab order.
+    fn tab_paths(editor: &Editor) -> Vec<Option<PathBuf>> {
+        editor.tabs().iter().map(|t| t.path.clone()).collect()
+    }
+
+    #[test]
+    fn renaming_repoints_a_tab_opened_through_another_spelling() {
+        let dir = temp_dir("rename-spelling");
+        fs::create_dir_all(dir.join("sub")).unwrap();
+        fs::write(dir.join("notes.txt"), "body").unwrap();
+        // The same file, spelled through `sub/..`.
+        let spelled = dir.join("sub").join("..").join("notes.txt");
+        let mut editor = editor_in(&dir, &[], None);
+        editor.apply(Command::OpenPath(spelled.clone()));
+        assert_eq!(editor.active_tab().unwrap().path, Some(spelled));
+
+        rename_via_prompt(&mut editor, &dir.join("notes.txt"), "renamed.txt");
+
+        assert_eq!(
+            editor.active_tab().unwrap().path,
+            Some(dir.join("renamed.txt"))
+        );
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn renaming_a_directory_repoints_tabs_opened_through_another_spelling() {
+        let dir = temp_dir("rename-dir-spelling");
+        fs::create_dir_all(dir.join("sub")).unwrap();
+        fs::create_dir_all(dir.join("pkg").join("inner")).unwrap();
+        fs::write(dir.join("pkg").join("inner").join("a.txt"), "body").unwrap();
+        let spelled = dir
+            .join("sub")
+            .join("..")
+            .join("pkg")
+            .join("inner")
+            .join("a.txt");
+        let mut editor = editor_in(&dir, &[], None);
+        editor.apply(Command::OpenPath(spelled.clone()));
+        assert_eq!(editor.active_tab().unwrap().path, Some(spelled));
+
+        rename_via_prompt(&mut editor, &dir.join("pkg"), "lib");
+
+        assert_eq!(
+            editor.active_tab().unwrap().path,
+            Some(dir.join("lib").join("inner").join("a.txt"))
+        );
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_failed_rename_leaves_every_tab_path_unchanged() {
+        let dir = temp_dir("rename-fails-tabs");
+        fs::create_dir_all(dir.join("sub")).unwrap();
+        fs::write(dir.join("notes.txt"), "body").unwrap();
+        fs::write(dir.join("taken.txt"), "other").unwrap();
+        let mut editor = editor_in(&dir, &[], None);
+        editor.apply(Command::OpenPath(dir.join("notes.txt")));
+        editor.apply(Command::OpenPath(
+            dir.join("sub").join("..").join("taken.txt"),
+        ));
+        let before = tab_paths(&editor);
+
+        rename_via_prompt(&mut editor, &dir.join("notes.txt"), "taken.txt");
+
+        assert!(dir.join("notes.txt").is_file(), "the rename was refused");
+        assert_eq!(tab_paths(&editor), before);
 
         fs::remove_dir_all(&dir).unwrap();
     }
