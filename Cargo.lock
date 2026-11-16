@@ -2614,6 +2614,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "frext-term"
+version = "0.1.0"
+dependencies = [
+ "frext-core",
+ "log",
+]
+
+[[package]]
 name = "fst"
 version = "0.4.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"

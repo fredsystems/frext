@@ -135,7 +135,12 @@ view. Real editing arrives in plan 03, the sidebar in 05.
   crossterm version that ratatui 0.30.2 uses through
   `ratatui-crossterm`, so the tree resolves to one crossterm. Both MSRVs
   (1.88 and 1.63) are below the workspace's 1.95. Add `unicode-width`
-  at the version already in `Cargo.lock` through ratatui.
+  at the version already in `Cargo.lock` through ratatui (0.2.3).
+  Each dependency enters both `[workspace.dependencies]` and
+  `frext-term/Cargo.toml` in the subtask that first uses it (`ratatui`
+  in 02.5, `crossterm` in 02.6, `unicode-width` in 02.11), so
+  `cargo machete` and cargo's unused-workspace-dependency check stay
+  quiet. Those subtasks' scopes include the manifests and `Cargo.lock`.
 - **No `ratatui::init`.** Its panic hook restores only raw mode and the
   alternate screen, not mouse capture, bracketed paste or the keyboard
   flags. `frext-term` owns the whole lifecycle in `terminal.rs`.
@@ -333,14 +338,14 @@ Scope: `Cargo.toml`, `Cargo.lock`, `frext-term/Cargo.toml` (new),
 
 What:
 
-- Add `frext-term` to the workspace members. Add the workspace
-  dependencies `crossterm`, `ratatui` and `unicode-width`, as pinned
-  under "Further decisions", alphabetically. `frext-term/Cargo.toml`
+- Add `frext-term` to the workspace members. `frext-term/Cargo.toml`
   inherits the `workspace.package` fields, sets
-  `[lints] workspace = true`, and depends on `crossterm`, `frext-core`,
-  `log` and `ratatui` for now (`unicode-width` is added by its first
-  user, 02.11). Not depending on `directories` is fine, because the
-  path comes from `Store::root()`.
+  `[lints] workspace = true`, and depends only on `frext-core` and
+  `log` (the TUI dependencies arrive with their first users). Not
+  depending on `directories` is fine, because the path comes from
+  `Store::root()`. The global logger is installed with
+  `log::set_logger(Box::leak(..))`, because `set_boxed_logger` needs
+  `log`'s `std` feature.
 - `cli.rs`: `#[derive(Debug, Default, PartialEq, Eq)] pub struct Args
   { pub files: Vec<PathBuf>, pub dir: Option<PathBuf> }` and
   `pub fn parse(args: impl IntoIterator<Item = OsString>) -> Args`
@@ -371,8 +376,7 @@ existing log becomes `.old`).
 
 Verification: the standard ritual, plus
 `cargo tree -p frext-term -e normal | rg -i 'egui|eframe|winit|glow|wgpu'`
-prints nothing, and `cargo tree -p frext-term -i crossterm` shows
-exactly one crossterm version (0.29.0).
+prints nothing.
 
 Prohibitions: do NOT touch `frext/` or `flake.nix`; do NOT enter raw
 mode yet; do NOT proceed to 02.5.
@@ -381,7 +385,7 @@ Stop: report and await review.
 
 ### 02.5 -- Theme conversion
 
-Scope: `frext-term/src/theme.rs` (new), `frext-term/src/lib.rs`.
+Scope: `Cargo.toml`, `Cargo.lock`, `frext-term/Cargo.toml`, `frext-term/src/theme.rs` (new), `frext-term/src/lib.rs`.
 
 What: `pub const fn color(rgb: Rgb) -> Color` (`Color::Rgb`) and
 `#[must_use]` style helpers:
@@ -406,6 +410,10 @@ helper's colours.
 
 Verification: the standard ritual.
 
+Adds `ratatui` (pinned as under "Further decisions") to the workspace
+and to `frext-term`. Verification also runs `cargo tree -p frext-term
+-i crossterm`, which must show exactly one crossterm (0.29.0).
+
 Prohibitions: do NOT add colours to `frext-core`; do NOT proceed to
 02.6.
 
@@ -413,7 +421,7 @@ Stop: report and await review.
 
 ### 02.6 -- OSC 52 clipboard and clipboard choice
 
-Scope: `frext-term/src/clipboard.rs` (new), `frext-term/src/lib.rs`.
+Scope: `Cargo.toml`, `Cargo.lock`, `frext-term/Cargo.toml`, `frext-term/src/clipboard.rs` (new), `frext-term/src/lib.rs`.
 
 What: `pub struct Osc52Clipboard<W: Write> { out: W }` with
 `pub fn new(out: W) -> Self`, implementing `frext_core::clipboard::
@@ -435,6 +443,10 @@ the base64 for `"héllo"` asserted literally), `osc52_read_is_none`,
 `from_env` for all four set/unset/empty combinations.
 
 Verification: the standard ritual.
+
+Adds `crossterm` (pinned as under "Further decisions") to the workspace
+and to `frext-term`. `cargo tree -p frext-term -i crossterm` must still
+show exactly one version.
 
 Prohibitions: do NOT add tmux passthrough (plan 06); do NOT add a
 `base64` dependency; do NOT proceed to 02.7.
@@ -632,7 +644,8 @@ Stop: report and await review.
 
 ### 02.11 -- Single-line text input
 
-Scope: `frext-term/Cargo.toml` (adds `unicode-width`),
+Scope: `Cargo.toml`, `Cargo.lock`, `frext-term/Cargo.toml` (adds
+`unicode-width`),
 `frext-term/src/text_input.rs` (new), `frext-term/src/lib.rs`.
 
 What: `#[derive(Debug, Default, Clone, PartialEq, Eq)] pub struct
