@@ -119,10 +119,10 @@ fn apply_match_highlights(job: &mut LayoutJob, matches: &MatchHighlights) {
 
     // Background colour for byte `b`, if it falls inside any match.
     let bg_at = |b: usize| -> Option<Color32> {
-        if let Some(cur) = &current {
-            if cur.contains(&b) {
-                return Some(current_color);
-            }
+        if let Some(cur) = &current
+            && cur.contains(&b)
+        {
+            return Some(current_color);
         }
         if matches.ranges.iter().any(|r| r.contains(&b)) {
             Some(other)

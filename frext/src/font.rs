@@ -285,7 +285,7 @@ mod tests {
     }
 
     /// Shape `text` against the embedded regular face with `harfrust` (the
-    /// same shaper egui/epaint 0.35 uses internally) and return the resulting
+    /// same shaper egui/epaint 0.37 uses internally) and return the resulting
     /// glyph ids. `enable_ligatures` toggles the `calt`/`liga` features.
     fn shaped_glyph_ids(text: &str, enable_ligatures: bool) -> Vec<u32> {
         let font = harfrust::FontRef::from_index(REGULAR, 0).expect("regular face parses");

@@ -237,10 +237,10 @@ impl FrextApp {
 
     /// Write the active tab's buffer to its swap file.
     fn persist_active_swap(&self) {
-        if let Some(tab) = self.tabs.get(self.active) {
-            if let Err(err) = self.store.save_swap(tab) {
-                log::error!("failed to write swap file for tab {}: {err}", tab.id);
-            }
+        if let Some(tab) = self.tabs.get(self.active)
+            && let Err(err) = self.store.save_swap(tab)
+        {
+            log::error!("failed to write swap file for tab {}: {err}", tab.id);
         }
     }
 
@@ -368,7 +368,7 @@ impl FrextApp {
 
         let mut choice = CloseChoice::Pending;
         let modal =
-            egui::Modal::new(egui::Id::new(("frext_confirm_close", index))).show(ctx, |ui| {
+            egui::Modal::new(egui::Id::unique(("frext_confirm_close", index))).show(ctx, |ui| {
                 ui.set_min_width(320.0);
                 ui.heading("Unsaved changes");
                 ui.add_space(4.0);
@@ -612,10 +612,10 @@ impl FrextApp {
     /// Falls back to the full path display when there is no workspace or the
     /// path is not under the root.
     fn relative_to_root(&self, path: &Path) -> String {
-        if let Some(ws) = self.workspace.as_ref() {
-            if let Ok(rel) = path.strip_prefix(&ws.root) {
-                return rel.display().to_string();
-            }
+        if let Some(ws) = self.workspace.as_ref()
+            && let Ok(rel) = path.strip_prefix(&ws.root)
+        {
+            return rel.display().to_string();
         }
         path.display().to_string()
     }
@@ -741,7 +741,7 @@ impl FrextApp {
         let mut submit = false;
         let mut cancel = false;
 
-        let modal = egui::Modal::new(egui::Id::new("frext_fs_prompt")).show(ctx, |ui| {
+        let modal = egui::Modal::new(egui::Id::unique("frext_fs_prompt")).show(ctx, |ui| {
             ui.set_min_width(320.0);
             ui.heading(title);
             ui.add_space(8.0);
@@ -807,10 +807,10 @@ impl FrextApp {
 
         match result {
             Ok(created_file) => {
-                if let Some(path) = created_file {
-                    if self.open_path(&path) {
-                        self.persist_session();
-                    }
+                if let Some(path) = created_file
+                    && self.open_path(&path)
+                {
+                    self.persist_session();
                 }
             }
             Err(err) => {
@@ -827,16 +827,17 @@ impl FrextApp {
     /// Open the find bar, seeding the pattern from the editor's current
     /// selection when there is a non-empty one, and request keyboard focus.
     fn open_search(&mut self, replace: bool) {
-        if let Some(selected) = self.active_selection_text() {
-            if !selected.is_empty() && !selected.contains('\n') {
-                // A single-line selection is a sensible search seed; multi-line
-                // selections are left alone (they are usually a scope, not a
-                // pattern).
-                self.search.query.pattern = selected;
-                // Plain mode for a seeded literal, so regex metacharacters in
-                // the selected text match literally.
-                self.search.query.regex = false;
-            }
+        if let Some(selected) = self.active_selection_text()
+            && !selected.is_empty()
+            && !selected.contains('\n')
+        {
+            // A single-line selection is a sensible search seed; multi-line
+            // selections are left alone (they are usually a scope, not a
+            // pattern).
+            self.search.query.pattern = selected;
+            // Plain mode for a seeded literal, so regex metacharacters in
+            // the selected text match literally.
+            self.search.query.regex = false;
         }
         self.search.open = true;
         self.search.replace_open = replace;
@@ -1411,11 +1412,11 @@ impl eframe::App for FrextApp {
         // by a change in on-disk size). A clean buffer is reloaded; a dirty
         // one is left untouched. Keeping the swap file and session index in
         // step after a reload preserves crash-safety.
-        if let Some(tab) = self.tabs.get_mut(self.active) {
-            if tab.reload_if_changed_on_disk() {
-                self.persist_active_swap();
-                self.persist_session();
-            }
+        if let Some(tab) = self.tabs.get_mut(self.active)
+            && tab.reload_if_changed_on_disk()
+        {
+            self.persist_active_swap();
+            self.persist_session();
         }
 
         // Keyboard shortcuts. Search actions are deferred like menu actions so
@@ -1598,16 +1599,16 @@ impl eframe::App for FrextApp {
                 self.close_workspace();
             } else {
                 for (dir, expanded) in expand_changes {
-                    if let Some(ws) = self.workspace.as_mut() {
-                        if ws.set_expanded(&dir, expanded) {
-                            self.persist_session();
-                        }
-                    }
-                }
-                if let Some(path) = file_to_open {
-                    if self.open_path(&path) {
+                    if let Some(ws) = self.workspace.as_mut()
+                        && ws.set_expanded(&dir, expanded)
+                    {
                         self.persist_session();
                     }
+                }
+                if let Some(path) = file_to_open
+                    && self.open_path(&path)
+                {
+                    self.persist_session();
                 }
                 if let Some(action) = tree_action {
                     self.apply_tree_action(&ctx, action);
@@ -1662,7 +1663,7 @@ impl eframe::App for FrextApp {
                             let editor_frame = egui::Frame::new()
                                 .fill(ui.visuals().extreme_bg_color)
                                 .inner_margin(egui::Margin::symmetric(4, 2));
-                            let editor_id = egui::Id::new(("frext_editor", tab.id));
+                            let editor_id = egui::Id::unique(("frext_editor", tab.id));
                             let mut output = egui::TextEdit::multiline(&mut tab.text)
                                 .id(editor_id)
                                 .code_editor()
