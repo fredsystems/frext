@@ -5,5 +5,6 @@
 //! [`frext_core`] crate.
 
 pub mod cli;
+pub mod clipboard;
 pub mod logging;
 pub mod theme;
