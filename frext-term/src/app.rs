@@ -162,8 +162,8 @@ impl TermApp {
                         .set_message(PASTE_MESSAGE, MessageKind::Info, now);
                 }
             }
-            AppEvent::Input(Event::Resize(..) | Event::FocusGained | Event::FocusLost)
-            | AppEvent::Wake => {}
+            AppEvent::Input(Event::Resize(..)) => self.forget_layout(),
+            AppEvent::Input(Event::FocusGained | Event::FocusLost) | AppEvent::Wake => {}
             AppEvent::Tick => {
                 self.status.expire(now);
             }
@@ -199,9 +199,7 @@ impl TermApp {
                         .set_message(FIND_BAR_MESSAGE, MessageKind::Info, now);
                 }
             }
-            Action::OpenFilePrompt => {
-                self.prompt.open_file(&self.editor);
-            }
+            Action::OpenFilePrompt => self.open_file_prompt(),
             Action::Quit => self.quit = Quit::Requested,
             Action::ToggleSidebar => {
                 self.sidebar = match self.sidebar {
@@ -209,6 +207,7 @@ impl TermApp {
                     SidebarVisibility::Hidden => SidebarVisibility::Shown,
                 };
                 self.settle_focus();
+                self.forget_layout();
             }
             Action::ToggleFocus => {
                 if self.sidebar_shown() {
@@ -249,9 +248,7 @@ impl TermApp {
                     Some(Target::Save) => self.send(Command::Save),
                     Some(Target::SelectTab(index)) => self.send(Command::SelectTab(index)),
                     Some(Target::CloseTab(index)) => self.send(Command::RequestClose(index)),
-                    Some(Target::OpenFile) => {
-                        self.prompt.open_file(&self.editor);
-                    }
+                    Some(Target::OpenFile) => self.open_file_prompt(),
                     Some(Target::Editor) => self.focus = Focus::Editor,
                     Some(
                         Target::PromptPopup
@@ -284,6 +281,23 @@ impl TermApp {
         let outcome = self.editor.apply(command);
         self.effects.extend(outcome.effects);
         self.prompt.sync(&self.editor);
+        self.forget_layout();
+    }
+
+    /// Opens the open-file prompt over the current layout.
+    fn open_file_prompt(&mut self) {
+        self.prompt.open_file(&self.editor);
+        self.forget_layout();
+    }
+
+    /// Drops the hit map and hover target, which describe the last
+    /// rendered layout. Called whenever the layout may have changed
+    /// before the next render, so a queued click cannot hit a target
+    /// that has moved (such as a tab index shifted by a close); until
+    /// the next render, mouse events hit nothing.
+    fn forget_layout(&mut self) {
+        self.hits.clear();
+        self.hovered = None;
     }
 
     /// Carries out the queued effects, then drops the scroll position of
@@ -591,6 +605,105 @@ mod tests {
         assert!(app.editor().prompt().is_none());
         assert_eq!(app.editor().tabs().len(), tabs_before);
         assert!(app.editor().tabs()[index].is_dirty());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The column of tab `index`'s close glyph as last rendered at 80
+    /// columns.
+    fn close_column(app: &TermApp, index: usize) -> u16 {
+        let items = tab_bar::items(app.editor().tabs(), app.editor().active_index(), 80);
+        let item = items
+            .iter()
+            .find(|item| item.target == Target::CloseTab(index))
+            .unwrap();
+        assert_eq!(app.hits.hit(item.x, 0), Some(Target::CloseTab(index)));
+        item.x
+    }
+
+    #[test]
+    fn queued_clicks_after_a_close_do_not_hit_a_shifted_tab() {
+        let dir = temp_dir("queued-close");
+        let files: Vec<PathBuf> = ["a.txt", "b.txt", "c.txt"]
+            .iter()
+            .map(|name| {
+                let file = dir.join(name);
+                fs::write(&file, *name).unwrap();
+                file
+            })
+            .collect();
+        let mut app = app(&dir, &files, KeyboardMode::Enhanced);
+        let tabs_before = app.editor().tabs().len();
+        let index_of = |app: &TermApp, file: &Path| {
+            app.editor()
+                .tabs()
+                .iter()
+                .position(|tab| tab.path.as_deref() == Some(file))
+        };
+        let first_index = index_of(&app, &files[0]).unwrap();
+        assert_eq!(index_of(&app, &files[1]), Some(first_index + 1));
+        assert_eq!(index_of(&app, &files[2]), Some(first_index + 2));
+        draw(&mut app);
+        let first = close_column(&app, first_index);
+        let second = close_column(&app, first_index + 1);
+        let now = Instant::now();
+
+        app.handle(
+            mouse(MouseEventKind::Down(MouseButton::Left), first, 0),
+            now,
+        );
+        app.handle(
+            mouse(MouseEventKind::Down(MouseButton::Left), second, 0),
+            now,
+        );
+        app.apply_effects();
+
+        assert_eq!(app.editor().tabs().len(), tabs_before - 1);
+        assert_eq!(index_of(&app, &files[0]), None);
+        assert_eq!(index_of(&app, &files[1]), Some(first_index));
+        assert_eq!(index_of(&app, &files[2]), Some(first_index + 1));
+        assert_eq!(app.hovered, None);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_resize_clears_the_hit_map_until_the_next_render() {
+        let dir = temp_dir("resize-hits");
+        let mut app = app(&dir, &[], KeyboardMode::Enhanced);
+        let now = Instant::now();
+        draw(&mut app);
+        app.handle(mouse(MouseEventKind::Moved, 1, 0), now);
+        assert_eq!(app.hovered, Some(Target::NewTab));
+
+        app.handle(AppEvent::Input(Event::Resize(100, 30)), now);
+        assert_eq!(app.hovered, None);
+        app.handle(mouse(MouseEventKind::Down(MouseButton::Left), 1, 0), now);
+        assert_eq!(app.editor().tabs().len(), 1);
+
+        draw(&mut app);
+        app.handle(mouse(MouseEventKind::Down(MouseButton::Left), 1, 0), now);
+        assert_eq!(app.editor().tabs().len(), 2);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn toggling_the_sidebar_and_opening_the_prompt_clear_the_hit_map() {
+        let dir = temp_dir("toggle-hits");
+        let mut app = app(&dir, &[], KeyboardMode::Enhanced);
+        let now = Instant::now();
+        draw(&mut app);
+        app.handle(ctrl('b'), now);
+        assert_eq!(app.hits.hit(1, 0), None);
+
+        draw(&mut app);
+        app.handle(ctrl('o'), now);
+        assert_eq!(app.hits.hit(1, 0), None);
+
+        app.handle(key(KeyCode::Esc, KeyModifiers::NONE), now);
+        let buf = draw(&mut app);
+        let open = column_of(&row_text(&buf, 0), "Open");
+        app.handle(mouse(MouseEventKind::Down(MouseButton::Left), open, 0), now);
+        assert!(app.prompt.is_open(&app.editor));
+        assert_eq!(app.hits.hit(1, 0), None);
         fs::remove_dir_all(&dir).unwrap();
     }
 

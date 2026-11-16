@@ -1216,3 +1216,49 @@ as `xterm`, or `TERM=xterm-256color` in tmux):
   still passing, plus the standard ritual.
 - **Scheduling:** needs the user's sign-off, because it changes GUI
   behaviour too. Independent of every other subtask.
+
+### 02.21 -- Review fixes (PR #40)
+
+Surfaced by the Copilot and CodeRabbit reviews of PR #40 (`c248275`).
+All of them come from this plan's own code. Each lands as its own
+commit with a regression test, followed by the standard ritual.
+
+- **A -- Stale hit targets within a batch.** `run` routes a whole
+  event batch before the next render rebuilds the `HitMap`, so after a
+  tab closes, a second queued click can hit a shifted index and close
+  the wrong tab. Fix: clear the hit map whenever the layout can change
+  between renders: after every `send`, on `ToggleSidebar`, on opening
+  the open-file prompt, and on `Resize`. (`app.rs`)
+- **B -- Panic hook on worker threads.** The proofread worker catches
+  Harper panics with `catch_unwind`, but the hook runs first and would
+  restore the terminal (and print to stderr) while the UI keeps
+  running. Fix: `enter` records the UI thread's `ThreadId`. The hook
+  restores and chains to the previous hook only on that thread, and
+  only logs on every other thread. (`terminal.rs`)
+- **C -- Editor view clips inside graphemes.** Fix: build the
+  tab-expanded, control-stripped line and let `Buffer::set_stringn`
+  clip it, since it clips by whole grapheme and cell width.
+  (`editor_view.rs`)
+- **D -- Backspace in prompt fields on legacy terminals.** Terminals
+  that send `0x08` for Backspace arrive as Ctrl+H, which the input
+  ignored. Fix: `TextInput` treats Ctrl+H as Backspace.
+  (`text_input.rs`)
+- **E -- Grapheme-aware text input, linear scroll.** Summing scalar
+  widths misplaces the cursor after a ZWJ sequence, and the scroll loop
+  is quadratic after a long paste. Fix: the cursor still counts chars
+  but only rests on grapheme boundaries (`unicode-segmentation`
+  1.13.3, already in `Cargo.lock` through ratatui). Moves and deletes
+  go by grapheme, widths are per grapheme (`UnicodeWidthStr`), and the
+  scroll adjustment subtracts widths incrementally. (`text_input.rs`,
+  manifests)
+- **F -- FIFOs and other non-regular files.** Opening or saving to an
+  existing FIFO blocks the UI thread in core's synchronous I/O. Fix:
+  both path prompts reject an existing path that is not a regular file
+  (`“{p}” is not a regular file`). (`prompt.rs`)
+- **G -- Held Enter overwrites a file.** Without release events, key
+  repeats arrive as presses, so "press Enter again" can confirm an
+  overwrite by itself. Fix (user decision): the first Enter on an
+  existing file locks the field and shows `“{name}” exists.` with
+  `[ Replace ] [ Back ]`, focused on Back. Enter on Back, or Esc,
+  returns to editing. Replace needs Left/Tab then Enter, or a click.
+  (`prompt.rs`)
