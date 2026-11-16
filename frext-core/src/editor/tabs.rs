@@ -77,12 +77,14 @@ impl Editor {
         self.persist_session();
     }
 
-    /// Focus the tab at `index`; ignored when out of range.
+    /// Focus the tab at `index` (ignored when out of range), then re-find in
+    /// whichever buffer is active.
     pub(super) fn select_tab(&mut self, index: usize) {
         if index < self.tabs.len() {
             self.active = index;
             self.persist_session();
         }
+        self.recompute_matches();
     }
 
     /// Request to close the tab at `index`.
@@ -216,7 +218,7 @@ impl Editor {
             self.active,
             self.next_id,
             self.workspace.as_ref(),
-            &self.search_query,
+            self.search.query(),
         ) {
             log::error!("failed to save session index: {err}");
         }

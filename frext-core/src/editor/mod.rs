@@ -9,20 +9,21 @@
 mod command;
 mod effect;
 mod prompt;
+mod search;
 mod tabs;
 
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 
-pub use command::Command;
+pub use command::{Command, SearchBar, SearchOption, StepDirection};
 pub use effect::{BufferChange, EditorFocus, Effect, Outcome};
 pub use prompt::{AfterSave, CloseChoice, Prompt};
+pub use search::SearchState;
 
 use crate::{
     clipboard::Clipboard,
     persistence::{RestoredSession, Store},
     proofread::state::Proofreading,
-    search::SearchQuery,
     tab::Tab,
     workspace::Workspace,
 };
@@ -47,9 +48,8 @@ pub struct Editor {
     next_id: u64,
     /// The sidebar workspace (root directory + expanded folders), if open.
     workspace: Option<Workspace>,
-    /// The persisted search query (the live search state stays in the front
-    /// end until search moves into the editor).
-    search_query: SearchQuery,
+    /// Find/replace state; its query is persisted in the session.
+    search: SearchState,
     /// The prompt the editor is waiting on, if any.
     prompt: Option<Prompt>,
     /// Spelling/grammar checking: background worker, per-tab results, the
@@ -135,7 +135,7 @@ impl Editor {
             active,
             next_id,
             workspace,
-            search_query: restored_search,
+            search: SearchState::restored(restored_search),
             prompt: None,
             proofread: Proofreading::new(user_words),
             dictionary_file,
@@ -174,6 +174,11 @@ impl Editor {
 
     /// Apply `command`, returning whether the buffer changed and the
     /// effects the front end should apply.
+    ///
+    /// A command that edits the buffer leaves the editor consistent itself
+    /// (swap file persisted, search matches refreshed);
+    /// [`BufferChange::Edited`] only informs the front end. [`Self::commit_edit`]
+    /// is solely for edits the view made through [`Self::active_view_mut`].
     pub fn apply(&mut self, command: Command) -> Outcome {
         match command {
             Command::NewTab => self.new_tab(),
@@ -189,6 +194,28 @@ impl Editor {
             Command::ResolveClose(choice) => self.resolve_close(choice),
             Command::SubmitSavePath(path) => self.submit_save_path(path),
             Command::CancelPrompt => self.prompt = None,
+            Command::OpenSearch(bar) => return self.open_search(bar),
+            Command::CloseSearch => {
+                self.close_search();
+                // Persist the (possibly edited) query when the bar closes.
+                self.persist_session();
+            }
+            Command::StepMatch(direction) => return self.step_match(direction),
+            Command::RecomputeMatches => self.recompute_matches(),
+            Command::ToggleSearchOption(option) => self.toggle_search_option(option),
+            Command::ToggleReplaceRow => self.toggle_replace_row(),
+            Command::ReplaceCurrent => {
+                return Outcome {
+                    buffer: self.replace_current(),
+                    effects: Vec::new(),
+                };
+            }
+            Command::ReplaceAll => {
+                return Outcome {
+                    buffer: self.replace_all(),
+                    effects: Vec::new(),
+                };
+            }
         }
         Outcome::default()
     }
@@ -210,9 +237,13 @@ impl Editor {
     }
 
     /// The view mutated the active buffer (through
-    /// [`Self::active_view_mut`]): persist its swap file.
+    /// [`Self::active_view_mut`]): persist its swap file and, while the find
+    /// bar is open, refresh the matches so they track the edit.
     pub fn commit_edit(&mut self) {
         self.persist_active_swap();
+        if self.search.is_open() {
+            self.recompute_matches();
+        }
     }
 
     /// The open tabs, in tab-bar order.
@@ -253,24 +284,9 @@ impl Editor {
 }
 
 // Transitional API: direct access for logic that still lives in the front
-// end. These are removed as search (01.9), the workspace tree (01.10) and
-// editing plus the frame hooks (01.11) move into the editor.
+// end. These are removed as the workspace tree (01.10) and editing plus
+// the frame hooks (01.11) move into the editor.
 impl Editor {
-    /// The persisted search query.
-    ///
-    /// Transitional: removed in 01.9.
-    #[must_use]
-    pub fn search_query(&self) -> &SearchQuery {
-        &self.search_query
-    }
-
-    /// Mutable access to the persisted search query.
-    ///
-    /// Transitional: removed in 01.9.
-    pub fn search_query_mut(&mut self) -> &mut SearchQuery {
-        &mut self.search_query
-    }
-
     /// Mutable access to every open tab.
     ///
     /// Transitional: removed in 01.10.

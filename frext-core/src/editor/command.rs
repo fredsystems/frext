@@ -31,4 +31,53 @@ pub enum Command {
     SubmitSavePath(PathBuf),
     /// Dismiss whatever prompt is pending.
     CancelPrompt,
+    // Search.
+    /// Show the find bar (seeding the pattern from a single-line selection)
+    /// and focus its find field.
+    OpenSearch(SearchBar),
+    /// Hide the find bar, clearing its matches, and persist the query.
+    CloseSearch,
+    /// Focus the next or previous match, wrapping around, and select it.
+    StepMatch(StepDirection),
+    /// Re-run the search after the pattern was edited.
+    RecomputeMatches,
+    /// Flip one search toggle and re-run the search.
+    ToggleSearchOption(SearchOption),
+    /// Show or hide the replace row.
+    ToggleReplaceRow,
+    /// Replace the focused match with the replacement text.
+    ReplaceCurrent,
+    /// Replace every match in the active buffer.
+    ReplaceAll,
+}
+
+/// Which rows of the search bar [`Command::OpenSearch`] shows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SearchBar {
+    /// The find row only.
+    Find,
+    /// The find row and the replace row.
+    FindReplace,
+}
+
+/// The direction [`Command::StepMatch`] moves in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StepDirection {
+    /// To the next match.
+    Forward,
+    /// To the previous match.
+    Backward,
+}
+
+/// A search toggle flipped by [`Command::ToggleSearchOption`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SearchOption {
+    /// Match case exactly.
+    CaseSensitive,
+    /// Require word boundaries around each match.
+    WholeWord,
+    /// Treat the pattern as a regular expression.
+    Regex,
+    /// Restrict matches to the editor's current selection.
+    InSelection,
 }
