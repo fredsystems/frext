@@ -12,8 +12,8 @@ use std::hint::black_box;
 use criterion::{Criterion, criterion_group, criterion_main};
 use eframe::egui::FontId;
 use frext::editor_layout::layout_job;
-use frext::highlight::MatchHighlights;
-use frext::search::SearchQuery;
+use frext_core::highlight::MatchHighlights;
+use frext_core::search::SearchQuery;
 
 /// A fixed 50-line Rust template; repeated [`REPEATS`] times to build the
 /// benchmark source. `frobnicate` occurs exactly twice per template.

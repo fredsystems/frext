@@ -1,7 +1,8 @@
 //! frext binary entry point.
 
 use eframe::egui;
-use frext::{app::FrextApp, persistence::Store};
+use frext::app::FrextApp;
+use frext_core::persistence::Store;
 
 fn main() -> eframe::Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();

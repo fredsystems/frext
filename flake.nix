@@ -144,8 +144,8 @@
               # they are not ours to lint (codespell trips on icon names like
               # the `ags` and `tese` file extensions).
               "^assets/file-icons/"
-              "^frext/src/file_icon_table\\.rs$"
-              "^frext/src/file_icon_bytes\\.rs$"
+              "^frext-core/src/file_icon_table\\.rs$"
+              "^frext-core/src/file_icon_bytes\\.rs$"
             ];
 
             baseModule = precommit.lib.mkBaseCheck { inherit system extraExcludes; };

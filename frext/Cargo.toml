@@ -13,23 +13,15 @@ keywords.workspace = true
 categories.workspace = true
 
 [dependencies]
-arboard = { workspace = true }
-directories = { workspace = true }
 eframe = { workspace = true }
 egui = { workspace = true }
 egui_extras = { workspace = true }
 env_logger = { workspace = true }
 fontdb = { workspace = true }
-harper-core = { workspace = true }
+frext-core = { workspace = true }
 log = { workspace = true }
-regex = { workspace = true }
 rfd = { workspace = true }
-serde = { workspace = true }
-serde_json = { workspace = true }
-thiserror = { workspace = true }
-trash = { workspace = true }
 ttf-parser = { workspace = true }
-two-face = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }

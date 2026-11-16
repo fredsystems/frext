@@ -10,7 +10,7 @@
 //! applies a font's `calt`/`liga` glyph substitutions when laying out a
 //! galley. Because the editor and the line-number gutter both resolve
 //! [`egui::TextStyle::Monospace`] from the active style (see
-//! [`crate::highlight`] and `app::FrextApp::line_number_gutter`), installing
+//! [`frext_core::highlight`] and `app::FrextApp::line_number_gutter`), installing
 //! CaskaydiaCove as the monospace family makes ligatures appear with no
 //! per-character processing on frext's side — egui caches one galley per text
 //! block.

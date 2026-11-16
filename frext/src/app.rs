@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 use eframe::egui;
 
-use crate::{
+use frext_core::{
     clipboard::{Clipboard, SystemClipboard},
     highlight::MatchHighlights,
     persistence::Store,
@@ -162,7 +162,7 @@ impl FrextApp {
     pub fn with_args(store: Store, files: &[PathBuf], dir: Option<&Path>) -> Self {
         let restored = store.load().unwrap_or_else(|err| {
             log::error!("failed to load session, starting fresh: {err}");
-            crate::persistence::RestoredSession::default()
+            frext_core::persistence::RestoredSession::default()
         });
 
         let mut tabs = restored.tabs;
@@ -301,7 +301,7 @@ impl FrextApp {
     /// [`Self::paint_line_numbers`], aligned to the editor's real rows so
     /// soft-wrapped continuation rows are left blank.
     fn reserve_line_number_gutter(ui: &mut egui::Ui, text: &str) -> Gutter {
-        let line_count = crate::lines::line_count(text);
+        let line_count = frext_core::lines::line_count(text);
         let font_id = egui::TextStyle::Monospace.resolve(ui.style());
         let digits = line_count.to_string().len();
 
@@ -349,7 +349,7 @@ impl FrextApp {
         let galley = &output.galley;
 
         let ends_with_newline = galley.rows.iter().map(|r| r.ends_with_newline);
-        for (row_index, number) in crate::lines::line_numbers_for_rows(ends_with_newline) {
+        for (row_index, number) in frext_core::lines::line_numbers_for_rows(ends_with_newline) {
             let Some(placed) = galley.rows.get(row_index) else {
                 continue;
             };
@@ -518,8 +518,11 @@ impl FrextApp {
             EditorAction::None => false,
             EditorAction::Copy => {
                 if let Some(tab) = self.tabs.get(self.active) {
-                    let text =
-                        crate::edit_ops::selected_text(&tab.text, selection.start, selection.end);
+                    let text = frext_core::edit_ops::selected_text(
+                        &tab.text,
+                        selection.start,
+                        selection.end,
+                    );
                     if !text.is_empty() {
                         self.clipboard.write_text(text);
                     }
@@ -531,13 +534,16 @@ impl FrextApp {
                     return false;
                 };
                 let text =
-                    crate::edit_ops::selected_text(&tab.text, selection.start, selection.end);
+                    frext_core::edit_ops::selected_text(&tab.text, selection.start, selection.end);
                 if text.is_empty() {
                     return false;
                 }
                 self.clipboard.write_text(text);
-                let caret =
-                    crate::edit_ops::delete_range(&mut tab.text, selection.start, selection.end);
+                let caret = frext_core::edit_ops::delete_range(
+                    &mut tab.text,
+                    selection.start,
+                    selection.end,
+                );
                 Self::store_caret(ctx, editor_id, caret);
                 true
             }
@@ -551,7 +557,7 @@ impl FrextApp {
                 let Some(tab) = self.tabs.get_mut(self.active) else {
                     return false;
                 };
-                let caret = crate::edit_ops::replace_range(
+                let caret = frext_core::edit_ops::replace_range(
                     &mut tab.text,
                     selection.start,
                     selection.end,
@@ -666,7 +672,7 @@ impl FrextApp {
                 let relative = self.relative_to_root(&path);
                 self.clipboard.write_text(relative);
             }
-            TreeAction::Reveal(path) => crate::fs_ops::reveal(&path),
+            TreeAction::Reveal(path) => frext_core::fs_ops::reveal(&path),
             TreeAction::Rename(path) => {
                 self.pending_fs = Some(FsPrompt {
                     kind: FsPromptKind::Rename,
@@ -716,7 +722,7 @@ impl FrextApp {
     /// file was trashed (the file itself, or a file under a trashed directory)
     /// is closed, since its backing file no longer exists.
     fn trash_path(&mut self, path: &Path) {
-        if let Err(err) = crate::fs_ops::move_to_trash(path) {
+        if let Err(err) = frext_core::fs_ops::move_to_trash(path) {
             log::error!("{err}");
             return;
         }
@@ -749,8 +755,12 @@ impl FrextApp {
     ///
     /// Returns the rename result so the caller can keep the modal open and
     /// show the error on failure.
-    fn rename_path(&mut self, from: &Path, new_name: &str) -> Result<(), crate::error::FsError> {
-        let to = crate::fs_ops::rename(from, new_name)?;
+    fn rename_path(
+        &mut self,
+        from: &Path,
+        new_name: &str,
+    ) -> Result<(), frext_core::error::FsError> {
+        let to = frext_core::fs_ops::rename(from, new_name)?;
         if to == from {
             return Ok(());
         }
@@ -890,10 +900,10 @@ impl FrextApp {
                 .rename_path(&prompt.target, &prompt.name)
                 .map(|()| None),
             FsPromptKind::NewFile => {
-                crate::fs_ops::create_file(&prompt.target, &prompt.name).map(Some)
+                frext_core::fs_ops::create_file(&prompt.target, &prompt.name).map(Some)
             }
             FsPromptKind::NewFolder => {
-                crate::fs_ops::create_dir(&prompt.target, &prompt.name).map(|_| None)
+                frext_core::fs_ops::create_dir(&prompt.target, &prompt.name).map(|_| None)
             }
         };
 
@@ -1295,7 +1305,7 @@ impl FrextApp {
         expand_changes: &mut Vec<(PathBuf, bool)>,
         tree_action: &mut Option<TreeAction>,
     ) {
-        let (dirs, files) = crate::workspace::read_dir_split(dir);
+        let (dirs, files) = frext_core::workspace::read_dir_split(dir);
 
         for sub in dirs {
             let name = sub
@@ -1319,7 +1329,7 @@ impl FrextApp {
 
             let (_toggle, header, _body) = state
                 .show_header(ui, |ui| {
-                    Self::file_icon(ui, crate::file_icon::icon_for_dir(&name, is_open));
+                    Self::file_icon(ui, frext_core::file_icon::icon_for_dir(&name, is_open));
                     ui.label(name);
                 })
                 .body(|ui| {
@@ -1354,7 +1364,7 @@ impl FrextApp {
 
             let row = ui
                 .horizontal(|ui| {
-                    Self::file_icon(ui, crate::file_icon::icon_for_file(&name));
+                    Self::file_icon(ui, frext_core::file_icon::icon_for_file(&name));
                     ui.selectable_label(is_active, name)
                 })
                 .inner;
@@ -1533,7 +1543,7 @@ impl FrextApp {
 
     /// Draw the file-type icon for `stem` inline, sized to the current text
     /// row. A stem with no embedded artwork (which should not occur for stems
-    /// produced by [`crate::file_icon`]) simply renders nothing, leaving the
+    /// produced by [`frext_core::file_icon`]) simply renders nothing, leaving the
     /// row icon-less rather than failing.
     fn file_icon(ui: &mut egui::Ui, stem: &'static str) {
         let size = ui.text_style_height(&egui::TextStyle::Body);
@@ -1783,7 +1793,7 @@ impl eframe::App for FrextApp {
 
         egui::CentralPanel::default().show(ui, |ui| {
             if let Some(tab) = self.tabs.get_mut(self.active) {
-                let language = crate::syntax::language_from_path(tab.path.as_deref());
+                let language = frext_core::syntax::language_from_path(tab.path.as_deref());
                 let mut layouter = crate::editor_layout::layouter(&language, &highlights);
 
                 // The editor must be wrapped in a ScrollArea: a bare
@@ -1869,8 +1879,9 @@ impl eframe::App for FrextApp {
                             // (byte range -> char range) so egui scrolls it
                             // into view on this frame.
                             if let Some(range) = &scroll_to {
-                                let start = crate::offsets::char_of_byte(&tab.text, range.start);
-                                let end = crate::offsets::char_of_byte(&tab.text, range.end);
+                                let start =
+                                    frext_core::offsets::char_of_byte(&tab.text, range.start);
+                                let end = frext_core::offsets::char_of_byte(&tab.text, range.end);
                                 let ccursor_range = egui::text::CCursorRange::two(
                                     egui::text::CCursor::new(start),
                                     egui::text::CCursor::new(end),
@@ -1890,8 +1901,8 @@ impl eframe::App for FrextApp {
                                 let hi = range.primary.index.0.max(range.secondary.index.0);
                                 editor_char_selection = Some(lo..hi);
                                 new_selection = Some(
-                                    crate::offsets::byte_of_char(&tab.text, lo)
-                                        ..crate::offsets::byte_of_char(&tab.text, hi),
+                                    frext_core::offsets::byte_of_char(&tab.text, lo)
+                                        ..frext_core::offsets::byte_of_char(&tab.text, hi),
                                 );
                             } else {
                                 editor_char_selection = None;
@@ -2008,7 +2019,7 @@ impl eframe::App for FrextApp {
 /// texture across frames and rows. Returns `None` when the stem is not bundled.
 #[must_use]
 fn image_source(stem: &'static str) -> Option<egui::ImageSource<'static>> {
-    let bytes = crate::file_icon::icon_bytes(stem)?;
+    let bytes = frext_core::file_icon::icon_bytes(stem)?;
     Some(egui::ImageSource::Bytes {
         // The `.svg` extension routes the bytes to egui_extras' SVG loader,
         // and the `frext-file-icon://` scheme keeps these URIs from colliding
@@ -2143,7 +2154,7 @@ mod tests {
     use std::{fs, path::PathBuf};
 
     use super::*;
-    use crate::clipboard::MemoryClipboard;
+    use frext_core::clipboard::MemoryClipboard;
 
     #[test]
     fn requesting_close_of_a_clean_tab_closes_immediately() {
@@ -2595,7 +2606,7 @@ mod tests {
 
         let mut app = app_in(&dir);
         let err = app.rename_path(&a, "b.txt").unwrap_err();
-        assert!(matches!(err, crate::error::FsError::AlreadyExists(_)));
+        assert!(matches!(err, frext_core::error::FsError::AlreadyExists(_)));
         // Both files remain.
         assert!(a.exists() && b.exists());
 

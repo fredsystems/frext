@@ -2559,24 +2559,32 @@ dependencies = [
 name = "frext"
 version = "0.1.0"
 dependencies = [
- "arboard",
  "criterion",
- "directories",
  "eframe",
  "egui",
  "egui_extras",
  "env_logger",
  "fontdb",
+ "frext-core",
  "harfrust",
+ "log",
+ "rfd",
+ "ttf-parser",
+]
+
+[[package]]
+name = "frext-core"
+version = "0.1.0"
+dependencies = [
+ "arboard",
+ "directories",
  "harper-core",
  "log",
  "regex",
- "rfd",
  "serde",
  "serde_json",
  "thiserror 2.0.21",
  "trash",
- "ttf-parser",
  "two-face",
 ]
 

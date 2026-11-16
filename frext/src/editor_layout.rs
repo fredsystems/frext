@@ -1,7 +1,7 @@
 //! egui text layout for the editor surface.
 //!
 //! Converts the frontend-neutral [`StyledSpan`]s produced by
-//! [`crate::highlight`] into an egui [`LayoutJob`], mapping palette colours
+//! [`frext_core::highlight`] into an egui [`LayoutJob`], mapping palette colours
 //! and search-match background roles through [`crate::theme`], and provides
 //! the [`layouter`] closure handed to [`egui::TextEdit::layouter`].
 
@@ -10,12 +10,14 @@ use eframe::egui::{
     text::{ByteIndex, LayoutJob, LayoutSection, TextFormat},
 };
 
-use crate::highlight::{MatchBackground, MatchHighlights, StyledSpan, highlight, overlay_matches};
+use frext_core::highlight::{
+    MatchBackground, MatchHighlights, StyledSpan, highlight, overlay_matches,
+};
 
 /// Build a `layouter` closure suitable for [`egui::TextEdit::layouter`].
 ///
 /// The closure highlights the buffer for `language` (a file-extension token,
-/// see [`crate::syntax::language_from_path`]) and lays the result out into a
+/// see [`frext_core::syntax::language_from_path`]) and lays the result out into a
 /// [`Galley`]. When the extension does not resolve to a known syntax the text
 /// is laid out unhighlighted, so the editor always renders. Any `matches` are
 /// painted on top with a background fill so search hits stand out.
@@ -40,7 +42,7 @@ pub fn layouter<'a>(
 /// Build the styled [`LayoutJob`] for `text` without laying it out.
 ///
 /// Highlights `text` for `language` (a file-extension token, see
-/// [`crate::syntax::language_from_path`]) in `font_id`, then paints any search
+/// [`frext_core::syntax::language_from_path`]) in `font_id`, then paints any search
 /// `matches` on top as background fills. This is exactly what [`layouter`]
 /// feeds to egui, minus the wrap width and galley layout, so it can be tested
 /// and benchmarked without a UI context.

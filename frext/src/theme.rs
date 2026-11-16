@@ -1,13 +1,13 @@
 //! Catppuccin Mocha theme for egui.
 //!
-//! The palette values and semantic roles live in [`crate::palette`] as
+//! The palette values and semantic roles live in [`frext_core::palette`] as
 //! frontend-neutral RGB; this module converts them to egui colours. Applying
 //! them directly to `egui::Visuals` avoids pulling in a theme crate that lags
 //! egui releases, keeping the dependency tree lean.
 
 use eframe::egui::{self, Color32};
 
-use crate::palette::{self, Rgb, Tint};
+use frext_core::palette::{self, Rgb, Tint};
 
 /// Convert a neutral palette colour to an egui colour.
 #[must_use]

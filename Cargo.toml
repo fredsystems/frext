@@ -1,5 +1,5 @@
 [workspace]
-members = ["frext"]
+members = ["frext-core", "frext"]
 resolver = "3"
 
 [workspace.package]
@@ -24,6 +24,7 @@ egui = { version = "0.37.0", default-features = false }
 egui_extras = { version = "0.37.0", default-features = false, features = ["svg"] }
 env_logger = "0.11.11"
 fontdb = "0.24.0"
+frext-core = { path = "frext-core" }
 harfrust = "0.12.0"
 harper-core = { version = "3.2.0", default-features = false, features = ["concurrent"] }
 log = "0.4.35"
