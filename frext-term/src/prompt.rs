@@ -2,17 +2,20 @@
 //!
 //! Core owns the [`Prompt`] itself and, for a name prompt, its text.
 //! [`PromptUi`] owns only the view state: which control has focus, the
-//! input's cursor and where the input was last drawn. It never applies a
-//! command itself; it returns [`PromptReply::Send`] and the app sends it.
+//! input's cursor and where the input was last drawn, plus the text and
+//! completion state of the two path prompts (save-as, and the TUI-only
+//! open-file prompt). It never applies a command itself; it returns
+//! [`PromptReply::Send`] and the app sends it.
 
 use std::path::{Path, PathBuf};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use frext_core::editor::{CloseChoice, Command, Editor, NameKind, Prompt};
+use frext_core::editor::{CloseChoice, Command, Editor, NameKind, Prompt, StepDirection};
 use frext_core::tab::Tab;
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Position, Rect};
 
+use crate::complete::{Completion, CompletionView, resolve};
 use crate::hit::{HitMap, Target};
 use crate::popup;
 use crate::text_input::{InputOutcome, TextInput};
@@ -31,6 +34,12 @@ const CONFIRM_WIDTH: u16 = 60;
 /// The width of the name popup.
 const NAME_WIDTH: u16 = 50;
 
+/// The width of the path popups.
+const PATH_WIDTH: u16 = 70;
+
+/// The most completion candidates a path popup lists at once.
+const MAX_CANDIDATES: usize = 8;
+
 /// What the app should do after a prompt handled an event.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PromptReply {
@@ -48,6 +57,8 @@ enum PromptKey {
     ConfirmClose(u64),
     SavePath(u64),
     Name(NameKind, PathBuf),
+    /// The TUI-only open-file prompt.
+    Open,
 }
 
 impl PromptKey {
@@ -85,6 +96,13 @@ impl PromptFocus {
             Self::Button(_) => Self::Button(0),
         }
     }
+}
+
+/// Whether the TUI-only open-file prompt is showing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OpenState {
+    Closed,
+    Open,
 }
 
 /// The title, field label and action label of a name prompt.
@@ -131,6 +149,12 @@ pub struct PromptUi {
     input_rect: Option<Rect>,
     base: PathBuf,
     home: Option<PathBuf>,
+    open: OpenState,
+    path_text: String,
+    path_error: Option<String>,
+    completion: Completion,
+    candidates: CompletionView,
+    overwrite_armed: Option<PathBuf>,
 }
 
 impl PromptUi {
@@ -145,6 +169,12 @@ impl PromptUi {
             input_rect: None,
             base,
             home,
+            open: OpenState::Closed,
+            path_text: String::new(),
+            path_error: None,
+            completion: Completion::default(),
+            candidates: CompletionView::default(),
+            overwrite_armed: None,
         }
     }
 
@@ -160,23 +190,70 @@ impl PromptUi {
         self.home.as_deref()
     }
 
+    /// The directory relative paths in a path prompt resolve against:
+    /// the workspace root when there is one, else the launch directory.
+    fn effective_base(&self, editor: &Editor) -> PathBuf {
+        editor
+            .workspace()
+            .map_or_else(|| self.base.clone(), |workspace| workspace.root.clone())
+    }
+
+    /// Whether a prompt is showing: the editor's, or the local open-file
+    /// prompt.
+    #[must_use]
+    pub fn is_open(&self, editor: &Editor) -> bool {
+        editor.prompt().is_some() || self.open == OpenState::Open
+    }
+
+    /// Starts the open-file prompt with an empty field. Returns `false`,
+    /// without opening it, while the editor has a prompt of its own.
+    pub fn open_file(&mut self, editor: &Editor) -> bool {
+        if editor.prompt().is_some() {
+            return false;
+        }
+        self.open = OpenState::Open;
+        self.reset_path();
+        self.input = TextInput::new();
+        self.focus = PromptFocus::Input;
+        true
+    }
+
+    /// Clears the path prompts' text, error, completion and arming.
+    fn reset_path(&mut self) {
+        self.path_text.clear();
+        self.path_error = None;
+        self.completion.reset();
+        self.candidates = CompletionView::default();
+        self.overwrite_armed = None;
+    }
+
     /// Resets the view state when the editor's prompt differs from the
     /// one last seen: the focus goes to the prompt's first control and
-    /// the input cursor to the end of its text.
+    /// the input cursor to the end of its text. A prompt from the editor
+    /// closes the local open-file prompt.
     pub fn sync(&mut self, editor: &Editor) {
-        let key = editor.prompt().map(PromptKey::of);
+        let key = match editor.prompt() {
+            Some(prompt) => {
+                self.open = OpenState::Closed;
+                Some(PromptKey::of(prompt))
+            }
+            None => (self.open == OpenState::Open).then_some(PromptKey::Open),
+        };
         if key == self.key {
             return;
         }
         self.focus = match key {
-            Some(PromptKey::Name(..)) => PromptFocus::Input,
-            _ => PromptFocus::Button(0),
+            Some(PromptKey::Name(..) | PromptKey::SavePath(_) | PromptKey::Open) => {
+                PromptFocus::Input
+            }
+            Some(PromptKey::ConfirmClose(_)) | None => PromptFocus::Button(0),
         };
         self.input = TextInput::new();
         if let Some(Prompt::Name(prompt)) = editor.prompt() {
             self.input.move_to_end(&prompt.name);
         }
         self.input_rect = None;
+        self.reset_path();
         self.key = key;
     }
 
@@ -184,9 +261,16 @@ impl PromptUi {
     /// its cursor to the end.
     pub fn focus_field(&mut self, editor: &Editor) {
         self.sync(editor);
-        if let Some(Prompt::Name(prompt)) = editor.prompt() {
-            self.focus = PromptFocus::Input;
-            self.input.move_to_end(&prompt.name);
+        match (&self.key, editor.prompt()) {
+            (_, Some(Prompt::Name(prompt))) => {
+                self.focus = PromptFocus::Input;
+                self.input.move_to_end(&prompt.name);
+            }
+            (Some(PromptKey::SavePath(_) | PromptKey::Open), _) => {
+                self.focus = PromptFocus::Input;
+                self.input.move_to_end(&self.path_text);
+            }
+            _ => {}
         }
     }
 
@@ -197,7 +281,8 @@ impl PromptUi {
         match self.key {
             Some(PromptKey::ConfirmClose(tab_id)) => self.confirm_key(editor, tab_id, key),
             Some(PromptKey::Name(..)) => self.name_key(editor, key),
-            Some(PromptKey::SavePath(_)) | None => PromptReply::Ignored,
+            Some(PromptKey::SavePath(_) | PromptKey::Open) => self.path_key(editor, key),
+            None => PromptReply::Ignored,
         }
     }
 
@@ -278,6 +363,152 @@ impl PromptUi {
         }
     }
 
+    /// Handles a key in a path prompt. Focus stays on the field: Tab and
+    /// Shift+Tab complete, Enter submits and Esc cancels.
+    fn path_key(&mut self, editor: &Editor, key: KeyEvent) -> PromptReply {
+        if key.kind == KeyEventKind::Release {
+            return PromptReply::Handled;
+        }
+        self.focus = PromptFocus::Input;
+        match key.code {
+            KeyCode::Tab => {
+                self.complete(editor, StepDirection::Forward);
+                return PromptReply::Handled;
+            }
+            KeyCode::BackTab => {
+                self.complete(editor, StepDirection::Backward);
+                return PromptReply::Handled;
+            }
+            _ => {}
+        }
+        match self.input.handle_key(&mut self.path_text, key) {
+            InputOutcome::Edited => {
+                self.path_edited();
+                PromptReply::Handled
+            }
+            InputOutcome::Moved | InputOutcome::Ignored => PromptReply::Handled,
+            InputOutcome::Submit => self.path_submit(editor),
+            InputOutcome::Cancel => self.path_cancel(),
+        }
+    }
+
+    /// Runs one Tab-completion step on the path field.
+    fn complete(&mut self, editor: &Editor, direction: StepDirection) {
+        let base = self.effective_base(editor);
+        self.candidates =
+            self.completion
+                .tab(&mut self.path_text, &base, self.home.as_deref(), direction);
+        self.input.move_to_end(&self.path_text);
+        self.path_error = None;
+        self.overwrite_armed = None;
+    }
+
+    /// Drops the completion, error and overwrite arming after an edit.
+    fn path_edited(&mut self) {
+        self.completion.reset();
+        self.candidates = CompletionView::default();
+        self.overwrite_armed = None;
+        self.path_error = None;
+    }
+
+    /// Submits the path field of the current path prompt.
+    fn path_submit(&mut self, editor: &Editor) -> PromptReply {
+        if self.path_text.is_empty() {
+            self.path_error = Some("Enter a file name".to_string());
+            return PromptReply::Handled;
+        }
+        let base = self.effective_base(editor);
+        let path = resolve(&self.path_text, &base, self.home.as_deref());
+        match self.key {
+            Some(PromptKey::SavePath(_)) => self.submit_save(path),
+            Some(PromptKey::Open) => self.submit_open(path),
+            _ => PromptReply::Handled,
+        }
+    }
+
+    /// Validates a save-as target; an existing file needs a second Enter.
+    fn submit_save(&mut self, path: PathBuf) -> PromptReply {
+        if path.is_dir() {
+            self.path_error = Some(format!("\u{201c}{}\u{201d} is a directory", path.display()));
+            return PromptReply::Handled;
+        }
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+            && !parent.is_dir()
+        {
+            self.path_error = Some(format!(
+                "Folder \u{201c}{}\u{201d} does not exist",
+                parent.display()
+            ));
+            return PromptReply::Handled;
+        }
+        if path.exists() && self.overwrite_armed.as_ref() != Some(&path) {
+            let name = path
+                .file_name()
+                .map_or_else(String::new, |name| name.to_string_lossy().into_owned());
+            self.path_error = Some(format!(
+                "\u{201c}{name}\u{201d} exists. Press Enter again to replace it"
+            ));
+            self.overwrite_armed = Some(path);
+            return PromptReply::Handled;
+        }
+        PromptReply::Send(Command::SubmitSavePath(path))
+    }
+
+    /// Opens an existing file and closes the local prompt.
+    fn submit_open(&mut self, path: PathBuf) -> PromptReply {
+        if path.is_dir() {
+            self.path_error = Some(format!("\u{201c}{}\u{201d} is a directory", path.display()));
+            return PromptReply::Handled;
+        }
+        if !path.exists() {
+            self.path_error = Some(format!("No such file: {}", path.display()));
+            return PromptReply::Handled;
+        }
+        self.open = OpenState::Closed;
+        PromptReply::Send(Command::OpenPath(path))
+    }
+
+    /// Cancels the current path prompt: save-as asks core, open closes
+    /// locally.
+    fn path_cancel(&mut self) -> PromptReply {
+        match self.key {
+            Some(PromptKey::SavePath(_)) => PromptReply::Send(Command::CancelPrompt),
+            Some(PromptKey::Open) => {
+                self.open = OpenState::Closed;
+                PromptReply::Handled
+            }
+            _ => PromptReply::Handled,
+        }
+    }
+
+    /// Handles a click on `target` in a path prompt.
+    fn path_click(&mut self, editor: &Editor, target: Option<Target>, column: u16) -> PromptReply {
+        match target {
+            Some(Target::PromptButton(0)) => self.path_submit(editor),
+            Some(Target::PromptButton(1)) => self.path_cancel(),
+            Some(Target::PromptInput) => {
+                self.focus = PromptFocus::Input;
+                if let Some(rect) = self.input_rect {
+                    self.input
+                        .click(&self.path_text, column.saturating_sub(rect.x));
+                }
+                PromptReply::Handled
+            }
+            Some(Target::PromptCandidate(index)) => {
+                if let Some(candidate) = self.candidates.candidates.get(index).cloned() {
+                    self.path_text = candidate;
+                    self.path_edited();
+                    self.focus = PromptFocus::Input;
+                    self.input.move_to_end(&self.path_text);
+                }
+                PromptReply::Handled
+            }
+            Some(Target::PromptPopup | Target::PromptButton(_)) => PromptReply::Handled,
+            _ => self.path_cancel(),
+        }
+    }
+
     /// Handles a click at `column` on `target` (the hit-map result) while
     /// a prompt is open. A click outside the popup cancels the prompt.
     pub fn handle_click(
@@ -316,18 +547,29 @@ impl PromptUi {
                 Some(Target::PromptPopup | Target::PromptCandidate(_)) => PromptReply::Handled,
                 _ => PromptReply::Send(Command::CancelPrompt),
             },
-            Some(PromptKey::SavePath(_)) | None => PromptReply::Ignored,
+            Some(PromptKey::SavePath(_) | PromptKey::Open) => {
+                self.path_click(editor, target, column)
+            }
+            None => PromptReply::Ignored,
         }
     }
 
     /// Inserts pasted `text` into the focused prompt's input, focusing it.
     pub fn handle_paste(&mut self, editor: &mut Editor, text: &str) {
         self.sync(editor);
-        if let Some(PromptKey::Name(..)) = self.key
-            && let Some(name) = editor.prompt_name_mut()
-        {
-            self.focus = PromptFocus::Input;
-            self.input.insert_str(name, text);
+        match self.key {
+            Some(PromptKey::Name(..)) => {
+                if let Some(name) = editor.prompt_name_mut() {
+                    self.focus = PromptFocus::Input;
+                    self.input.insert_str(name, text);
+                }
+            }
+            Some(PromptKey::SavePath(_) | PromptKey::Open) => {
+                self.focus = PromptFocus::Input;
+                self.input.insert_str(&mut self.path_text, text);
+                self.path_edited();
+            }
+            Some(PromptKey::ConfirmClose(_)) | None => {}
         }
     }
 
@@ -382,8 +624,94 @@ impl PromptUi {
                 popup::render_buttons(&[action, "Cancel"], focused, row, buf, hits);
                 cursor
             }
-            Some(Prompt::SavePath { .. }) | None => None,
+            Some(Prompt::SavePath { .. }) => {
+                self.render_path(editor, ("Save as", "Save"), area, buf, hits)
+            }
+            None if self.open == OpenState::Open => {
+                self.render_path(editor, ("Open file", "Open"), area, buf, hits)
+            }
+            None => None,
         }
+    }
+
+    /// Draws a path prompt titled `labels.0` with action button
+    /// `labels.1`: the field, the base hint, any error, the candidates
+    /// and the buttons.
+    fn render_path(
+        &mut self,
+        editor: &Editor,
+        (title, action): (&str, &str),
+        area: Rect,
+        buf: &mut Buffer,
+        hits: &mut HitMap,
+    ) -> Option<Position> {
+        let total = self.candidates.candidates.len();
+        let shown = total.min(MAX_CANDIDATES);
+        let more = total > MAX_CANDIDATES;
+        let rows = 5 + usize::from(self.path_error.is_some()) + shown + usize::from(more);
+        let height = u16::try_from(rows).unwrap_or(u16::MAX);
+        let rect = popup::centered(area, PATH_WIDTH.min(area.width), height);
+        let inner = popup::render_frame(title, rect, buf, hits);
+        if inner.is_empty() {
+            return None;
+        }
+        let width = usize::from(inner.width);
+        let limit = inner.bottom() - 1;
+        let mut y = inner.y;
+
+        let mut cursor = None;
+        if y < limit {
+            let input_rect = Rect::new(inner.x, y, inner.width, 1);
+            hits.push(input_rect, Target::PromptInput);
+            self.input_rect = Some(input_rect);
+            let position = self.input.render(&self.path_text, input_rect, buf);
+            if self.focus == PromptFocus::Input {
+                cursor = position;
+            }
+            y += 1;
+        }
+        if y < limit {
+            let hint = format!("relative to {}", self.effective_base(editor).display());
+            buf.set_stringn(inner.x, y, hint, width, theme::popup());
+            y += 1;
+        }
+        if let Some(error) = &self.path_error
+            && y < limit
+        {
+            let style = theme::status_error().bg(theme::popup().bg.unwrap_or_default());
+            buf.set_stringn(inner.x, y, error, width, style);
+            y += 1;
+        }
+        let start = self
+            .candidates
+            .selected
+            .map_or(0, |selected| selected.saturating_sub(MAX_CANDIDATES - 1));
+        for index in start..start + shown {
+            if y >= limit {
+                break;
+            }
+            let Some(candidate) = self.candidates.candidates.get(index) else {
+                break;
+            };
+            let row = Rect::new(inner.x, y, inner.width, 1);
+            let style = if self.candidates.selected == Some(index) {
+                theme::button_focused()
+            } else {
+                theme::popup()
+            };
+            buf.set_style(row, style);
+            buf.set_stringn(inner.x, y, candidate, width, style);
+            hits.push(row, Target::PromptCandidate(index));
+            y += 1;
+        }
+        if more && y < limit {
+            let text = format!("\u{2026} {} more", total - shown);
+            buf.set_stringn(inner.x, y, text, width, theme::popup());
+        }
+
+        let row = Rect::new(inner.x, limit, inner.width, 1);
+        popup::render_buttons(&[action, "Cancel"], usize::MAX, row, buf, hits);
+        cursor
     }
 
     fn render_confirm(&self, name: &str, area: Rect, buf: &mut Buffer, hits: &mut HitMap) {
@@ -898,5 +1226,480 @@ mod tests {
             name_labels(NameKind::NewFolder),
             ("New folder", "Folder name", "Create")
         );
+    }
+
+    /// Types `text` into the prompt one key at a time.
+    fn type_text(ui: &mut PromptUi, editor: &mut Editor, text: &str) {
+        for c in text.chars() {
+            assert_eq!(
+                ui.handle_key(editor, press(KeyCode::Char(c))),
+                PromptReply::Handled
+            );
+        }
+    }
+
+    /// An editor with an untitled tab and a pending save-as prompt,
+    /// resolving relative paths against `dir/files`.
+    fn save_fixture(tag: &str) -> (PathBuf, PathBuf, Editor, PromptUi) {
+        let dir = temp_dir(tag);
+        let files = dir.join("files");
+        fs::create_dir_all(&files).unwrap();
+        let mut editor = open_editor(&dir, &[], None);
+        editor.apply(Command::Save);
+        assert!(matches!(editor.prompt(), Some(Prompt::SavePath { .. })));
+        let ui = PromptUi::new(files.clone(), None);
+        (dir, files, editor, ui)
+    }
+
+    /// An editor with no prompt and the open-file prompt showing,
+    /// resolving relative paths against `dir/files`.
+    fn open_fixture(tag: &str) -> (PathBuf, PathBuf, Editor, PromptUi) {
+        let dir = temp_dir(tag);
+        let files = dir.join("files");
+        fs::create_dir_all(&files).unwrap();
+        let editor = open_editor(&dir, &[], None);
+        let mut ui = PromptUi::new(files.clone(), None);
+        assert!(!ui.is_open(&editor));
+        assert!(ui.open_file(&editor));
+        assert!(ui.is_open(&editor));
+        (dir, files, editor, ui)
+    }
+
+    /// The row holding `needle`, if any.
+    fn find_row(buf: &Buffer, needle: &str) -> Option<u16> {
+        find_row_from(buf, 0, needle)
+    }
+
+    /// The first row at or below `start` holding `needle`, if any.
+    fn find_row_from(buf: &Buffer, start: u16, needle: &str) -> Option<u16> {
+        (start..buf.area.height).find(|&y| row_text(buf, y).contains(needle))
+    }
+
+    /// The first 68 chars of `text`: what fits inside a 70-wide popup.
+    fn fitted(text: &str) -> String {
+        text.chars().take(68).collect()
+    }
+
+    #[test]
+    fn save_path_to_a_new_file_submits_the_resolved_path() {
+        let (dir, files, mut editor, mut ui) = save_fixture("save-new");
+        type_text(&mut ui, &mut editor, "new.txt");
+        assert_eq!(
+            ui.handle_key(&mut editor, press(KeyCode::Enter)),
+            send(Command::SubmitSavePath(files.join("new.txt")))
+        );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn save_path_with_an_empty_field_asks_for_a_name() {
+        let (dir, _, mut editor, mut ui) = save_fixture("save-empty");
+        assert_eq!(
+            ui.handle_key(&mut editor, press(KeyCode::Enter)),
+            PromptReply::Handled
+        );
+        assert_eq!(ui.path_error.as_deref(), Some("Enter a file name"));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn save_path_to_an_existing_file_needs_two_enters() {
+        let (dir, files, mut editor, mut ui) = save_fixture("save-existing");
+        let target = files.join("old.txt");
+        fs::write(&target, "old").unwrap();
+        type_text(&mut ui, &mut editor, "old.txt");
+        assert_eq!(
+            ui.handle_key(&mut editor, press(KeyCode::Enter)),
+            PromptReply::Handled
+        );
+        assert_eq!(
+            ui.path_error.as_deref(),
+            Some("\u{201c}old.txt\u{201d} exists. Press Enter again to replace it")
+        );
+        assert_eq!(ui.overwrite_armed.as_ref(), Some(&target));
+        assert_eq!(
+            ui.handle_key(&mut editor, press(KeyCode::Enter)),
+            send(Command::SubmitSavePath(target))
+        );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn editing_disarms_the_overwrite() {
+        let (dir, files, mut editor, mut ui) = save_fixture("save-disarm");
+        fs::write(files.join("old.txt"), "old").unwrap();
+        type_text(&mut ui, &mut editor, "old.txt");
+        ui.handle_key(&mut editor, press(KeyCode::Enter));
+        assert!(ui.overwrite_armed.is_some());
+        ui.handle_key(&mut editor, press(KeyCode::Backspace));
+        type_text(&mut ui, &mut editor, "t");
+        assert_eq!(ui.overwrite_armed, None);
+        assert_eq!(ui.path_error, None);
+        assert_eq!(
+            ui.handle_key(&mut editor, press(KeyCode::Enter)),
+            PromptReply::Handled
+        );
+        assert!(ui.overwrite_armed.is_some());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn save_path_to_a_directory_or_missing_parent_shows_errors() {
+        let (dir, files, mut editor, mut ui) = save_fixture("save-errors");
+        fs::create_dir_all(files.join("sub")).unwrap();
+        type_text(&mut ui, &mut editor, "sub");
+        assert_eq!(
+            ui.handle_key(&mut editor, press(KeyCode::Enter)),
+            PromptReply::Handled
+        );
+        let expected = format!(
+            "\u{201c}{}\u{201d} is a directory",
+            files.join("sub").display()
+        );
+        assert_eq!(ui.path_error.as_deref(), Some(expected.as_str()));
+
+        ui.handle_paste(&mut editor, "/nope/x.txt");
+        assert_eq!(ui.path_error, None);
+        assert_eq!(
+            ui.handle_key(&mut editor, press(KeyCode::Enter)),
+            PromptReply::Handled
+        );
+        let expected = format!(
+            "Folder \u{201c}{}\u{201d} does not exist",
+            files.join("sub/nope").display()
+        );
+        assert_eq!(ui.path_error.as_deref(), Some(expected.as_str()));
+
+        let (buf, _, _) = render(&mut ui, &editor);
+        let row = find_row(&buf, "Folder \u{201c}").unwrap();
+        let col = column_of(&row_text(&buf, row), "Folder");
+        assert_eq!(buf[(col, row)].style().fg, theme::status_error().fg);
+        assert!(find_row(&buf, "[ Save ] [ Cancel ]").is_some());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn save_path_cancels_through_core() {
+        let (dir, _, mut editor, mut ui) = save_fixture("save-cancel");
+        assert_eq!(
+            ui.handle_key(&mut editor, press(KeyCode::Esc)),
+            send(Command::CancelPrompt)
+        );
+        assert_eq!(
+            ui.handle_click(&mut editor, Some(Target::PromptButton(1)), 0),
+            send(Command::CancelPrompt)
+        );
+        assert_eq!(
+            ui.handle_click(&mut editor, None, 0),
+            send(Command::CancelPrompt)
+        );
+        assert_eq!(
+            ui.handle_click(&mut editor, Some(Target::PromptPopup), 0),
+            PromptReply::Handled
+        );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn save_path_button_zero_submits() {
+        let (dir, files, mut editor, mut ui) = save_fixture("save-button");
+        type_text(&mut ui, &mut editor, "a.txt");
+        assert_eq!(
+            ui.handle_click(&mut editor, Some(Target::PromptButton(0)), 0),
+            send(Command::SubmitSavePath(files.join("a.txt")))
+        );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn save_path_text_starts_empty_for_each_new_prompt() {
+        let (dir, _, mut editor, mut ui) = save_fixture("save-reset");
+        type_text(&mut ui, &mut editor, "draft");
+        editor.apply(Command::CancelPrompt);
+        ui.sync(&editor);
+        editor.apply(Command::Save);
+        ui.sync(&editor);
+        assert_eq!(ui.path_text, "");
+        assert_eq!(ui.focus, PromptFocus::Input);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn open_file_is_refused_while_a_core_prompt_is_set() {
+        let (dir, mut editor, mut ui) = confirm_fixture("open-refused");
+        assert!(!ui.open_file(&editor));
+        assert!(ui.is_open(&editor));
+        assert_eq!(ui.open, OpenState::Closed);
+        // The confirmation still owns the keys.
+        assert_eq!(
+            ui.handle_key(&mut editor, press(KeyCode::Enter)),
+            close(CloseChoice::Save)
+        );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn open_to_a_file_sends_open_path_and_closes() {
+        let (dir, files, mut editor, mut ui) = open_fixture("open-file");
+        fs::write(files.join("notes.txt"), "hi").unwrap();
+        type_text(&mut ui, &mut editor, "notes.txt");
+        assert_eq!(
+            ui.handle_key(&mut editor, press(KeyCode::Enter)),
+            send(Command::OpenPath(files.join("notes.txt")))
+        );
+        assert!(!ui.is_open(&editor));
+        assert_eq!(
+            ui.handle_key(&mut editor, press(KeyCode::Enter)),
+            PromptReply::Ignored
+        );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn open_to_a_directory_or_missing_file_shows_errors() {
+        let (dir, files, mut editor, mut ui) = open_fixture("open-errors");
+        fs::create_dir_all(files.join("sub")).unwrap();
+        assert_eq!(
+            ui.handle_key(&mut editor, press(KeyCode::Enter)),
+            PromptReply::Handled
+        );
+        assert_eq!(ui.path_error.as_deref(), Some("Enter a file name"));
+
+        type_text(&mut ui, &mut editor, "sub");
+        assert_eq!(
+            ui.handle_key(&mut editor, press(KeyCode::Enter)),
+            PromptReply::Handled
+        );
+        let expected = format!(
+            "\u{201c}{}\u{201d} is a directory",
+            files.join("sub").display()
+        );
+        assert_eq!(ui.path_error.as_deref(), Some(expected.as_str()));
+        assert!(ui.is_open(&editor));
+        let (buf, _, _) = render(&mut ui, &editor);
+        assert!(find_row(&buf, &fitted(&expected)).is_some());
+
+        type_text(&mut ui, &mut editor, "/x.txt");
+        ui.handle_key(&mut editor, press(KeyCode::Enter));
+        let expected = format!("No such file: {}", files.join("sub/x.txt").display());
+        assert_eq!(ui.path_error.as_deref(), Some(expected.as_str()));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn open_cancels_locally() {
+        let (dir, _, mut editor, mut ui) = open_fixture("open-cancel");
+        assert_eq!(
+            ui.handle_key(&mut editor, press(KeyCode::Esc)),
+            PromptReply::Handled
+        );
+        assert!(!ui.is_open(&editor));
+
+        assert!(ui.open_file(&editor));
+        assert_eq!(
+            ui.handle_click(&mut editor, Some(Target::PromptButton(1)), 0),
+            PromptReply::Handled
+        );
+        assert!(!ui.is_open(&editor));
+
+        assert!(ui.open_file(&editor));
+        assert_eq!(
+            ui.handle_click(&mut editor, Some(Target::Editor), 0),
+            PromptReply::Handled
+        );
+        assert!(!ui.is_open(&editor));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn open_file_clears_the_previous_text() {
+        let (dir, _, mut editor, mut ui) = open_fixture("open-clear");
+        type_text(&mut ui, &mut editor, "abc");
+        ui.handle_key(&mut editor, press(KeyCode::Enter));
+        assert!(ui.path_error.is_some());
+        ui.handle_key(&mut editor, press(KeyCode::Esc));
+        assert!(ui.open_file(&editor));
+        assert_eq!(ui.path_text, "");
+        assert_eq!(ui.path_error, None);
+        let (_, _, cursor) = render(&mut ui, &editor);
+        assert!(cursor.is_some());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_core_prompt_closes_the_local_open_prompt() {
+        let (dir, _, mut editor, mut ui) = open_fixture("open-core-wins");
+        editor.apply(Command::Save);
+        assert!(matches!(editor.prompt(), Some(Prompt::SavePath { .. })));
+        ui.sync(&editor);
+        assert_eq!(ui.open, OpenState::Closed);
+        assert_eq!(ui.key, Some(PromptKey::SavePath(editor.tabs()[0].id)));
+        let (buf, _, _) = render(&mut ui, &editor);
+        assert!(find_row(&buf, "Save as").is_some());
+        assert!(find_row(&buf, "Open file").is_none());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn tab_completes_and_the_candidates_render() {
+        let (dir, files, mut editor, mut ui) = open_fixture("open-complete");
+        fs::write(files.join("alpha.txt"), "").unwrap();
+        fs::write(files.join("alpha.md"), "").unwrap();
+        type_text(&mut ui, &mut editor, "al");
+        ui.handle_key(&mut editor, press(KeyCode::Tab));
+        assert_eq!(ui.path_text, "alpha.");
+        assert!(ui.candidates.candidates.is_empty());
+
+        ui.handle_key(&mut editor, press(KeyCode::Tab));
+        assert_eq!(ui.path_text, "alpha.md");
+        assert_eq!(ui.candidates.selected, Some(0));
+
+        let (buf, hits, cursor) = render(&mut ui, &editor);
+        let title = find_row(&buf, "Open file").unwrap();
+        // Width 70 centred in 80: the border is at 5, the field at 6.
+        assert_eq!(cursor, Some(Position::new(6 + 8, title + 1)));
+        let hint = format!("relative to {}", files.display());
+        assert!(row_text(&buf, title + 2).contains(&fitted(&hint)));
+        let md = find_row_from(&buf, title + 3, "alpha.md ").unwrap();
+        assert_eq!(md, title + 3);
+        assert_eq!(buf[(6, md)].style().bg, theme::button_focused().bg);
+        assert_eq!(hits.hit(6, md), Some(Target::PromptCandidate(0)));
+        assert!(row_text(&buf, md + 1).contains("alpha.txt"));
+        assert_eq!(buf[(6, md + 1)].style().bg, theme::popup().bg);
+        assert_eq!(hits.hit(6, md + 1), Some(Target::PromptCandidate(1)));
+        assert!(row_text(&buf, md + 2).contains("[ Open ] [ Cancel ]"));
+
+        ui.handle_key(&mut editor, press(KeyCode::BackTab));
+        assert_eq!(ui.path_text, "alpha.txt");
+        ui.handle_key(&mut editor, press(KeyCode::Backspace));
+        assert!(ui.candidates.candidates.is_empty());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn long_candidate_lists_show_more_and_scroll_to_the_selection() {
+        let (dir, files, mut editor, mut ui) = open_fixture("open-more");
+        for i in 0..10 {
+            fs::write(files.join(format!("f{i:02}")), "").unwrap();
+        }
+        type_text(&mut ui, &mut editor, "f0");
+        ui.handle_key(&mut editor, press(KeyCode::Tab));
+        assert_eq!(ui.candidates.candidates.len(), 10);
+        let (buf, _, _) = render(&mut ui, &editor);
+        let list = find_row(&buf, "Open file").unwrap() + 3;
+        assert!(row_text(&buf, list).contains("f00 "));
+        assert!(row_text(&buf, list + 7).contains("f07 "));
+        assert!(row_text(&buf, list + 8).contains("\u{2026} 2 more"));
+        assert!(row_text(&buf, list + 9).contains("[ Open ] [ Cancel ]"));
+
+        for _ in 0..8 {
+            ui.handle_key(&mut editor, press(KeyCode::Tab));
+        }
+        assert_eq!(ui.candidates.selected, Some(8));
+        let (buf, hits, _) = render(&mut ui, &editor);
+        assert!(find_row(&buf, "f00 ").is_none());
+        assert!(row_text(&buf, list).contains("f01 "));
+        assert_eq!(hits.hit(6, list), Some(Target::PromptCandidate(1)));
+        assert!(row_text(&buf, list + 7).contains("f08 "));
+        assert_eq!(hits.hit(6, list + 7), Some(Target::PromptCandidate(8)));
+        assert_eq!(buf[(6, list + 7)].style().bg, theme::button_focused().bg);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn clicking_a_candidate_fills_the_field() {
+        let (dir, files, mut editor, mut ui) = open_fixture("open-click");
+        fs::write(files.join("alpha.txt"), "").unwrap();
+        fs::write(files.join("alpha.md"), "").unwrap();
+        type_text(&mut ui, &mut editor, "alpha.");
+        ui.handle_key(&mut editor, press(KeyCode::Tab));
+        let (buf, hits, _) = render(&mut ui, &editor);
+        let row = find_row(&buf, "alpha.txt").unwrap();
+        let target = hits.hit(10, row);
+        assert_eq!(target, Some(Target::PromptCandidate(1)));
+        assert_eq!(
+            ui.handle_click(&mut editor, target, 10),
+            PromptReply::Handled
+        );
+        assert_eq!(ui.path_text, "alpha.txt");
+        assert!(ui.candidates.candidates.is_empty());
+        assert_eq!(ui.input.cursor(), "alpha.txt".len());
+        assert_eq!(
+            ui.handle_key(&mut editor, press(KeyCode::Enter)),
+            send(Command::OpenPath(files.join("alpha.txt")))
+        );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn clicking_the_path_field_places_the_cursor() {
+        let (dir, _, mut editor, mut ui) = open_fixture("open-field-click");
+        type_text(&mut ui, &mut editor, "abc");
+        let (buf, hits, _) = render(&mut ui, &editor);
+        let row = find_row(&buf, "Open file").unwrap() + 1;
+        let target = hits.hit(7, row);
+        assert_eq!(target, Some(Target::PromptInput));
+        ui.handle_click(&mut editor, target, 7);
+        type_text(&mut ui, &mut editor, "_");
+        assert_eq!(ui.path_text, "a_bc");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn paste_inserts_into_the_path_field() {
+        let (dir, files, mut editor, mut ui) = open_fixture("open-paste");
+        type_text(&mut ui, &mut editor, "a");
+        ui.handle_paste(&mut editor, "b/c\n");
+        assert_eq!(ui.path_text, "ab/c ");
+        ui.handle_key(&mut editor, press(KeyCode::Backspace));
+        ui.handle_key(&mut editor, press(KeyCode::Enter));
+        let expected = format!("No such file: {}", files.join("ab/c").display());
+        assert_eq!(ui.path_error.as_deref(), Some(expected.as_str()));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_workspace_root_is_the_base_when_there_is_one() {
+        let dir = temp_dir("open-workspace");
+        let root = dir.join("root");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("w.txt"), "").unwrap();
+        let mut editor = open_editor(&dir, &[], Some(&root));
+        let mut ui = PromptUi::new(dir.join("elsewhere"), None);
+        assert!(ui.open_file(&editor));
+        let (buf, _, _) = render(&mut ui, &editor);
+        let hint = format!("relative to {}", root.display());
+        assert!(find_row(&buf, &fitted(&hint)).is_some());
+        type_text(&mut ui, &mut editor, "w.txt");
+        assert_eq!(
+            ui.handle_key(&mut editor, press(KeyCode::Enter)),
+            send(Command::OpenPath(root.join("w.txt")))
+        );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn tilde_expands_to_home_in_path_prompts() {
+        let (dir, files, mut editor, _) = open_fixture("open-home");
+        let mut ui = PromptUi::new(dir.clone(), Some(files.clone()));
+        assert!(ui.open_file(&editor));
+        fs::write(files.join("h.txt"), "").unwrap();
+        type_text(&mut ui, &mut editor, "~/h.txt");
+        assert_eq!(
+            ui.handle_key(&mut editor, press(KeyCode::Enter)),
+            send(Command::OpenPath(files.join("h.txt")))
+        );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn focus_field_moves_the_path_cursor_to_the_end() {
+        let (dir, _, mut editor, mut ui) = save_fixture("save-focus");
+        type_text(&mut ui, &mut editor, "abc");
+        ui.handle_key(&mut editor, press(KeyCode::Home));
+        ui.focus_field(&editor);
+        assert_eq!(ui.focus, PromptFocus::Input);
+        assert_eq!(ui.input.cursor(), 3);
+        fs::remove_dir_all(&dir).unwrap();
     }
 }

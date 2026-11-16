@@ -853,8 +853,9 @@ it, if `editor.prompt()` is `Some`. `pub fn is_open(&self, editor)
 prompts:
 
 - show the title, then the field, then a hint line
-  `relative to {base}` (or `{workspace root}`; the app passes
-  `editor.workspace()` root as `base` when there is one), then up to 8
+  `relative to {base}`, where the base is the workspace root when
+  there is one, else the `base` given to `PromptUi::new` (computed
+  inside `PromptUi`, so the app never passes it), then up to 8
   candidate rows (each a `PromptCandidate(i)` hit, the selected one in
   `theme::button_focused()`, plus `… N more` if there are more), then
   the buttons
