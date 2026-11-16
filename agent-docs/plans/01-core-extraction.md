@@ -789,6 +789,23 @@ NOT add summary or progress documents (`no-summary-documents`).
 
 Stop: report and await review.
 
+### 01.13 -- Cleanup: broken intra-doc link in `squiggle.rs`
+
+- **Surfaced:** 01.7 (`d92a291`), by
+  `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps`.
+  Pre-existing: the same link is on `main` at `af9f421`
+  (`frext/src/proofread/squiggle.rs:114`).
+- **Impact:** `cargo doc` fails with `-D warnings`: the public
+  `wave_points` doc links to the private const `HALF_WAVELENGTH`. No
+  runtime effect; the verification ritual does not run `cargo doc`.
+- **Scope of fix:** `frext/src/squiggle.rs` doc comment only.
+- **Suggested approach:** replace the intra-doc link with plain code
+  formatting (`` `HALF_WAVELENGTH` ``), or document the constant's value
+  inline.
+- **Verification:** the command above exits 0, plus the standard ritual.
+- **Scheduling:** independent of every other subtask; may land at any
+  point before the PR is marked `pending merge`.
+
 ## Manual smoke checklist (whole plan)
 
 The GUI is not covered by UI tests, so before the PR is marked
