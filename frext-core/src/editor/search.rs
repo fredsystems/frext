@@ -291,11 +291,19 @@ impl Editor {
                 return BufferChange::Unchanged;
             }
         };
+        // The same scope `recompute_matches` searches within.
+        let scope = match (self.search.in_selection, self.selection_bytes()) {
+            (true, Some(scope)) if scope.start < scope.end => Some(scope),
+            _ => None,
+        };
         let Some(tab) = self.tabs.get_mut(self.active) else {
             return BufferChange::Unchanged;
         };
 
-        let new_text = matcher.replace_all(&tab.text, &self.search.replacement);
+        let new_text = match scope {
+            Some(scope) => matcher.replace_all_in(&tab.text, scope, &self.search.replacement),
+            None => matcher.replace_all(&tab.text, &self.search.replacement),
+        };
         let change = if new_text == tab.text {
             BufferChange::Unchanged
         } else {
@@ -949,6 +957,39 @@ mod tests {
         editor.apply(Command::SelectTab(index_of(&editor, &b)));
 
         assert_eq!(editor.search().matches(), [0..3, 4..7, 8..11]);
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn replace_all_in_selection_only_replaces_inside_the_selection() {
+        let dir = temp_dir("replace-all-in-selection");
+        let mut editor = editor_with_two_tabs(&dir, "cat cat", "");
+        *editor.search_replacement_mut() = "dog".to_owned();
+        find(&mut editor, "cat");
+        editor.set_selection(Some(0..3));
+        editor.apply(Command::ToggleSearchOption(SearchOption::InSelection));
+
+        let outcome = editor.apply(Command::ReplaceAll);
+
+        assert_eq!(outcome.buffer, BufferChange::Edited);
+        assert_eq!(editor.active_tab().unwrap().text, "dog cat");
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn replace_all_without_in_selection_still_replaces_everything() {
+        let dir = temp_dir("replace-all-no-in-selection");
+        let mut editor = editor_with_two_tabs(&dir, "cat cat", "");
+        *editor.search_replacement_mut() = "dog".to_owned();
+        find(&mut editor, "cat");
+        editor.set_selection(Some(0..3));
+
+        let outcome = editor.apply(Command::ReplaceAll);
+
+        assert_eq!(outcome.buffer, BufferChange::Edited);
+        assert_eq!(editor.active_tab().unwrap().text, "dog dog");
 
         fs::remove_dir_all(&dir).unwrap();
     }

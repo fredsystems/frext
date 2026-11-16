@@ -125,6 +125,34 @@ impl Matcher {
         }
     }
 
+    /// Replace only the matches [`Self::find_matches_in`] would return for
+    /// `scope` (a byte range of `text`): non-empty matches lying wholly
+    /// inside it. Everything else is left untouched. Capture references in
+    /// `replacement` expand in regex mode and are literal in plain mode,
+    /// exactly as in [`Self::replace_all`].
+    #[must_use]
+    pub fn replace_all_in(&self, text: &str, scope: Range<usize>, replacement: &str) -> String {
+        self.regex
+            .replace_all(text, |caps: &regex::Captures| {
+                let Some(whole) = caps.get(0) else {
+                    return String::new();
+                };
+                let in_scope = whole.start() != whole.end()
+                    && whole.start() >= scope.start
+                    && whole.end() <= scope.end;
+                if !in_scope {
+                    whole.as_str().to_owned()
+                } else if self.literal_replacement {
+                    replacement.to_owned()
+                } else {
+                    let mut buf = String::new();
+                    caps.expand(replacement, &mut buf);
+                    buf
+                }
+            })
+            .into_owned()
+    }
+
     /// Replace the single match covering byte offset `at` (the start of the
     /// current match) with `replacement`, returning the new string and the
     /// byte range the replacement now occupies. Returns `None` when no match
@@ -248,5 +276,36 @@ mod tests {
         assert_eq!(range, 4..7);
         // No match starts at offset 1.
         assert!(m.replace_one_at("foo foo", 1, "bar").is_none());
+    }
+
+    #[test]
+    fn replace_all_in_only_replaces_plain_matches_inside_the_scope() {
+        let m = query("cat", false, false, false).compile().unwrap();
+        assert_eq!(m.replace_all_in("cat cat cat", 4..7, "dog"), "cat dog cat");
+    }
+
+    #[test]
+    fn replace_all_in_expands_captures_only_inside_the_scope() {
+        let m = query(r"(\w+)@(\w+)", false, true, false).compile().unwrap();
+        assert_eq!(m.replace_all_in("a@b c@d", 4..7, "$2.$1"), "a@b d.c");
+    }
+
+    #[test]
+    fn replace_all_in_skips_a_match_crossing_the_scope_edge() {
+        let m = query("cat", false, false, false).compile().unwrap();
+        // The first "cat" (0..3) only partly overlaps 1..7.
+        assert_eq!(m.replace_all_in("cat cat cat", 1..7, "dog"), "cat dog cat");
+    }
+
+    #[test]
+    fn replace_all_in_keeps_capture_references_literal_in_plain_mode() {
+        let m = query("cat", false, false, false).compile().unwrap();
+        assert_eq!(m.replace_all_in("cat cat", 0..3, "$1"), "$1 cat");
+    }
+
+    #[test]
+    fn replace_all_in_an_empty_scope_replaces_nothing() {
+        let m = query("cat", false, false, false).compile().unwrap();
+        assert_eq!(m.replace_all_in("cat cat", 4..4, "dog"), "cat cat");
     }
 }
