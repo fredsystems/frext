@@ -36,8 +36,13 @@ unit-testable against byte output) rather than using ratatui-image's:
   `2 * cell_px.width` x `cell_px.height` (about square, since cells are
   roughly 1:2). Pin `resvg` / `tiny-skia` to the versions `egui_extras`
   already pulls in, so the workspace carries one copy.
-- **Upload once per stem, lazily**: `a=T,U=1,f=32,i=<id>,c=2,r=1,q=2`,
-  base64 in 4096-byte chunks (`m=1` ... `m=0`), direct transfer `t=d`.
+- **Upload once per stem, lazily**:
+  `a=T,U=1,f=32,s=<w>,v=<h>,i=<id>,c=2,r=1,q=2`, where `s` / `v` are
+  the rasterised RGBA width / height in pixels (see Rasterising); raw
+  `f=32` data requires them (`c` / `r` are only the placement size in
+  cells), and with `q=2` a missing size would fail silently, so they
+  are spelled out. Base64 in 4096-byte chunks (`m=1` ... `m=0`), direct
+  transfer `t=d`.
   `U=1` creates a virtual placement for unicode placeholders. `q=2`
   suppresses all replies so none land in the input stream as garbage
   key events. Uploads are written out-of-band through
