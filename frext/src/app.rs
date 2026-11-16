@@ -13,7 +13,7 @@ use frext_core::{
         Prompt, SearchBar, SearchOption, StepDirection,
     },
     persistence::Store,
-    proofread::{Diagnostic, DiagnosticKind, IgnoreKey},
+    proofread::{Diagnostic, DiagnosticKind},
     tab::Tab,
     workspace::Workspace,
 };
@@ -62,13 +62,6 @@ impl FrextApp {
     #[must_use]
     pub fn new(store: Store) -> Self {
         Self::with_args(store, &[], None)
-    }
-
-    /// Build the app like [`FrextApp::new`], but backed by `clipboard`
-    /// instead of the system clipboard.
-    #[cfg(test)]
-    fn with_clipboard(store: Store, clipboard: Box<dyn frext_core::clipboard::Clipboard>) -> Self {
-        Self::from_editor(Editor::open(store, clipboard, &[], None))
     }
 
     /// Build the app, restoring the previous session and then opening any
@@ -271,136 +264,6 @@ impl FrextApp {
             None => Command::CancelPrompt,
         };
         self.send(command);
-    }
-
-    /// Apply a deferred editor context-menu action after the editor borrow has
-    /// ended.
-    ///
-    /// Clipboard text edits (cut/copy/paste) act on the editor's char
-    /// selection over the active buffer, then queue the resulting caret as a
-    /// [`Effect::SetSelection`] so the cursor follows the edit next frame.
-    /// Find/replace and save reuse the existing deferred actions.
-    ///
-    /// Returns `true` when the buffer changed (so the caller can persist and
-    /// refresh matches), matching how the editor's own `changed()` is handled.
-    fn apply_editor_action(&mut self, action: EditorAction) -> bool {
-        let selection = self.editor.selection().unwrap_or(0..0);
-
-        match action {
-            EditorAction::None => false,
-            EditorAction::Copy => {
-                if let Some(tab) = self.editor.active_tab() {
-                    let text = frext_core::edit_ops::selected_text(
-                        &tab.text,
-                        selection.start,
-                        selection.end,
-                    );
-                    if !text.is_empty() {
-                        self.editor.clipboard_mut().write_text(text);
-                    }
-                }
-                false
-            }
-            EditorAction::Cut => {
-                let Some(tab) = self.editor.active_tab() else {
-                    return false;
-                };
-                let text =
-                    frext_core::edit_ops::selected_text(&tab.text, selection.start, selection.end);
-                if text.is_empty() {
-                    return false;
-                }
-                self.editor.clipboard_mut().write_text(text);
-                let Some(view) = self.editor.active_view_mut() else {
-                    return false;
-                };
-                let caret = frext_core::edit_ops::delete_range(
-                    &mut view.tab.text,
-                    selection.start,
-                    selection.end,
-                );
-                self.focus_caret(caret);
-                true
-            }
-            EditorAction::Paste => {
-                let Some(clip) = self.editor.clipboard_mut().read_text() else {
-                    return false;
-                };
-                if clip.is_empty() {
-                    return false;
-                }
-                let Some(view) = self.editor.active_view_mut() else {
-                    return false;
-                };
-                let caret = frext_core::edit_ops::replace_range(
-                    &mut view.tab.text,
-                    selection.start,
-                    selection.end,
-                    &clip,
-                );
-                self.focus_caret(caret);
-                true
-            }
-            EditorAction::SelectAll => {
-                if let Some(tab) = self.editor.active_tab() {
-                    let len = tab.text.chars().count();
-                    self.effects.push(Effect::SetSelection {
-                        chars: 0..len,
-                        focus: EditorFocus::Focus,
-                    });
-                }
-                false
-            }
-            EditorAction::Find => {
-                self.send(Command::OpenSearch(SearchBar::Find));
-                false
-            }
-            EditorAction::FindReplace => {
-                self.send(Command::OpenSearch(SearchBar::FindReplace));
-                false
-            }
-            EditorAction::Save => {
-                self.send(Command::Save);
-                false
-            }
-            EditorAction::ApplySuggestion {
-                bytes,
-                flagged,
-                replacement,
-            } => {
-                let Some(view) = self.editor.active_view_mut() else {
-                    return false;
-                };
-                let tab = view.tab;
-                // The buffer may have changed since the menu opened; only
-                // replace text that is still exactly what was flagged.
-                if tab.text.get(bytes.clone()) != Some(flagged.as_str()) {
-                    return false;
-                }
-                let caret = tab.text.get(..bytes.start).map_or(0, |s| s.chars().count())
-                    + replacement.chars().count();
-                tab.text.replace_range(bytes, &replacement);
-                self.focus_caret(caret);
-                true
-            }
-            EditorAction::AddToDictionary(word) => {
-                self.editor.add_to_dictionary(&word);
-                false
-            }
-            EditorAction::Ignore(key) => {
-                self.editor.proofread_mut().ignore(key);
-                false
-            }
-        }
-    }
-
-    /// Queue `caret` (a character index) as a collapsed, focused editor
-    /// selection, so the cursor tracks a programmatic edit.
-    fn focus_caret(&mut self, caret: usize) {
-        self.effects.push(Effect::SetSelection {
-            chars: caret..caret,
-            focus: EditorFocus::Focus,
-        });
     }
 
     /// Render and resolve the filesystem name-entry modal (rename / new file /
@@ -778,7 +641,7 @@ impl FrextApp {
         ui: &mut egui::Ui,
         has_selection: bool,
         diagnostic: Option<&Diagnostic>,
-        editor_action: &mut EditorAction,
+        editor_action: &mut Option<Command>,
     ) {
         if let Some(diagnostic) = diagnostic {
             Self::diagnostic_menu_items(ui, diagnostic, editor_action);
@@ -788,36 +651,36 @@ impl FrextApp {
             .add_enabled(has_selection, egui::Button::new("Cut"))
             .clicked()
         {
-            *editor_action = EditorAction::Cut;
+            *editor_action = Some(Command::Cut);
             ui.close();
         }
         if ui
             .add_enabled(has_selection, egui::Button::new("Copy"))
             .clicked()
         {
-            *editor_action = EditorAction::Copy;
+            *editor_action = Some(Command::Copy);
             ui.close();
         }
         if ui.button("Paste").clicked() {
-            *editor_action = EditorAction::Paste;
+            *editor_action = Some(Command::Paste);
             ui.close();
         }
         if ui.button("Select all").clicked() {
-            *editor_action = EditorAction::SelectAll;
+            *editor_action = Some(Command::SelectAll);
             ui.close();
         }
         ui.separator();
         if ui.button("Find\u{2026}").clicked() {
-            *editor_action = EditorAction::Find;
+            *editor_action = Some(Command::OpenSearch(SearchBar::Find));
             ui.close();
         }
         if ui.button("Find and replace\u{2026}").clicked() {
-            *editor_action = EditorAction::FindReplace;
+            *editor_action = Some(Command::OpenSearch(SearchBar::FindReplace));
             ui.close();
         }
         ui.separator();
         if ui.button("Save").clicked() {
-            *editor_action = EditorAction::Save;
+            *editor_action = Some(Command::Save);
             ui.close();
         }
     }
@@ -828,7 +691,7 @@ impl FrextApp {
     fn diagnostic_menu_items(
         ui: &mut egui::Ui,
         diagnostic: &Diagnostic,
-        editor_action: &mut EditorAction,
+        editor_action: &mut Option<Command>,
     ) {
         ui.add(egui::Label::new(egui::RichText::new(&diagnostic.message).weak()).wrap());
         if diagnostic.suggestions.is_empty() {
@@ -841,11 +704,11 @@ impl FrextApp {
                 suggestion.clone()
             };
             if ui.button(egui::RichText::new(label).strong()).clicked() {
-                *editor_action = EditorAction::ApplySuggestion {
+                *editor_action = Some(Command::ApplySuggestion {
                     bytes: diagnostic.bytes.clone(),
                     flagged: diagnostic.flagged.clone(),
                     replacement: suggestion.clone(),
-                };
+                });
                 ui.close();
             }
         }
@@ -858,11 +721,11 @@ impl FrextApp {
                 ))
                 .clicked()
         {
-            *editor_action = EditorAction::AddToDictionary(diagnostic.flagged.clone());
+            *editor_action = Some(Command::AddToDictionary(diagnostic.flagged.clone()));
             ui.close();
         }
         if ui.button("Ignore").clicked() {
-            *editor_action = EditorAction::Ignore(diagnostic.ignore_key());
+            *editor_action = Some(Command::Ignore(diagnostic.ignore_key()));
             ui.close();
         }
     }
@@ -886,31 +749,21 @@ impl FrextApp {
 impl eframe::App for FrextApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        // Proofreading runs on a background thread that repaints when a
+        // result lands, so squiggles appear without further input. The
+        // editor also picks up external modifications to the active tab's
+        // file here (detected by a change in on-disk size): a clean buffer is
+        // reloaded, a dirty one is left untouched.
+        self.editor.begin_frame({
+            let ctx = ctx.clone();
+            move || ctx.request_repaint()
+        });
         // Effects queued by last frame's commands, applied while rendering.
         let effects = self.apply_effects();
         // A deferred tab-bar / shortcut command (the last one chosen wins),
         // and whether the open-file dialog was asked for.
         let mut action: Option<Command> = None;
         let mut open_dialog = false;
-
-        // Proofreading runs on a background thread that repaints when a
-        // result lands, so squiggles appear without further input.
-        self.editor.proofread_mut().ensure_started({
-            let ctx = ctx.clone();
-            move || ctx.request_repaint()
-        });
-        self.editor.proofread_mut().poll();
-
-        // Pick up external modifications to the active tab's file (detected
-        // by a change in on-disk size). A clean buffer is reloaded; a dirty
-        // one is left untouched. Keeping the swap file and session index in
-        // step after a reload preserves crash-safety.
-        if let Some(view) = self.editor.active_view_mut()
-            && view.tab.reload_if_changed_on_disk()
-        {
-            self.editor.persist_active_swap();
-            self.editor.persist_session();
-        }
 
         // Keyboard shortcuts. Search commands are deferred like menu actions
         // so they run after the editor borrow ends, in the order they occur.
@@ -1117,7 +970,7 @@ impl eframe::App for FrextApp {
         // Editor context-menu plumbing: the chosen action plus the live char
         // selection it acts on, captured inside the closure and applied after
         // the borrow ends.
-        let mut editor_action = EditorAction::None;
+        let mut editor_action: Option<Command> = None;
         let mut editor_char_selection: Option<Range<usize>> = None;
 
         egui::CentralPanel::default().show(ui, |ui| {
@@ -1271,24 +1124,20 @@ impl eframe::App for FrextApp {
         // actions below act on it.
         self.editor.set_selection(editor_char_selection);
 
-        // Apply a deferred editor context-menu action (cut/copy/paste/select
-        // all/find/save). A clipboard edit that mutates the buffer is folded
-        // into `changed` so it persists and refreshes matches just like a
-        // typed edit.
-        if !matches!(editor_action, EditorAction::None) {
-            let edited = self.apply_editor_action(editor_action);
-            changed = changed || edited;
+        // Apply a deferred editor context-menu command (cut/copy/paste/select
+        // all/find/save/proofreading fixes). A command that edits the buffer
+        // persists it and refreshes matches itself, so its buffer change
+        // needs no handling here.
+        if let Some(command) = editor_action {
+            self.send(command);
         }
 
-        // The buffer was edited this frame: persist it and refresh matches so
-        // the search bar tracks live edits, not just query changes.
+        // The editor surface was typed into this frame: persist the buffer
+        // and refresh matches so the search bar tracks live edits, not just
+        // query changes.
         if changed {
             self.editor.commit_edit();
         }
-
-        // Queue a proofread of the active buffer; a no-op unless its text
-        // (or path) changed since the last request.
-        self.editor.end_frame();
 
         if open_dialog {
             self.open_file();
@@ -1314,6 +1163,10 @@ impl eframe::App for FrextApp {
         // Filesystem name-entry modal (rename / new file / new folder),
         // resolved after rendering for the same borrow-simplicity reason.
         self.resolve_name_prompt(&ctx, effects.focus_prompt);
+
+        // Queue a proofread of the active buffer; a no-op unless its text
+        // (or path) changed since the last request.
+        self.editor.end_frame();
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
@@ -1346,37 +1199,6 @@ fn stem_uri(stem: &str) -> String {
     format!("frext-file-icon://{stem}.svg")
 }
 
-/// A deferred editor context-menu action, collected while the editor is
-/// borrowed and applied after the borrow ends.
-enum EditorAction {
-    None,
-    /// Copy the selection to the clipboard, then delete it from the buffer.
-    Cut,
-    /// Copy the selection to the clipboard.
-    Copy,
-    /// Replace the selection (or insert at the caret) with the clipboard text.
-    Paste,
-    /// Select the entire buffer.
-    SelectAll,
-    /// Open the find bar.
-    Find,
-    /// Open the find-and-replace bar.
-    FindReplace,
-    /// Save the active buffer.
-    Save,
-    /// Replace the proofreading-flagged `bytes` (still holding `flagged`)
-    /// with `replacement`.
-    ApplySuggestion {
-        bytes: Range<usize>,
-        flagged: String,
-        replacement: String,
-    },
-    /// Add a word to the personal dictionary.
-    AddToDictionary(String),
-    /// Hide matching diagnostics for the rest of the session.
-    Ignore(IgnoreKey),
-}
-
 /// Show a native "open file" picker. Returns `None` if cancelled or if no
 /// picker backend is available.
 fn rfd_pick_file() -> Option<std::path::PathBuf> {
@@ -1394,234 +1216,7 @@ mod tests {
     // `Err`/`None` is exactly the failure signal we want from a test.
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-    use std::{fs, path::PathBuf};
-
     use super::*;
-    use frext_core::clipboard::MemoryClipboard;
-
-    /// Create an isolated temp directory unique to this test.
-    fn temp_dir(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "frext-app-test-{tag}-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        fs::create_dir_all(&dir).unwrap();
-        dir
-    }
-
-    /// A fresh app backed by a store rooted in `dir/state`.
-    fn app_in(dir: &std::path::Path) -> FrextApp {
-        let store = Store::at(dir.join("state")).unwrap();
-        FrextApp::with_clipboard(store, Box::new(MemoryClipboard::default()))
-    }
-
-    #[test]
-    fn cut_deletes_the_selection_from_the_buffer() {
-        let dir = temp_dir("editor-cut");
-        let mut app = app_in(&dir);
-        let active = app.editor.active_index();
-        app.editor.tabs_mut()[active].text = "hello world".to_owned();
-
-        // Cut "hello " (chars 0..6).
-        app.editor.set_selection(Some(0..6));
-        let changed = app.apply_editor_action(EditorAction::Cut);
-
-        assert!(changed);
-        assert_eq!(app.editor.active_tab().unwrap().text, "world");
-        assert_eq!(
-            app.editor.clipboard_mut().read_text().as_deref(),
-            Some("hello ")
-        );
-
-        fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn paste_replaces_the_selection_with_clipboard_text() {
-        let dir = temp_dir("editor-paste");
-        let mut app = app_in(&dir);
-        let active = app.editor.active_index();
-        app.editor.tabs_mut()[active].text = "hello world".to_owned();
-        assert!(app.editor.clipboard_mut().write_text("there".to_owned()));
-
-        // Paste over "world" (chars 6..11).
-        app.editor.set_selection(Some(6..11));
-        let changed = app.apply_editor_action(EditorAction::Paste);
-
-        assert!(changed);
-        assert_eq!(app.editor.active_tab().unwrap().text, "hello there");
-
-        fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn paste_with_an_empty_clipboard_is_a_noop() {
-        let dir = temp_dir("editor-paste-empty");
-        let mut app = app_in(&dir);
-        let active = app.editor.active_index();
-        app.editor.tabs_mut()[active].text = "unchanged".to_owned();
-
-        app.editor.set_selection(Some(0..2));
-        let changed = app.apply_editor_action(EditorAction::Paste);
-
-        assert!(!changed);
-        assert_eq!(app.editor.active_tab().unwrap().text, "unchanged");
-
-        fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn copy_does_not_mutate_the_buffer() {
-        let dir = temp_dir("editor-copy");
-        let mut app = app_in(&dir);
-        let active = app.editor.active_index();
-        app.editor.tabs_mut()[active].text = "keep me".to_owned();
-
-        app.editor.set_selection(Some(0..4));
-        let changed = app.apply_editor_action(EditorAction::Copy);
-
-        assert!(!changed);
-        assert_eq!(app.editor.active_tab().unwrap().text, "keep me");
-        assert_eq!(
-            app.editor.clipboard_mut().read_text().as_deref(),
-            Some("keep")
-        );
-
-        fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn find_action_opens_the_search_bar() {
-        let dir = temp_dir("editor-find");
-        let mut app = app_in(&dir);
-        assert!(!app.editor.search().is_open());
-
-        let changed = app.apply_editor_action(EditorAction::Find);
-
-        assert!(!changed);
-        assert!(app.editor.search().is_open());
-        assert!(!app.editor.search().replace_open());
-
-        fs::remove_dir_all(&dir).unwrap();
-    }
-
-    fn suggestion(bytes: Range<usize>, flagged: &str, replacement: &str) -> EditorAction {
-        EditorAction::ApplySuggestion {
-            bytes,
-            flagged: flagged.to_owned(),
-            replacement: replacement.to_owned(),
-        }
-    }
-
-    #[test]
-    fn applying_a_suggestion_replaces_the_flagged_text() {
-        let dir = temp_dir("editor-suggest");
-        let mut app = app_in(&dir);
-        let active = app.editor.active_index();
-        app.editor.tabs_mut()[active].text = "café wrrod here".to_owned();
-
-        // "wrrod" sits after a multi-byte char: bytes 6..11.
-        let changed = app.apply_editor_action(suggestion(6..11, "wrrod", "word"));
-
-        assert!(changed);
-        assert_eq!(app.editor.active_tab().unwrap().text, "café word here");
-
-        fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn a_stale_suggestion_leaves_the_buffer_alone() {
-        let dir = temp_dir("editor-suggest-stale");
-        let mut app = app_in(&dir);
-        // The buffer was edited after the menu opened: the range no longer
-        // holds the flagged word.
-        let active = app.editor.active_index();
-        app.editor.tabs_mut()[active].text = "a word here".to_owned();
-
-        let changed = app.apply_editor_action(suggestion(2..7, "wrrod", "word"));
-
-        assert!(!changed);
-        assert_eq!(app.editor.active_tab().unwrap().text, "a word here");
-
-        fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn a_removal_suggestion_deletes_the_flagged_text() {
-        let dir = temp_dir("editor-suggest-remove");
-        let mut app = app_in(&dir);
-        let active = app.editor.active_index();
-        app.editor.tabs_mut()[active].text = "the the cat".to_owned();
-
-        let changed = app.apply_editor_action(suggestion(0..4, "the ", ""));
-
-        assert!(changed);
-        assert_eq!(app.editor.active_tab().unwrap().text, "the cat");
-
-        fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn adding_to_the_dictionary_persists_across_launches() {
-        let dir = temp_dir("editor-dictionary");
-        let mut app = app_in(&dir);
-
-        let changed = app.apply_editor_action(EditorAction::AddToDictionary("frext".to_owned()));
-
-        assert!(!changed, "the buffer is untouched");
-        assert_eq!(
-            app.editor.proofread().user_words().collect::<Vec<_>>(),
-            vec!["frext"]
-        );
-
-        // A fresh app over the same store loads the saved word.
-        let reopened = app_in(&dir);
-        assert_eq!(
-            reopened.editor.proofread().user_words().collect::<Vec<_>>(),
-            vec!["frext"]
-        );
-
-        fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn an_unreadable_dictionary_is_never_overwritten() {
-        let dir = temp_dir("editor-dictionary-unreadable");
-        let state = dir.join("state");
-        fs::create_dir_all(&state).unwrap();
-        // Invalid UTF-8: `load_dictionary` fails rather than returning words.
-        let original: &[u8] = b"kept\n\xff\xfe broken\n";
-        fs::write(state.join("dictionary.txt"), original).unwrap();
-
-        let mut app = app_in(&dir);
-        app.apply_editor_action(EditorAction::AddToDictionary("frext".to_owned()));
-
-        // The word works for this session...
-        assert_eq!(
-            app.editor.proofread().user_words().collect::<Vec<_>>(),
-            vec!["frext"]
-        );
-        // ...but the unreadable file is left exactly as it was.
-        assert_eq!(fs::read(state.join("dictionary.txt")).unwrap(), original);
-
-        fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn find_replace_action_opens_the_replace_row() {
-        let dir = temp_dir("editor-replace");
-        let mut app = app_in(&dir);
-
-        app.apply_editor_action(EditorAction::FindReplace);
-
-        assert!(app.editor.search().is_open());
-        assert!(app.editor.search().replace_open());
-
-        fs::remove_dir_all(&dir).unwrap();
-    }
 
     #[test]
     fn stem_uri_is_stable_and_svg_suffixed() {

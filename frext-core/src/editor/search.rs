@@ -771,4 +771,32 @@ mod tests {
 
         fs::remove_dir_all(&dir).unwrap();
     }
+
+    #[test]
+    fn find_action_opens_the_search_bar() {
+        let dir = temp_dir("search-find-action");
+        let mut editor = editor_with_files(&dir, &[]);
+        assert!(!editor.search().is_open());
+
+        let outcome = editor.apply(Command::OpenSearch(SearchBar::Find));
+
+        assert_eq!(outcome.buffer, BufferChange::Unchanged);
+        assert!(editor.search().is_open());
+        assert!(!editor.search().replace_open());
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn find_replace_action_opens_the_replace_row() {
+        let dir = temp_dir("search-replace-action");
+        let mut editor = editor_with_files(&dir, &[]);
+
+        editor.apply(Command::OpenSearch(SearchBar::FindReplace));
+
+        assert!(editor.search().is_open());
+        assert!(editor.search().replace_open());
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
 }

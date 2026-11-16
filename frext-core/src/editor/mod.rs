@@ -7,6 +7,7 @@
 //! [`Outcome`]'s [`Effect`]s to its own view state.
 
 mod command;
+mod editing;
 mod effect;
 mod prompt;
 mod search;
@@ -154,8 +155,32 @@ impl Editor {
         editor
     }
 
-    /// Queue a proofread of the active buffer; a no-op unless its text (or
-    /// path) changed since the last request.
+    /// Start of every frame: start the proofreading worker, collect its
+    /// finished results, and reload the active tab if its file changed on
+    /// disk.
+    ///
+    /// `notify` is called from the worker thread whenever a result lands, so
+    /// the front end can wake up and render it. Only the first call's
+    /// closure is used: the worker is started once and later calls leave it
+    /// running.
+    ///
+    /// An external modification is detected by a change in on-disk size. A
+    /// clean buffer is reloaded and its swap file and the session index are
+    /// rewritten to keep crash recovery in step; a dirty buffer is left
+    /// untouched.
+    pub fn begin_frame(&mut self, notify: impl Fn() + Send + 'static) {
+        self.proofread.ensure_started(notify);
+        self.proofread.poll();
+        if let Some(tab) = self.tabs.get_mut(self.active)
+            && tab.reload_if_changed_on_disk()
+        {
+            self.persist_active_swap();
+            self.persist_session();
+        }
+    }
+
+    /// End of every frame: queue a proofread of the active buffer; a no-op
+    /// unless its text (or path) changed since the last request.
     pub fn end_frame(&mut self) {
         if let Some(tab) = self.tabs.get(self.active) {
             self.proofread
@@ -227,6 +252,17 @@ impl Editor {
                     effects: Vec::new(),
                 };
             }
+            Command::Cut => return self.cut(),
+            Command::Copy => self.copy(),
+            Command::Paste => return self.paste(),
+            Command::SelectAll => return self.select_all(),
+            Command::ApplySuggestion {
+                bytes,
+                flagged,
+                replacement,
+            } => return self.apply_suggestion(bytes, &flagged, &replacement),
+            Command::AddToDictionary(word) => self.add_to_dictionary(&word),
+            Command::Ignore(key) => self.proofread.ignore(key),
         }
         Outcome::default()
     }
@@ -291,61 +327,6 @@ impl Editor {
     #[must_use]
     pub fn proofread(&self) -> &Proofreading {
         &self.proofread
-    }
-}
-
-// Transitional API: direct access for logic that still lives in the front
-// end. These are removed as editing plus the frame hooks (01.11) move into
-// the editor.
-impl Editor {
-    /// Mutable access to every open tab.
-    ///
-    /// Transitional: removed in 01.11.
-    pub fn tabs_mut(&mut self) -> &mut [Tab] {
-        &mut self.tabs
-    }
-
-    /// The clipboard.
-    ///
-    /// Transitional: removed in 01.11.
-    pub fn clipboard_mut(&mut self) -> &mut dyn Clipboard {
-        self.clipboard.as_mut()
-    }
-
-    /// Mutable access to proofreading state.
-    ///
-    /// Transitional: removed in 01.11.
-    pub fn proofread_mut(&mut self) -> &mut Proofreading {
-        &mut self.proofread
-    }
-
-    /// Add `word` to the personal dictionary, saving it unless the
-    /// dictionary file was unreadable at startup.
-    ///
-    /// Transitional: removed in 01.11 (becomes a command).
-    pub fn add_to_dictionary(&mut self, word: &str) {
-        if !self.proofread.add_word(word) {
-            return;
-        }
-        match self.dictionary_file {
-            DictionaryFile::Loaded => {
-                if let Err(err) = self.store.save_dictionary(self.proofread.user_words()) {
-                    log::error!("failed to save the personal dictionary: {err}");
-                }
-            }
-            DictionaryFile::Unreadable => log::warn!(
-                "added {word:?} for this session only: the dictionary file could \
-                 not be read at startup, so it is not being overwritten"
-            ),
-        }
-    }
-
-    /// The selection last reported through [`Self::set_selection`].
-    ///
-    /// Transitional: removed in 01.11.
-    #[must_use]
-    pub fn selection(&self) -> Option<Range<usize>> {
-        self.selection.clone()
     }
 }
 
@@ -487,13 +468,53 @@ mod tests {
     }
 
     #[test]
+    fn begin_frame_reloads_a_clean_tab_changed_on_disk_and_persists_it() {
+        let dir = temp_dir("begin-frame-reload");
+        let file = dir.join("doc.txt");
+        fs::write(&file, "short").unwrap();
+        let mut editor = open_in(&dir, std::slice::from_ref(&file), None);
+        let id = editor.active_tab().unwrap().id;
+
+        // An external writer changes the file's length.
+        fs::write(&file, "a much longer body").unwrap();
+        editor.begin_frame(|| {});
+
+        assert_eq!(editor.active_tab().unwrap().text, "a much longer body");
+        drop(editor);
+
+        // The reload reached the swap file, so a fresh store restores it.
+        let restored = Store::at(dir.join("state")).unwrap().load().unwrap();
+        let tab = restored.tabs.iter().find(|t| t.id == id).unwrap();
+        assert_eq!(tab.text, "a much longer body");
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn begin_frame_leaves_a_dirty_tab_alone() {
+        let dir = temp_dir("begin-frame-dirty");
+        let file = dir.join("doc.txt");
+        fs::write(&file, "short").unwrap();
+        let mut editor = open_in(&dir, std::slice::from_ref(&file), None);
+        let active = editor.active_index();
+        editor.tabs[active].text.push_str(" and unsaved");
+
+        fs::write(&file, "a much longer body").unwrap();
+        editor.begin_frame(|| {});
+
+        assert_eq!(editor.active_tab().unwrap().text, "short and unsaved");
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn shutdown_flushes_every_tabs_swap() {
         let dir = temp_dir("shutdown");
         let mut editor = open_in(&dir, &[], None);
         editor.apply(Command::NewTab);
 
         // Edit both tabs without committing either.
-        for (i, tab) in editor.tabs_mut().iter_mut().enumerate() {
+        for (i, tab) in editor.tabs.iter_mut().enumerate() {
             tab.text = format!("tab {i}");
         }
         let ids: Vec<u64> = editor.tabs().iter().map(|t| t.id).collect();

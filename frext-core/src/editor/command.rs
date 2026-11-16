@@ -1,8 +1,10 @@
 //! Every user intent a front end can send to the [`Editor`](super::Editor).
 
+use std::ops::Range;
 use std::path::PathBuf;
 
 use super::prompt::CloseChoice;
+use crate::proofread::IgnoreKey;
 
 /// A request to change editor state, applied with
 /// [`Editor::apply`](super::Editor::apply).
@@ -80,6 +82,32 @@ pub enum Command {
     ReplaceCurrent,
     /// Replace every match in the active buffer.
     ReplaceAll,
+    // Editing.
+    /// Copy the selection to the clipboard, then delete it from the buffer.
+    Cut,
+    /// Copy the selection to the clipboard.
+    Copy,
+    /// Replace the selection (or insert at the caret) with the clipboard
+    /// text.
+    Paste,
+    /// Select the entire buffer.
+    SelectAll,
+    /// Replace the proofreading-flagged `bytes` with `replacement`, but only
+    /// while they still hold `flagged` (the buffer may have changed since
+    /// the diagnostic was shown).
+    ApplySuggestion {
+        /// The flagged byte range in the active buffer.
+        bytes: Range<usize>,
+        /// The text the range held when it was flagged.
+        flagged: String,
+        /// The text to put in its place (empty removes it).
+        replacement: String,
+    },
+    /// Add a word to the personal dictionary, saving it unless the
+    /// dictionary file was unreadable at startup.
+    AddToDictionary(String),
+    /// Hide diagnostics matching this key for the rest of the session.
+    Ignore(IgnoreKey),
 }
 
 /// A sidebar folder's open/closed state, set by [`Command::SetExpanded`].

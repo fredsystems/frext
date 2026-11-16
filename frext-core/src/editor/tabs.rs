@@ -203,15 +203,10 @@ impl Editor {
     }
 }
 
-// Transitional API: persistence that the front end's frame-top reload and
-// editing code still call directly. Made private again as editing plus the
-// frame hooks (01.11) move into the editor.
 impl Editor {
     /// Persist the session index, logging (but not propagating) failures so
     /// a transient write error never crashes the editor.
-    ///
-    /// Transitional: removed from the public API in 01.11.
-    pub fn persist_session(&self) {
+    pub(super) fn persist_session(&self) {
         if let Err(err) = self.store.save_session(
             &self.tabs,
             self.active,
@@ -224,18 +219,14 @@ impl Editor {
     }
 
     /// Write the active tab's buffer to its swap file.
-    ///
-    /// Transitional: removed from the public API in 01.11.
-    pub fn persist_active_swap(&self) {
+    pub(super) fn persist_active_swap(&self) {
         if let Some(tab) = self.tabs.get(self.active)
             && let Err(err) = self.store.save_swap(tab)
         {
             log::error!("failed to write swap file for tab {}: {err}", tab.id);
         }
     }
-}
 
-impl Editor {
     /// Close the tab at `index`, removing its swap file. Closing the last
     /// tab replaces it with a fresh untitled one.
     pub(super) fn close_tab(&mut self, index: usize) {
@@ -300,7 +291,7 @@ mod tests {
         let mut editor = editor_in(dir);
         editor.apply(Command::NewTab);
         let active = editor.active_index();
-        editor.tabs_mut()[active].text.push_str("unsaved work");
+        editor.tabs[active].text.push_str("unsaved work");
         assert!(editor.tabs()[active].is_dirty());
         let id = editor.tabs()[active].id;
         (editor, id)
@@ -333,7 +324,7 @@ mod tests {
         let before = editor.tabs().len();
 
         // Make tab 0 dirty.
-        editor.tabs_mut()[0].text.push_str("unsaved work");
+        editor.tabs[0].text.push_str("unsaved work");
         assert!(editor.tabs()[0].is_dirty());
         let tab_id = editor.tabs()[0].id;
 
@@ -364,7 +355,7 @@ mod tests {
         let index = editor.active_index();
         assert_eq!(editor.tabs()[index].path.as_deref(), Some(file.as_path()));
 
-        editor.tabs_mut()[index].text = "edited".to_owned();
+        editor.tabs[index].text = "edited".to_owned();
         assert!(editor.tabs()[index].is_dirty());
 
         // save_tab is what "Save and close" calls; it must succeed and clean

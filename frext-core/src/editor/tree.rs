@@ -585,7 +585,7 @@ mod tests {
         let mut editor = editor_in(&dir, &[], None);
         editor.apply(Command::NewTab);
         let index = editor.active_index();
-        editor.tabs_mut()[index].text.push_str("unsaved");
+        editor.tabs[index].text.push_str("unsaved");
         editor.apply(Command::RequestCloseActive);
         let pending = editor.prompt().cloned();
         assert!(matches!(pending, Some(Prompt::ConfirmClose { .. })));
@@ -613,7 +613,7 @@ mod tests {
         // A non-name prompt exposes no name field.
         editor.apply(Command::NewTab);
         let index = editor.active_index();
-        editor.tabs_mut()[index].text.push_str("unsaved");
+        editor.tabs[index].text.push_str("unsaved");
         editor.apply(Command::RequestCloseActive);
         assert!(editor.prompt_name_mut().is_none());
 
@@ -677,7 +677,7 @@ mod tests {
         let mut editor = editor_in(&dir, &[], None);
         editor.apply(Command::NewTab);
         let index = editor.active_index();
-        editor.tabs_mut()[index].text.push_str("unsaved");
+        editor.tabs[index].text.push_str("unsaved");
         editor.apply(Command::RequestCloseActive);
         assert!(matches!(editor.prompt(), Some(Prompt::ConfirmClose { .. })));
 
