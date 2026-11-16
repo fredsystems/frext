@@ -23,6 +23,7 @@ mod mocha {
     pub const BASE: Color32 = Color32::from_rgb(0x1e, 0x1e, 0x2e);
     pub const MANTLE: Color32 = Color32::from_rgb(0x18, 0x18, 0x25);
     pub const RED: Color32 = Color32::from_rgb(0xf3, 0x8b, 0xa8);
+    pub const GREEN: Color32 = Color32::from_rgb(0xa6, 0xe3, 0xa1);
 }
 
 /// Apply the Catppuccin Mocha theme to the given egui context.
@@ -101,6 +102,18 @@ pub const fn search_match() -> Color32 {
 pub fn search_current_match() -> Color32 {
     // The accent, dimmed so dark foreground glyphs stay legible on top.
     mocha::BLUE.linear_multiply(0.55)
+}
+
+/// The squiggle under a misspelled word.
+#[must_use]
+pub const fn spelling_squiggle() -> Color32 {
+    mocha::RED
+}
+
+/// The squiggle under a grammar (or other non-spelling) issue.
+#[must_use]
+pub const fn grammar_squiggle() -> Color32 {
+    mocha::GREEN
 }
 
 /// The colour used for error text (e.g. an invalid search regex).

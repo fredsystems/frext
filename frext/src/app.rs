@@ -7,7 +7,11 @@ use std::path::{Path, PathBuf};
 use eframe::egui;
 
 use crate::{
-    highlight::MatchHighlights, persistence::Store, search::SearchQuery, tab::Tab,
+    highlight::MatchHighlights,
+    persistence::Store,
+    proofread::{Diagnostic, DiagnosticKind, IgnoreKey, state::Proofreading},
+    search::SearchQuery,
+    tab::Tab,
     workspace::Workspace,
 };
 
@@ -59,6 +63,14 @@ pub struct FrextApp {
     /// A pending name-entry prompt (rename / new file / new folder) from a
     /// sidebar context menu, if any. While set, a modal collects the name.
     pending_fs: Option<FsPrompt>,
+    /// Spelling/grammar checking: background worker, per-tab results, the
+    /// personal dictionary, and ignored diagnostics.
+    proofread: Proofreading,
+    /// Whether the personal dictionary file may be rewritten.
+    dictionary_file: DictionaryFile,
+    /// The diagnostic under the pointer when the editor was last
+    /// right-clicked; drives the suggestion entries of the context menu.
+    menu_diagnostic: Option<Diagnostic>,
 }
 
 /// A pending filesystem name-entry prompt driven by a modal dialog.
@@ -85,6 +97,17 @@ enum FsPromptKind {
     NewFile,
     /// Create a new folder named by the entry inside `target` (a directory).
     NewFolder,
+}
+
+/// What happened when the personal dictionary was loaded at startup.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DictionaryFile {
+    /// Loaded (or absent, which is an empty dictionary): safe to rewrite.
+    Loaded,
+    /// The file exists but could not be read (e.g. invalid UTF-8). Saving
+    /// the in-memory word set would destroy its contents, so new words are
+    /// kept for this session only.
+    Unreadable,
 }
 
 /// A reserved line-number gutter column, to be filled by
@@ -134,6 +157,16 @@ impl FrextApp {
         let mut next_id = restored.next_id;
         let mut workspace = restored.workspace;
         let restored_search = restored.search;
+        let (user_words, dictionary_file) = match store.load_dictionary() {
+            Ok(words) => (words, DictionaryFile::Loaded),
+            Err(err) => {
+                log::error!(
+                    "failed to load the personal dictionary; words added this \
+                     session will not be saved over it: {err}"
+                );
+                (Vec::new(), DictionaryFile::Unreadable)
+            }
+        };
 
         // Always guarantee at least one tab to edit.
         if tabs.is_empty() {
@@ -164,6 +197,9 @@ impl FrextApp {
             },
             pending_close: None,
             pending_fs: None,
+            proofread: Proofreading::new(user_words),
+            dictionary_file,
+            menu_diagnostic: None,
         };
 
         for file in files {
@@ -420,6 +456,7 @@ impl FrextApp {
         }
 
         let tab = self.tabs.remove(index);
+        self.proofread.forget_tab(tab.id);
         if let Err(err) = self.store.remove_swap(tab.id) {
             log::error!("failed to remove swap file for tab {}: {err}", tab.id);
         }
@@ -535,6 +572,46 @@ impl FrextApp {
             }
             EditorAction::Save => {
                 self.save_active();
+                false
+            }
+            EditorAction::ApplySuggestion {
+                bytes,
+                flagged,
+                replacement,
+            } => {
+                let Some(tab) = self.tabs.get_mut(self.active) else {
+                    return false;
+                };
+                // The buffer may have changed since the menu opened; only
+                // replace text that is still exactly what was flagged.
+                if tab.text.get(bytes.clone()) != Some(flagged.as_str()) {
+                    return false;
+                }
+                let caret = tab.text.get(..bytes.start).map_or(0, |s| s.chars().count())
+                    + replacement.chars().count();
+                tab.text.replace_range(bytes, &replacement);
+                Self::store_caret(ctx, editor_id, caret);
+                true
+            }
+            EditorAction::AddToDictionary(word) => {
+                if !self.proofread.add_word(&word) {
+                    return false;
+                }
+                match self.dictionary_file {
+                    DictionaryFile::Loaded => {
+                        if let Err(err) = self.store.save_dictionary(self.proofread.user_words()) {
+                            log::error!("failed to save the personal dictionary: {err}");
+                        }
+                    }
+                    DictionaryFile::Unreadable => log::warn!(
+                        "added {word:?} for this session only: the dictionary file could \
+                         not be read at startup, so it is not being overwritten"
+                    ),
+                }
+                false
+            }
+            EditorAction::Ignore(key) => {
+                self.proofread.ignore(key);
                 false
             }
         }
@@ -1342,13 +1419,20 @@ impl FrextApp {
     }
 
     /// The right-click menu for the editor surface. `has_selection` greys out
-    /// Cut/Copy when there is nothing selected. Choices are recorded in
+    /// Cut/Copy when there is nothing selected. When the click landed on a
+    /// proofreading `diagnostic`, its explanation, suggested fixes, and
+    /// dictionary/ignore actions lead the menu. Choices are recorded in
     /// `editor_action` and applied after the editor borrow ends.
     fn editor_context_menu(
         ui: &mut egui::Ui,
         has_selection: bool,
+        diagnostic: Option<&Diagnostic>,
         editor_action: &mut EditorAction,
     ) {
+        if let Some(diagnostic) = diagnostic {
+            Self::diagnostic_menu_items(ui, diagnostic, editor_action);
+            ui.separator();
+        }
         if ui
             .add_enabled(has_selection, egui::Button::new("Cut"))
             .clicked()
@@ -1387,6 +1471,51 @@ impl FrextApp {
         }
     }
 
+    /// The proofreading entries of the editor context menu: Harper's message,
+    /// one button per suggested fix, then "Add to dictionary" (spelling only)
+    /// and "Ignore".
+    fn diagnostic_menu_items(
+        ui: &mut egui::Ui,
+        diagnostic: &Diagnostic,
+        editor_action: &mut EditorAction,
+    ) {
+        ui.add(egui::Label::new(egui::RichText::new(&diagnostic.message).weak()).wrap());
+        if diagnostic.suggestions.is_empty() {
+            ui.add_enabled(false, egui::Button::new("No suggestions"));
+        }
+        for suggestion in &diagnostic.suggestions {
+            let label = if suggestion.is_empty() {
+                format!("Remove \u{201c}{}\u{201d}", diagnostic.flagged)
+            } else {
+                suggestion.clone()
+            };
+            if ui.button(egui::RichText::new(label).strong()).clicked() {
+                *editor_action = EditorAction::ApplySuggestion {
+                    bytes: diagnostic.bytes.clone(),
+                    flagged: diagnostic.flagged.clone(),
+                    replacement: suggestion.clone(),
+                };
+                ui.close();
+            }
+        }
+        ui.separator();
+        if diagnostic.kind == DiagnosticKind::Spelling
+            && ui
+                .button(format!(
+                    "Add \u{201c}{}\u{201d} to dictionary",
+                    diagnostic.flagged
+                ))
+                .clicked()
+        {
+            *editor_action = EditorAction::AddToDictionary(diagnostic.flagged.clone());
+            ui.close();
+        }
+        if ui.button("Ignore").clicked() {
+            *editor_action = EditorAction::Ignore(diagnostic.ignore_key());
+            ui.close();
+        }
+    }
+
     /// Draw the file-type icon for `stem` inline, sized to the current text
     /// row. A stem with no embedded artwork (which should not occur for stems
     /// produced by [`crate::file_icon`]) simply renders nothing, leaving the
@@ -1407,6 +1536,14 @@ impl eframe::App for FrextApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         let mut action = MenuAction::None;
+
+        // Proofreading runs on a background thread that repaints when a
+        // result lands, so squiggles appear without further input.
+        self.proofread.ensure_started({
+            let ctx = ctx.clone();
+            move || ctx.request_repaint()
+        });
+        self.proofread.poll();
 
         // Pick up external modifications to the active tab's file (detected
         // by a change in on-disk size). A clean buffer is reloaded; a dirty
@@ -1678,6 +1815,41 @@ impl eframe::App for FrextApp {
                             // continuation rows stay blank.
                             Self::paint_line_numbers(ui, &gutter, &output);
 
+                            // Wavy underlines for spelling (red) and grammar
+                            // (green) issues, painted over the laid-out text.
+                            let underlines = self
+                                .proofread
+                                .diagnostics(tab.id, &tab.text)
+                                .into_iter()
+                                .map(|d| {
+                                    let color = match d.kind {
+                                        DiagnosticKind::Spelling => {
+                                            crate::theme::spelling_squiggle()
+                                        }
+                                        DiagnosticKind::Grammar => crate::theme::grammar_squiggle(),
+                                    };
+                                    (&d.chars, color)
+                                });
+                            crate::proofread::squiggle::paint(
+                                ui.painter(),
+                                &output.galley,
+                                output.galley_pos,
+                                underlines,
+                            );
+
+                            // Remember which diagnostic (if any) a right-click
+                            // landed on, for the context menu's fixes.
+                            if output.response.secondary_clicked() {
+                                self.menu_diagnostic =
+                                    output.response.interact_pointer_pos().and_then(|pos| {
+                                        let cursor =
+                                            output.galley.cursor_from_pos(pos - output.galley_pos);
+                                        self.proofread
+                                            .diagnostic_at(tab.id, &tab.text, cursor.index.0)
+                                            .cloned()
+                                    });
+                            }
+
                             // Apply a pending scroll-to-match: select the match
                             // (byte range -> char range) so egui scrolls it
                             // into view on this frame.
@@ -1717,8 +1889,14 @@ impl eframe::App for FrextApp {
                             let has_selection = editor_char_selection
                                 .as_ref()
                                 .is_some_and(|r| r.start != r.end);
+                            let menu_diagnostic = self.menu_diagnostic.as_ref();
                             output.response.context_menu(|ui| {
-                                Self::editor_context_menu(ui, has_selection, &mut editor_action);
+                                Self::editor_context_menu(
+                                    ui,
+                                    has_selection,
+                                    menu_diagnostic,
+                                    &mut editor_action,
+                                );
                             });
 
                             output.response
@@ -1750,6 +1928,13 @@ impl eframe::App for FrextApp {
             }
         }
         self.search.selection = new_selection;
+
+        // Queue a proofread of the active buffer; a no-op unless its text
+        // (or path) changed since the last request.
+        if let Some(tab) = self.tabs.get(self.active) {
+            self.proofread
+                .request(tab.id, &tab.text, tab.path.as_deref());
+        }
 
         match action {
             MenuAction::None => {}
@@ -1907,6 +2092,17 @@ enum EditorAction {
     FindReplace,
     /// Save the active buffer.
     Save,
+    /// Replace the proofreading-flagged `bytes` (still holding `flagged`)
+    /// with `replacement`.
+    ApplySuggestion {
+        bytes: Range<usize>,
+        flagged: String,
+        replacement: String,
+    },
+    /// Add a word to the personal dictionary.
+    AddToDictionary(String),
+    /// Hide matching diagnostics for the rest of the session.
+    Ignore(IgnoreKey),
 }
 
 /// A deferred sidebar context-menu action, collected while the file tree is
@@ -2595,6 +2791,120 @@ mod tests {
         assert!(!changed);
         assert!(app.search.open);
         assert!(!app.search.replace_open);
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    fn suggestion(bytes: Range<usize>, flagged: &str, replacement: &str) -> EditorAction {
+        EditorAction::ApplySuggestion {
+            bytes,
+            flagged: flagged.to_owned(),
+            replacement: replacement.to_owned(),
+        }
+    }
+
+    #[test]
+    fn applying_a_suggestion_replaces_the_flagged_text() {
+        let dir = temp_dir("editor-suggest");
+        let mut app = app_in(&dir);
+        app.tabs[app.active].text = "café wrrod here".to_owned();
+
+        // "wrrod" sits after a multi-byte char: bytes 6..11.
+        let ctx = egui::Context::default();
+        let changed = app.apply_editor_action(&ctx, suggestion(6..11, "wrrod", "word"), None, None);
+
+        assert!(changed);
+        assert_eq!(app.tabs[app.active].text, "café word here");
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_stale_suggestion_leaves_the_buffer_alone() {
+        let dir = temp_dir("editor-suggest-stale");
+        let mut app = app_in(&dir);
+        // The buffer was edited after the menu opened: the range no longer
+        // holds the flagged word.
+        app.tabs[app.active].text = "a word here".to_owned();
+
+        let ctx = egui::Context::default();
+        let changed = app.apply_editor_action(&ctx, suggestion(2..7, "wrrod", "word"), None, None);
+
+        assert!(!changed);
+        assert_eq!(app.tabs[app.active].text, "a word here");
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_removal_suggestion_deletes_the_flagged_text() {
+        let dir = temp_dir("editor-suggest-remove");
+        let mut app = app_in(&dir);
+        app.tabs[app.active].text = "the the cat".to_owned();
+
+        let ctx = egui::Context::default();
+        let changed = app.apply_editor_action(&ctx, suggestion(0..4, "the ", ""), None, None);
+
+        assert!(changed);
+        assert_eq!(app.tabs[app.active].text, "the cat");
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn adding_to_the_dictionary_persists_across_launches() {
+        let dir = temp_dir("editor-dictionary");
+        let mut app = app_in(&dir);
+
+        let ctx = egui::Context::default();
+        let changed = app.apply_editor_action(
+            &ctx,
+            EditorAction::AddToDictionary("frext".to_owned()),
+            None,
+            None,
+        );
+
+        assert!(!changed, "the buffer is untouched");
+        assert_eq!(
+            app.proofread.user_words().collect::<Vec<_>>(),
+            vec!["frext"]
+        );
+
+        // A fresh app over the same store loads the saved word.
+        let reopened = app_in(&dir);
+        assert_eq!(
+            reopened.proofread.user_words().collect::<Vec<_>>(),
+            vec!["frext"]
+        );
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn an_unreadable_dictionary_is_never_overwritten() {
+        let dir = temp_dir("editor-dictionary-unreadable");
+        let state = dir.join("state");
+        fs::create_dir_all(&state).unwrap();
+        // Invalid UTF-8: `load_dictionary` fails rather than returning words.
+        let original: &[u8] = b"kept\n\xff\xfe broken\n";
+        fs::write(state.join("dictionary.txt"), original).unwrap();
+
+        let mut app = app_in(&dir);
+        let ctx = egui::Context::default();
+        app.apply_editor_action(
+            &ctx,
+            EditorAction::AddToDictionary("frext".to_owned()),
+            None,
+            None,
+        );
+
+        // The word works for this session...
+        assert_eq!(
+            app.proofread.user_words().collect::<Vec<_>>(),
+            vec!["frext"]
+        );
+        // ...but the unreadable file is left exactly as it was.
+        assert_eq!(fs::read(state.join("dictionary.txt")).unwrap(), original);
 
         fs::remove_dir_all(&dir).unwrap();
     }

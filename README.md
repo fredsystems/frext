@@ -33,6 +33,16 @@ syntax highlighting.
 - **Syntax highlighting.** Powered by syntect (via `egui_extras`), with
   the language auto-detected from the file extension. Untitled or
   extension-less buffers render as plain text.
+- **Spelling and grammar checking.** Powered by
+  [Harper](https://github.com/Automattic/harper), entirely offline.
+  Misspellings get a red wavy underline and grammar issues a green one.
+  Untitled buffers, plain-text and Markdown files, commit messages, and
+  extensionless files such as `README` are checked in full; in code
+  (recognised by extension or by name, e.g. `Makefile`), only comments
+  and string literals are checked. Files with an unrecognised extension
+  are not checked. Right-click a squiggle for
+  suggested fixes, "Add to dictionary" (saved to `dictionary.txt` in the
+  state directory), or "Ignore" (for the rest of the session).
 - **File-tree sidebar.** Launch `frext path/to/dir` to open a directory
   in a resizable sidebar. Click a file to open it; the active file is
   highlighted in the tree. The workspace root and which folders you have

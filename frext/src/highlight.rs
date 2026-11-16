@@ -52,6 +52,12 @@ fn highlighter() -> &'static Highlighter {
     })
 }
 
+/// The shared syntax set, so other modules (the proofreader's comment/string
+/// extraction) resolve languages exactly as the highlighter does.
+pub(crate) fn syntax_set() -> &'static SyntaxSet {
+    &highlighter().syntaxes
+}
+
 /// Map a file path to the file-extension token used to select a syntax.
 ///
 /// Returns an empty string when there is no usable extension; that selects the

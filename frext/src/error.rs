@@ -23,6 +23,14 @@ pub enum PersistenceError {
     Serde(#[from] serde_json::Error),
 }
 
+/// Errors that can occur while starting the background proofreader.
+#[derive(Debug, thiserror::Error)]
+pub enum ProofreadError {
+    /// The OS refused to spawn the proofreading worker thread.
+    #[error("could not start the proofreading thread: {0}")]
+    Spawn(#[source] std::io::Error),
+}
+
 /// Errors that can occur while compiling a search query into a matcher.
 #[derive(Debug, thiserror::Error)]
 pub enum SearchError {

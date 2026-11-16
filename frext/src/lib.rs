@@ -16,6 +16,7 @@ pub mod fs_ops;
 pub mod highlight;
 pub mod icon;
 pub mod persistence;
+pub mod proofread;
 pub mod search;
 pub mod tab;
 pub mod theme;

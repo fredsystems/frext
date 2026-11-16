@@ -7,6 +7,7 @@
 //! ```text
 //! frext/
 //!   session.json     # index: tab order, ids, paths, active tab
+//!   dictionary.txt   # personal proofreading dictionary, one word per line
 //!   swap/
 //!     <id>.swp       # full text of each tab's buffer
 //! ```
@@ -116,6 +117,58 @@ impl Store {
 
     fn swap_path(&self, id: u64) -> PathBuf {
         self.root.join("swap").join(format!("{id}.swp"))
+    }
+
+    fn dictionary_path(&self) -> PathBuf {
+        self.root.join("dictionary.txt")
+    }
+
+    /// Load the personal proofreading dictionary: one word per line, blank
+    /// lines ignored. A missing file is an empty dictionary.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PersistenceError`] on I/O failure other than "not found".
+    pub fn load_dictionary(&self) -> Result<Vec<String>, PersistenceError> {
+        let path = self.dictionary_path();
+        match fs::read_to_string(&path) {
+            Ok(raw) => Ok(raw
+                .lines()
+                .map(str::trim)
+                .filter(|w| !w.is_empty())
+                .map(str::to_owned)
+                .collect()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+            Err(source) => Err(PersistenceError::Io { path, source }),
+        }
+    }
+
+    /// Write the personal proofreading dictionary, one word per line.
+    ///
+    /// The words are written to a temporary file that is then renamed over
+    /// `dictionary.txt`, so a failed write (e.g. a full disk) leaves the
+    /// previous dictionary intact instead of truncated.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PersistenceError`] on I/O failure.
+    pub fn save_dictionary<'a>(
+        &self,
+        words: impl IntoIterator<Item = &'a str>,
+    ) -> Result<(), PersistenceError> {
+        let mut raw = String::new();
+        for word in words {
+            raw.push_str(word);
+            raw.push('\n');
+        }
+        let path = self.dictionary_path();
+        let temp = self.root.join("dictionary.txt.tmp");
+        if let Err(source) = fs::write(&temp, raw) {
+            // Best effort: a partial temp file is harmless but untidy.
+            let _ = fs::remove_file(&temp);
+            return Err(PersistenceError::Io { path: temp, source });
+        }
+        fs::rename(&temp, &path).map_err(|source| PersistenceError::Io { path, source })
     }
 
     /// Load the previous session, restoring each tab's content from its
@@ -353,6 +406,47 @@ mod tests {
         let loaded = restored.workspace.expect("workspace persisted");
         assert_eq!(loaded.root, PathBuf::from("/projects/demo"));
         assert!(loaded.is_expanded(Path::new("/projects/demo/src")));
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn missing_dictionary_is_empty() {
+        let dir = temp_dir("dict-missing");
+        let store = store_at(&dir);
+        assert!(store.load_dictionary().unwrap().is_empty());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn dictionary_round_trips_and_skips_blank_lines() {
+        let dir = temp_dir("dict-roundtrip");
+        let store = store_at(&dir);
+        store.save_dictionary(["frext", "egui"]).unwrap();
+        assert_eq!(store.load_dictionary().unwrap(), vec!["frext", "egui"]);
+
+        // A hand-edited file with stray blank lines and padding still loads.
+        fs::write(dir.join("dictionary.txt"), "\n  nixos \n\nharper\n").unwrap();
+        assert_eq!(store.load_dictionary().unwrap(), vec!["nixos", "harper"]);
+
+        // Saving replaces the file and leaves no temporary behind.
+        store.save_dictionary(["replaced"]).unwrap();
+        assert_eq!(store.load_dictionary().unwrap(), vec!["replaced"]);
+        assert!(!dir.join("dictionary.txt.tmp").exists());
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_failed_dictionary_save_keeps_the_old_file() {
+        let dir = temp_dir("dict-failed-save");
+        let store = store_at(&dir);
+        store.save_dictionary(["original"]).unwrap();
+
+        // A directory squatting on the temp path makes the write fail.
+        fs::create_dir(dir.join("dictionary.txt.tmp")).unwrap();
+        assert!(store.save_dictionary(["new"]).is_err());
+        assert_eq!(store.load_dictionary().unwrap(), vec!["original"]);
 
         fs::remove_dir_all(&dir).unwrap();
     }
