@@ -359,7 +359,10 @@ impl TermApp {
                 if language.is_empty() {
                     "plain text".clone_into(&mut language);
                 }
-                let right = format!("{language} \u{b7} {} lines", line_count(&tab.text));
+                let right = format!(
+                    "{language} \u{b7} {}",
+                    line_count_label(line_count(&tab.text))
+                );
                 (left, right)
             },
         );
@@ -368,6 +371,15 @@ impl TermApp {
         if let Some(position) = self.prompt.render(&self.editor, area, buf, &mut self.hits) {
             frame.set_cursor_position(position);
         }
+    }
+}
+
+/// `"1 line"` for a single line, `"{n} lines"` otherwise.
+fn line_count_label(n: usize) -> String {
+    if n == 1 {
+        "1 line".to_owned()
+    } else {
+        format!("{n} lines")
     }
 }
 
@@ -498,7 +510,30 @@ mod tests {
         let buf = draw(&mut app);
         let status = row_text(&buf, 23);
         assert!(status.starts_with(" untitled "), "{status:?}");
-        assert!(status.ends_with("plain text \u{b7} 1 lines "), "{status:?}");
+        assert!(status.ends_with("plain text \u{b7} 1 line "), "{status:?}");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn line_count_label_is_singular_only_for_one() {
+        assert_eq!(line_count_label(0), "0 lines");
+        assert_eq!(line_count_label(1), "1 line");
+        assert_eq!(line_count_label(2), "2 lines");
+        assert_eq!(line_count_label(10), "10 lines");
+    }
+
+    #[test]
+    fn one_line_buffer_status_says_one_line() {
+        let dir = temp_dir("one-line");
+        let file = dir.join("single.txt");
+        fs::write(&file, "only").unwrap();
+        let editor = open_editor(&dir, std::slice::from_ref(&file), Some(&dir));
+        let mut app = TermApp::new(editor, KeyboardMode::Enhanced, dir.clone(), None);
+        let buf = draw(&mut app);
+        let status = row_text(&buf, 23);
+        assert!(status.starts_with(" single.txt "), "{status:?}");
+        assert!(status.ends_with("txt \u{b7} 1 line "), "{status:?}");
+        assert!(!status.contains("1 lines"), "{status:?}");
         fs::remove_dir_all(&dir).unwrap();
     }
 

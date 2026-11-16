@@ -1183,3 +1183,33 @@ as `xterm`, or `TERM=xterm-256color` in tmux):
     and a word added to the dictionary in each survives.
 12. `~/.local/state/frext/term/frext-term.log` exists, and the previous
     log was rotated to `.old`.
+
+### 02.19 -- Fix: singular line count on the status line
+
+- **Surfaced:** manual smoke test after 02.18 (`44c03f0`): a one-line
+  buffer shows `txt · 1 lines`.
+- **Scope of fix:** `frext-term/src/app.rs` (the status right side).
+- **Approach:** `1 line` for exactly one line, `{n} lines` otherwise.
+- **Verification:** a regression test rendering a one-line buffer, plus
+  the standard ritual.
+- **Scheduling:** before the PR is marked `pending merge`.
+
+### 02.20 -- Cleanup: first-launch fallback tab beside CLI files
+
+- **Surfaced:** manual smoke test after 02.18 (`44c03f0`). With no
+  saved session, `frext-term a.txt b.rs` opens three tabs: an untitled
+  fallback tab, then the two files.
+- **Pre-existing:** `Editor::open` in `frext-core/src/editor/mod.rs`
+  creates the fallback before opening `files`, so the GUI does the
+  same, and it predates this plan.
+- **Impact:** an extra empty tab on first launch with file arguments.
+  Nothing is lost.
+- **Scope of fix:** `frext-core/src/editor/mod.rs`, plus its tests.
+- **Suggested approach:** create the fallback only if no tab exists
+  after restoring **and** opening `files`, keeping 01.16 F's
+  persist-immediately behaviour for that case.
+- **Verification:** a regression test (fresh store with one file
+  argument gives one tab), `a_first_launch_fallback_tab_survives_a_crash`
+  still passing, plus the standard ritual.
+- **Scheduling:** needs the user's sign-off, because it changes GUI
+  behaviour too. Independent of every other subtask.
