@@ -772,7 +772,7 @@ What:
   - `key: Option<PromptKey>`, a private enum that identifies the
     prompt: `ConfirmClose(tab_id)`, `SavePath(tab_id)`,
     `Name(kind, target)`, `Open`
-  - `focused_button: usize`
+  - `focus: PromptFocus`, a private enum `{ Input, Button(usize) }`
   - `input: TextInput`
 
   `pub fn sync(&mut self, editor: &Editor)` resets the state when the
