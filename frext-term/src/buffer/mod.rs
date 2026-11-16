@@ -5,9 +5,11 @@
 //! rows and maps a caret between char indices and (row, column).
 //! [`words`] finds word and line boundaries for word motions and
 //! double/triple-click selection. [`cursor`] holds the caret and
-//! selection and the motions that move them.
+//! selection and the motions that move them. [`history`] groups edits
+//! into undo/redo steps.
 
 pub mod cells;
 pub mod cursor;
+pub mod history;
 pub mod words;
 pub mod wrap;
