@@ -6,6 +6,7 @@
 
 pub mod cli;
 pub mod clipboard;
+pub mod events;
 pub mod logging;
 pub mod terminal;
 pub mod theme;

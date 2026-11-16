@@ -523,6 +523,8 @@ rx: Receiver<AppEvent> }` (std `mpsc`):
   the send fails.
 - `pub fn spawn_tick(&self, every: Duration)` sends `Tick` on that
   interval until a send fails.
+- Both spawn functions use `thread::Builder` and return
+  `io::Result<()>`, so a failed spawn is an error, not a panic.
 - `pub fn waker(&self) -> impl Fn() + Send + 'static` sends `Wake`,
   ignoring a send error.
 - `pub fn next_batch(&self) -> Option<Vec<AppEvent>>` blocks for one
