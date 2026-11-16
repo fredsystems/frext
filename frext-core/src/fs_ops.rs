@@ -135,12 +135,35 @@ pub fn reveal(path: &Path) {
     let program = "explorer";
 
     #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
-    if let Err(err) = std::process::Command::new(program).arg(&target).spawn() {
+    if let Err(err) = spawn_detached(std::process::Command::new(program).arg(&target)) {
         log::error!(
             "failed to reveal {} in file manager: {err}",
             target.display()
         );
     }
+}
+
+/// Spawn `command` without waiting for it, returning the child's process
+/// id. A background thread waits on the child so it is reaped when it
+/// exits instead of lingering as a zombie; if that thread cannot be
+/// created the child is left un-reaped (logged), never a panic.
+///
+/// # Errors
+///
+/// Returns the I/O error when the process could not be spawned.
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+fn spawn_detached(command: &mut std::process::Command) -> std::io::Result<u32> {
+    let mut child = command.spawn()?;
+    let id = child.id();
+    if let Err(err) = std::thread::Builder::new()
+        .name("frext-reveal".to_owned())
+        .spawn(move || {
+            let _ = child.wait();
+        })
+    {
+        log::warn!("could not start a thread to reap process {id}: {err}");
+    }
+    Ok(id)
 }
 
 #[cfg(test)]
@@ -295,5 +318,24 @@ mod tests {
         std::fs::write(&file, "x").unwrap();
         assert_eq!(reveal_target(&file), dir);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn spawn_detached_reaps_the_child() {
+        let pid = spawn_detached(&mut std::process::Command::new("true")).unwrap();
+        let proc_entry = PathBuf::from(format!("/proc/{pid}"));
+
+        // A zombie keeps its `/proc` entry until it is reaped; allow up to
+        // ~5 s for the process to exit and the background wait to reap it.
+        let mut reaped = false;
+        for _ in 0..500 {
+            if !proc_entry.exists() {
+                reaped = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(reaped, "process {pid} was never reaped");
     }
 }
