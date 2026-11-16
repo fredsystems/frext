@@ -248,6 +248,9 @@ impl Editor {
             self.tabs.push(Tab::new_untitled(id));
             self.active = 0;
             self.persist_active_swap();
+        } else if index < self.active {
+            // The active tab shifted down one slot; keep it focused.
+            self.active -= 1;
         } else if self.active >= self.tabs.len() {
             self.active = self.tabs.len() - 1;
         }
@@ -562,6 +565,70 @@ mod tests {
 
         editor.apply(Command::SelectTab(0));
         assert_eq!(editor.active_index(), 0);
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// An editor with three clean tabs, every swap flushed, and the middle
+    /// one active. Returns the editor and the three tab ids in order.
+    fn three_tabs_middle_active(dir: &Path) -> (Editor, [u64; 3]) {
+        let mut editor = editor_in(dir);
+        editor.apply(Command::NewTab);
+        editor.apply(Command::NewTab);
+        assert_eq!(editor.tabs().len(), 3);
+        // Write every tab's swap so all three are restorable.
+        editor.shutdown();
+        editor.apply(Command::SelectTab(1));
+        let ids = [
+            editor.tabs()[0].id,
+            editor.tabs()[1].id,
+            editor.tabs()[2].id,
+        ];
+        (editor, ids)
+    }
+
+    /// The id of the active tab in the session persisted under `dir/state`.
+    fn restored_active_id(dir: &Path) -> u64 {
+        let restored = Store::at(dir.join("state")).unwrap().load().unwrap();
+        restored.tabs[restored.active].id
+    }
+
+    #[test]
+    fn closing_a_tab_before_the_active_one_keeps_it_active() {
+        let dir = temp_dir("close-before-active");
+        let (mut editor, [_, b, _]) = three_tabs_middle_active(&dir);
+
+        editor.apply(Command::RequestClose(0));
+
+        assert_eq!(editor.active_tab().unwrap().id, b);
+        assert_eq!(restored_active_id(&dir), b);
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn closing_the_active_tab_focuses_its_neighbour() {
+        let dir = temp_dir("close-active");
+        let (mut editor, [_, _, c]) = three_tabs_middle_active(&dir);
+
+        // The tab after the closed one slides into its slot and takes over.
+        editor.apply(Command::RequestClose(1));
+
+        assert_eq!(editor.active_tab().unwrap().id, c);
+        assert_eq!(restored_active_id(&dir), c);
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn closing_a_tab_after_the_active_one_keeps_it_active() {
+        let dir = temp_dir("close-after-active");
+        let (mut editor, [_, b, _]) = three_tabs_middle_active(&dir);
+
+        editor.apply(Command::RequestClose(2));
+
+        assert_eq!(editor.active_tab().unwrap().id, b);
+        assert_eq!(restored_active_id(&dir), b);
 
         fs::remove_dir_all(&dir).unwrap();
     }
