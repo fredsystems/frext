@@ -2,7 +2,7 @@
 
 use eframe::egui;
 use frext::app::FrextApp;
-use frext_core::persistence::Store;
+use frext_core::persistence::{Profile, Store};
 
 fn main() -> eframe::Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
@@ -23,7 +23,7 @@ fn main() -> eframe::Result<()> {
         }
     }
 
-    let store = match Store::new() {
+    let store = match Store::new(Profile::Gui) {
         Ok(store) => store,
         Err(err) => {
             log::error!("failed to initialise persistence store: {err}");

@@ -2,14 +2,19 @@
 //! survive closing and reopening frext (and crashes).
 //!
 //! Layout under the platform state directory (`$XDG_STATE_HOME/frext` on
-//! Linux):
+//! Linux). Each [`Profile`] has its own session and swap files; both share
+//! one personal dictionary:
 //!
 //! ```text
 //! frext/
-//!   session.json     # index: tab order, ids, paths, active tab
-//!   dictionary.txt   # personal proofreading dictionary, one word per line
+//!   session.json     # Gui profile: tab order, ids, paths, active tab
+//!   dictionary.txt   # shared personal proofreading dictionary, one word per line
 //!   swap/
-//!     <id>.swp       # full text of each tab's buffer
+//!     <id>.swp       # Gui profile: full text of each tab's buffer
+//!   term/
+//!     session.json   # Term profile session index
+//!     swap/
+//!       <id>.swp     # Term profile swap files
 //! ```
 //!
 //! On launch the swap file is the source of truth for a tab's content, so
@@ -73,42 +78,95 @@ pub struct RestoredSession {
     pub search: SearchQuery,
 }
 
+/// Which front end a [`Store`] persists for. Each profile keeps its own
+/// session and swap files; all profiles share one personal dictionary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Profile {
+    /// The egui GUI front end: state lives directly in the base directory.
+    Gui,
+    /// The terminal front end: state lives in `term/` under the base
+    /// directory.
+    Term,
+}
+
 /// Owns the on-disk paths used for persistence.
 #[derive(Debug, Clone)]
 pub struct Store {
     root: PathBuf,
+    dictionary_dir: PathBuf,
 }
 
 impl Store {
-    /// Resolve the platform state directory and create the layout.
+    /// Resolve the platform state directory and create the layout for
+    /// `profile`.
     ///
     /// # Errors
     ///
     /// Returns [`PersistenceError`] if the state directory cannot be
     /// resolved or created.
-    pub fn new() -> Result<Self, PersistenceError> {
+    pub fn new(profile: Profile) -> Result<Self, PersistenceError> {
         let dirs = directories::ProjectDirs::from("io.github", "fredsystems", "frext")
             .ok_or(PersistenceError::NoStateDir)?;
 
         // Prefer a dedicated state dir; fall back to data dir on platforms
         // (macOS / Windows) where `directories` does not expose one.
-        let root = dirs
+        let base = dirs
             .state_dir()
             .map_or_else(|| dirs.data_dir().to_owned(), Path::to_owned);
 
-        Self::at(root)
+        Self::for_profile(base, profile)
     }
 
-    /// Create a store rooted at `root`, creating the `swap/` layout.
+    /// Lay out `profile`'s store under `base`: the GUI uses `base` itself,
+    /// the terminal front end uses `base/term`, and both keep the
+    /// dictionary in `base`.
+    fn for_profile(base: PathBuf, profile: Profile) -> Result<Self, PersistenceError> {
+        let root = match profile {
+            Profile::Gui => base.clone(),
+            Profile::Term => base.join("term"),
+        };
+        Self::at_with_dictionary_dir(root, base)
+    }
+
+    /// Create a store rooted at `root`, creating the `swap/` layout. The
+    /// dictionary also lives in `root`.
     ///
     /// # Errors
     ///
     /// Returns [`PersistenceError`] if the directory layout cannot be created.
     pub fn at(root: PathBuf) -> Result<Self, PersistenceError> {
+        let dictionary_dir = root.clone();
+        Self::at_with_dictionary_dir(root, dictionary_dir)
+    }
+
+    /// Create a store rooted at `root` whose dictionary lives in
+    /// `dictionary_dir`, creating `root/swap` and `dictionary_dir`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PersistenceError`] if the directory layout cannot be created.
+    pub fn at_with_dictionary_dir(
+        root: PathBuf,
+        dictionary_dir: PathBuf,
+    ) -> Result<Self, PersistenceError> {
         let swap = root.join("swap");
         fs::create_dir_all(&swap).map_err(|source| PersistenceError::Io { path: swap, source })?;
+        fs::create_dir_all(&dictionary_dir).map_err(|source| PersistenceError::Io {
+            path: dictionary_dir.clone(),
+            source,
+        })?;
 
-        Ok(Self { root })
+        Ok(Self {
+            root,
+            dictionary_dir,
+        })
+    }
+
+    /// The state root: the directory holding this store's session index and
+    /// swap files.
+    #[must_use]
+    pub fn root(&self) -> &Path {
+        &self.root
     }
 
     fn session_path(&self) -> PathBuf {
@@ -120,7 +178,7 @@ impl Store {
     }
 
     fn dictionary_path(&self) -> PathBuf {
-        self.root.join("dictionary.txt")
+        self.dictionary_dir.join("dictionary.txt")
     }
 
     /// Load the personal proofreading dictionary: one word per line, blank
@@ -162,7 +220,7 @@ impl Store {
             raw.push('\n');
         }
         let path = self.dictionary_path();
-        let temp = self.root.join("dictionary.txt.tmp");
+        let temp = self.dictionary_dir.join("dictionary.txt.tmp");
         if let Err(source) = fs::write(&temp, raw) {
             // Best effort: a partial temp file is harmless but untidy.
             let _ = fs::remove_file(&temp);
@@ -318,6 +376,64 @@ mod tests {
         let dir = temp_dir("layout");
         let _store = Store::at(dir.clone()).unwrap();
         assert!(dir.join("swap").is_dir());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn term_profile_layout_is_under_term() {
+        let base = temp_dir("profile-term");
+        let store = Store::for_profile(base.clone(), Profile::Term).unwrap();
+        assert_eq!(store.root(), base.join("term"));
+        assert!(base.join("term").join("swap").is_dir());
+        assert_eq!(store.dictionary_path(), base.join("dictionary.txt"));
+        assert_eq!(store.session_path(), base.join("term").join("session.json"));
+        assert_eq!(
+            store.swap_path(5),
+            base.join("term").join("swap").join("5.swp")
+        );
+        fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn gui_profile_layout_is_unchanged() {
+        let base = temp_dir("profile-gui");
+        let store = Store::for_profile(base.clone(), Profile::Gui).unwrap();
+        assert_eq!(store.root(), base);
+        assert!(base.join("swap").is_dir());
+        assert!(!base.join("term").exists());
+        assert_eq!(store.dictionary_path(), base.join("dictionary.txt"));
+        assert_eq!(store.session_path(), base.join("session.json"));
+        assert_eq!(store.swap_path(5), base.join("swap").join("5.swp"));
+        fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn profiles_share_one_dictionary() {
+        let base = temp_dir("profile-dict");
+        let gui = Store::for_profile(base.clone(), Profile::Gui).unwrap();
+        let term = Store::for_profile(base.clone(), Profile::Term).unwrap();
+
+        gui.save_dictionary(["frext"]).unwrap();
+        assert_eq!(term.load_dictionary().unwrap(), vec!["frext"]);
+
+        term.save_dictionary(["frext", "ratatui"]).unwrap();
+        assert_eq!(gui.load_dictionary().unwrap(), vec!["frext", "ratatui"]);
+
+        fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn root_reports_the_state_root() {
+        let dir = temp_dir("root");
+        let store = store_at(&dir);
+        assert_eq!(store.root(), dir.as_path());
+
+        let dict_dir = dir.join("dict");
+        let split = Store::at_with_dictionary_dir(dir.join("state"), dict_dir.clone()).unwrap();
+        assert_eq!(split.root(), dir.join("state"));
+        assert!(dict_dir.is_dir());
+        assert_eq!(split.dictionary_path(), dict_dir.join("dictionary.txt"));
+
         fs::remove_dir_all(&dir).unwrap();
     }
 
