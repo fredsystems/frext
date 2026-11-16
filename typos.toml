@@ -16,3 +16,8 @@ locale = "en"
 extend-ignore-identifiers-re = [
   "frext",
 ]
+
+[default.extend-words]
+# Crate names used in plan and source text.
+flate = "flate"
+ratatui = "ratatui"

@@ -2,3 +2,5 @@ crate
 frext
 egui
 eframe
+flate
+ratatui
