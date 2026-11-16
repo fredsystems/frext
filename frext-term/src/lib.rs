@@ -13,4 +13,5 @@ pub mod logging;
 pub mod status;
 pub mod tab_bar;
 pub mod terminal;
+pub mod text_input;
 pub mod theme;
