@@ -111,7 +111,7 @@ pub fn segments<R: RowGeometry>(
 }
 
 /// Zig-zag points for one segment: alternating peaks and dips every
-/// [`HALF_WAVELENGTH`], ending exactly at `x1`.
+/// `HALF_WAVELENGTH`, ending exactly at `x1`.
 #[must_use]
 pub fn wave_points(segment: Segment) -> Vec<Pos2> {
     let mut points = Vec::new();

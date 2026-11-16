@@ -1,78 +1,73 @@
 //! Catppuccin Mocha theme for egui.
 //!
-//! The palette is taken from the official Catppuccin Mocha specification
-//! (<https://github.com/catppuccin/catppuccin>). Applying it directly to
-//! `egui::Visuals` avoids pulling in a theme crate that lags egui releases,
-//! keeping the dependency tree lean.
+//! The palette values and semantic roles live in [`frext_core::palette`] as
+//! frontend-neutral RGB; this module converts them to egui colours. Applying
+//! them directly to `egui::Visuals` avoids pulling in a theme crate that lags
+//! egui releases, keeping the dependency tree lean.
 
 use eframe::egui::{self, Color32};
 
-/// A subset of the Catppuccin Mocha palette used by frext.
-mod mocha {
-    use eframe::egui::Color32;
+use frext_core::palette::{self, Rgb, Tint};
 
-    pub const ROSEWATER: Color32 = Color32::from_rgb(0xf5, 0xe0, 0xdc);
-    pub const BLUE: Color32 = Color32::from_rgb(0x89, 0xb4, 0xfa);
-    pub const TEXT: Color32 = Color32::from_rgb(0xcd, 0xd6, 0xf4);
-    pub const SUBTEXT0: Color32 = Color32::from_rgb(0xa6, 0xad, 0xc8);
-    pub const OVERLAY1: Color32 = Color32::from_rgb(0x7f, 0x84, 0x9c);
-    pub const OVERLAY0: Color32 = Color32::from_rgb(0x6c, 0x70, 0x86);
-    pub const SURFACE2: Color32 = Color32::from_rgb(0x58, 0x5b, 0x70);
-    pub const SURFACE1: Color32 = Color32::from_rgb(0x45, 0x47, 0x5a);
-    pub const SURFACE0: Color32 = Color32::from_rgb(0x31, 0x32, 0x44);
-    pub const BASE: Color32 = Color32::from_rgb(0x1e, 0x1e, 0x2e);
-    pub const MANTLE: Color32 = Color32::from_rgb(0x18, 0x18, 0x25);
-    pub const RED: Color32 = Color32::from_rgb(0xf3, 0x8b, 0xa8);
-    pub const GREEN: Color32 = Color32::from_rgb(0xa6, 0xe3, 0xa1);
+/// Convert a neutral palette colour to an egui colour.
+#[must_use]
+pub const fn color(rgb: Rgb) -> Color32 {
+    Color32::from_rgb(rgb.r, rgb.g, rgb.b)
+}
+
+/// Convert a neutral translucent colour to an egui colour.
+#[must_use]
+pub fn tint(tint: Tint) -> Color32 {
+    color(tint.color).linear_multiply(tint.opacity)
 }
 
 /// Apply the Catppuccin Mocha theme to the given egui context.
 pub fn apply(ctx: &egui::Context) {
     let mut visuals = egui::Visuals::dark();
 
-    visuals.override_text_color = Some(mocha::TEXT);
-    visuals.hyperlink_color = mocha::ROSEWATER;
-    visuals.faint_bg_color = mocha::SURFACE0;
+    visuals.override_text_color = Some(color(palette::TEXT));
+    visuals.hyperlink_color = color(palette::ROSEWATER);
+    visuals.faint_bg_color = color(palette::SURFACE0);
     // `extreme_bg_color` is what egui paints behind text-input widgets,
     // including the editor `TextEdit`. Use BASE so the editing surface
     // matches the surrounding panels rather than appearing as a darker
     // inset box.
-    visuals.extreme_bg_color = mocha::BASE;
-    visuals.code_bg_color = mocha::MANTLE;
-    visuals.warn_fg_color = mocha::RED;
-    visuals.error_fg_color = mocha::RED;
+    visuals.extreme_bg_color = color(palette::BASE);
+    visuals.code_bg_color = color(palette::MANTLE);
+    visuals.warn_fg_color = color(palette::RED);
+    visuals.error_fg_color = color(palette::RED);
 
-    visuals.window_fill = mocha::BASE;
-    visuals.panel_fill = mocha::BASE;
-    visuals.window_stroke.color = mocha::SURFACE1;
-    visuals.selection.bg_fill = mocha::BLUE.linear_multiply(0.35);
-    visuals.selection.stroke.color = mocha::ROSEWATER;
+    visuals.window_fill = color(palette::BASE);
+    visuals.panel_fill = color(palette::BASE);
+    visuals.window_stroke.color = color(palette::SURFACE1);
+    visuals.selection.bg_fill = tint(palette::selection());
+    visuals.selection.stroke.color = color(palette::ROSEWATER);
 
     let widgets = &mut visuals.widgets;
-    widgets.noninteractive.bg_fill = mocha::BASE;
-    widgets.noninteractive.weak_bg_fill = mocha::BASE;
-    widgets.noninteractive.bg_stroke.color = mocha::SURFACE0;
-    widgets.noninteractive.fg_stroke.color = mocha::SUBTEXT0;
+    widgets.noninteractive.bg_fill = color(palette::BASE);
+    widgets.noninteractive.weak_bg_fill = color(palette::BASE);
+    widgets.noninteractive.bg_stroke.color = color(palette::SURFACE0);
+    widgets.noninteractive.fg_stroke.color = color(palette::SUBTEXT0);
 
-    widgets.inactive.bg_fill = mocha::SURFACE0;
-    widgets.inactive.weak_bg_fill = mocha::SURFACE0;
-    widgets.inactive.bg_stroke.color = mocha::SURFACE1;
-    widgets.inactive.fg_stroke.color = mocha::TEXT;
+    widgets.inactive.bg_fill = color(palette::SURFACE0);
+    widgets.inactive.weak_bg_fill = color(palette::SURFACE0);
+    widgets.inactive.bg_stroke.color = color(palette::SURFACE1);
+    widgets.inactive.fg_stroke.color = color(palette::TEXT);
 
-    widgets.hovered.bg_fill = mocha::SURFACE1;
-    widgets.hovered.weak_bg_fill = mocha::SURFACE1;
-    widgets.hovered.bg_stroke.color = mocha::OVERLAY0;
-    widgets.hovered.fg_stroke.color = mocha::TEXT;
+    widgets.hovered.bg_fill = color(palette::SURFACE1);
+    widgets.hovered.weak_bg_fill = color(palette::SURFACE1);
+    widgets.hovered.bg_stroke.color = color(palette::OVERLAY0);
+    widgets.hovered.fg_stroke.color = color(palette::TEXT);
 
-    widgets.active.bg_fill = mocha::SURFACE2;
-    widgets.active.weak_bg_fill = mocha::SURFACE2;
-    widgets.active.bg_stroke.color = mocha::OVERLAY1;
-    widgets.active.fg_stroke.color = mocha::TEXT;
+    widgets.active.bg_fill = color(palette::SURFACE2);
+    widgets.active.weak_bg_fill = color(palette::SURFACE2);
+    widgets.active.bg_stroke.color = color(palette::OVERLAY1);
+    widgets.active.fg_stroke.color = color(palette::TEXT);
 
-    widgets.open.bg_fill = mocha::SURFACE1;
-    widgets.open.weak_bg_fill = mocha::SURFACE1;
-    widgets.open.bg_stroke.color = mocha::OVERLAY0;
-    widgets.open.fg_stroke.color = mocha::TEXT;
+    widgets.open.bg_fill = color(palette::SURFACE1);
+    widgets.open.weak_bg_fill = color(palette::SURFACE1);
+    widgets.open.bg_stroke.color = color(palette::OVERLAY0);
+    widgets.open.fg_stroke.color = color(palette::TEXT);
 
     ctx.set_visuals(visuals);
 }
@@ -80,44 +75,72 @@ pub fn apply(ctx: &egui::Context) {
 /// The accent colour used to mark the active tab.
 #[must_use]
 pub const fn accent() -> Color32 {
-    mocha::BLUE
+    color(palette::accent())
 }
 
 /// The dimmed colour used for the editor's line-number gutter.
 #[must_use]
 pub const fn gutter() -> Color32 {
-    mocha::OVERLAY0
+    color(palette::gutter())
 }
 
 /// Background fill for a non-current search match.
 #[must_use]
 pub const fn search_match() -> Color32 {
-    // A muted surface tint so every match is visible without overpowering the
-    // syntax-highlighted foreground.
-    mocha::SURFACE2
+    color(palette::search_match())
 }
 
 /// Background fill for the currently-focused search match.
 #[must_use]
 pub fn search_current_match() -> Color32 {
-    // The accent, dimmed so dark foreground glyphs stay legible on top.
-    mocha::BLUE.linear_multiply(0.55)
+    tint(palette::search_current_match())
 }
 
 /// The squiggle under a misspelled word.
 #[must_use]
 pub const fn spelling_squiggle() -> Color32 {
-    mocha::RED
+    color(palette::spelling_squiggle())
 }
 
 /// The squiggle under a grammar (or other non-spelling) issue.
 #[must_use]
 pub const fn grammar_squiggle() -> Color32 {
-    mocha::GREEN
+    color(palette::grammar_squiggle())
 }
 
 /// The colour used for error text (e.g. an invalid search regex).
 #[must_use]
 pub const fn error() -> Color32 {
-    mocha::RED
+    color(palette::error())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const OLD_BLUE: Color32 = Color32::from_rgb(0x89, 0xb4, 0xfa);
+
+    #[test]
+    fn opaque_roles_are_pixel_identical_to_previous_values() {
+        assert_eq!(accent(), OLD_BLUE);
+        assert_eq!(gutter(), Color32::from_rgb(0x6c, 0x70, 0x86));
+        assert_eq!(search_match(), Color32::from_rgb(0x58, 0x5b, 0x70));
+        assert_eq!(spelling_squiggle(), Color32::from_rgb(0xf3, 0x8b, 0xa8));
+        assert_eq!(grammar_squiggle(), Color32::from_rgb(0xa6, 0xe3, 0xa1));
+        assert_eq!(error(), Color32::from_rgb(0xf3, 0x8b, 0xa8));
+    }
+
+    #[test]
+    fn translucent_roles_are_pixel_identical_to_previous_values() {
+        assert_eq!(search_current_match(), OLD_BLUE.linear_multiply(0.55));
+        assert_eq!(tint(palette::selection()), OLD_BLUE.linear_multiply(0.35));
+    }
+
+    #[test]
+    fn color_converts_channels_directly() {
+        assert_eq!(
+            color(Rgb::new(0x12, 0x34, 0x56)),
+            Color32::from_rgb(0x12, 0x34, 0x56)
+        );
+    }
 }

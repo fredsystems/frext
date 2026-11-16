@@ -85,7 +85,7 @@ pub fn check_scope(text: &str, path: Option<&Path>) -> CheckScope {
     let Some(path) = path else {
         return CheckScope::Document(ProseFormat::Plain);
     };
-    let syntaxes = crate::highlight::syntax_set();
+    let syntaxes = crate::syntax::syntax_set();
     let extension = path
         .extension()
         .and_then(OsStr::to_str)

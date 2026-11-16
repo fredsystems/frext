@@ -4,8 +4,8 @@ The SVG file-type icons under `mocha/` are the Catppuccin Mocha flavour of the
 [`catppuccin/zed-icons`](https://github.com/catppuccin/zed-icons) set, vendored
 at commit `6d953c8c7566b9e721d15b54e802dd77ae26fa9c`.
 
-The Rust lookup tables in `frext/src/file_icon_table.rs` and the embed table in
-`frext/src/file_icon_bytes.rs` are generated from the upstream icon-theme
+The Rust lookup tables in `frext-core/src/file_icon_table.rs` and the embed table in
+`frext-core/src/file_icon_bytes.rs` are generated from the upstream icon-theme
 manifest (`icon_themes/catppuccin-icons.json`) at that same commit.
 
 ## License

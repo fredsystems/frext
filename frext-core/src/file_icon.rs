@@ -71,30 +71,6 @@ pub fn icon_bytes(stem: &str) -> Option<&'static [u8]> {
         .map(|index| ICON_BYTES[index].1)
 }
 
-/// An [`egui::ImageSource`] for the icon `stem`, ready to hand to
-/// [`egui::Image::new`].
-///
-/// The `uri` is stable per stem so egui's image cache reuses a single rendered
-/// texture across frames and rows. Returns `None` when the stem is not bundled.
-#[must_use]
-pub fn image_source(stem: &'static str) -> Option<egui::ImageSource<'static>> {
-    let bytes = icon_bytes(stem)?;
-    Some(egui::ImageSource::Bytes {
-        // The `.svg` extension routes the bytes to egui_extras' SVG loader,
-        // and the `frext-file-icon://` scheme keeps these URIs from colliding
-        // with any other image source in the app.
-        uri: stem_uri(stem).into(),
-        bytes: egui::load::Bytes::Static(bytes),
-    })
-}
-
-/// The cache URI for an icon `stem`. Pure and deterministic so it can be tested
-/// without an egui context.
-#[must_use]
-fn stem_uri(stem: &str) -> String {
-    format!("frext-file-icon://{stem}.svg")
-}
-
 /// Look up `key` in a sorted `(key, value)` table by binary search.
 fn lookup(table: &[(&str, &'static str)], key: &str) -> Option<&'static str> {
     table
@@ -264,10 +240,5 @@ mod tests {
         let lower = icon_for_dir(".github", false);
         let upper = icon_for_dir(".GITHUB", false);
         assert_eq!(lower, upper);
-    }
-
-    #[test]
-    fn stem_uri_is_stable_and_svg_suffixed() {
-        assert_eq!(stem_uri("rust"), "frext-file-icon://rust.svg");
     }
 }

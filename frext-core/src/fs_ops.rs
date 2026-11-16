@@ -2,7 +2,7 @@
 //! create directory, and move-to-trash.
 //!
 //! These are factored out of the UI loop so the validation and the disk
-//! effects can be unit-tested without an egui context. Every operation returns
+//! effects can be unit-tested without a GUI context. Every operation returns
 //! a typed [`FsError`]; the UI layer logs failures (and surfaces them to the
 //! user) rather than panicking.
 
@@ -103,6 +103,67 @@ pub fn move_to_trash(path: &Path) -> Result<(), FsError> {
         path: path.to_path_buf(),
         message: err.to_string(),
     })
+}
+
+/// The directory to open when revealing `path` in a file manager: a
+/// directory maps to itself, anything else to its containing directory
+/// (falling back to `path` itself when it has no parent).
+#[must_use]
+pub fn reveal_target(path: &Path) -> PathBuf {
+    // Reveal the containing directory so the manager opens somewhere useful
+    // even for a file (which most managers would otherwise try to *run*).
+    if path.is_dir() {
+        path.to_path_buf()
+    } else {
+        path.parent()
+            .map_or_else(|| path.to_path_buf(), Path::to_path_buf)
+    }
+}
+
+/// Open `path` in the platform file manager, selecting it where the manager
+/// supports it. On Linux this opens the containing directory via `xdg-open`
+/// (there is no portable "reveal and select" call); failures are logged, not
+/// propagated, so a missing opener never crashes the editor.
+pub fn reveal(path: &Path) {
+    let target = reveal_target(path);
+
+    #[cfg(target_os = "linux")]
+    let program = "xdg-open";
+    #[cfg(target_os = "macos")]
+    let program = "open";
+    #[cfg(target_os = "windows")]
+    let program = "explorer";
+
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+    if let Err(err) = spawn_detached(std::process::Command::new(program).arg(&target)) {
+        log::error!(
+            "failed to reveal {} in file manager: {err}",
+            target.display()
+        );
+    }
+}
+
+/// Spawn `command` without waiting for it, returning the child's process
+/// id. A background thread waits on the child so it is reaped when it
+/// exits instead of lingering as a zombie; if that thread cannot be
+/// created the child is left un-reaped (logged), never a panic.
+///
+/// # Errors
+///
+/// Returns the I/O error when the process could not be spawned.
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+fn spawn_detached(command: &mut std::process::Command) -> std::io::Result<u32> {
+    let mut child = command.spawn()?;
+    let id = child.id();
+    if let Err(err) = std::thread::Builder::new()
+        .name("frext-reveal".to_owned())
+        .spawn(move || {
+            let _ = child.wait();
+        })
+    {
+        log::warn!("could not start a thread to reap process {id}: {err}");
+    }
+    Ok(id)
 }
 
 #[cfg(test)]
@@ -241,5 +302,40 @@ mod tests {
         assert!(matches!(err, FsError::AlreadyExists(_)));
 
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn reveal_target_maps_a_directory_to_itself() {
+        let dir = temp_dir("reveal-dir");
+        assert_eq!(reveal_target(&dir), dir);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn reveal_target_maps_a_file_to_its_parent_directory() {
+        let dir = temp_dir("reveal-file");
+        let file = dir.join("notes.txt");
+        std::fs::write(&file, "x").unwrap();
+        assert_eq!(reveal_target(&file), dir);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn spawn_detached_reaps_the_child() {
+        let pid = spawn_detached(&mut std::process::Command::new("true")).unwrap();
+        let proc_entry = PathBuf::from(format!("/proc/{pid}"));
+
+        // A zombie keeps its `/proc` entry until it is reaped; allow up to
+        // ~5 s for the process to exit and the background wait to reap it.
+        let mut reaped = false;
+        for _ in 0..500 {
+            if !proc_entry.exists() {
+                reaped = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(reaped, "process {pid} was never reaped");
     }
 }
