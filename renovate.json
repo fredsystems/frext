@@ -26,6 +26,25 @@
       "matchManagers": ["github-actions", "nix"],
       "matchUpdateTypes": ["major", "minor", "patch", "pin"],
       "automerge": true
+    },
+    {
+      "groupName": "font shaping stack",
+      "matchManagers": ["cargo"],
+      "description": "fontdb and ttf-parser are direct dependencies and harfrust is a dev-dependency. skrifa, read-fonts and font-types are listed only so lockfile updates of the shared fontations stack are grouped with them.",
+      "matchPackageNames": [
+        "fontdb",
+        "font-types",
+        "harfrust",
+        "read-fonts",
+        "skrifa",
+        "ttf-parser"
+      ]
+    },
+    {
+      "matchManagers": ["cargo"],
+      "matchPackageNames": ["harfrust"],
+      "description": "harfrust is held below 0.13 because epaint (egui 0.37) declares the 0.12 line. It is a dev-dependency used only by the ligature regression test in frext/src/font.rs, which must shape with the same harfrust egui renders with; 0.13+ would also duplicate the read-fonts/font-types stack. Bump it together with the egui stack. Remove or raise once epaint's own declared harfrust requirement moves.",
+      "allowedVersions": "<0.13"
     }
   ]
 }
