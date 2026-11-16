@@ -9,6 +9,7 @@ pub mod clipboard;
 pub mod complete;
 pub mod events;
 pub mod hit;
+pub mod keymap;
 pub mod layout;
 pub mod logging;
 pub mod popup;
