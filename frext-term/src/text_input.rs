@@ -46,6 +46,22 @@ fn byte_offset(text: &str, index: usize) -> usize {
         .map_or(text.len(), |(byte, _)| byte)
 }
 
+/// The key code `key` is handled as.
+///
+/// Ctrl+H (without Alt) becomes [`KeyCode::Backspace`]: legacy terminals
+/// send 0x08 for the Backspace key, which crossterm reports as Ctrl+H.
+fn normalise(key: KeyEvent) -> KeyCode {
+    match key.code {
+        KeyCode::Char('h' | 'H')
+            if key.modifiers.contains(KeyModifiers::CONTROL)
+                && !key.modifiers.contains(KeyModifiers::ALT) =>
+        {
+            KeyCode::Backspace
+        }
+        code => code,
+    }
+}
+
 impl TextInput {
     /// An input with the cursor at the start.
     #[must_use]
@@ -80,7 +96,7 @@ impl TextInput {
         if key.kind == KeyEventKind::Release {
             return InputOutcome::Ignored;
         }
-        match key.code {
+        match normalise(key) {
             KeyCode::Char(c) => {
                 if key
                     .modifiers
@@ -315,6 +331,51 @@ mod tests {
         );
         assert_eq!(text, "é");
         assert_eq!(input.cursor(), 1);
+    }
+
+    #[test]
+    fn ctrl_h_deletes_backward_like_backspace() {
+        let mut input = TextInput::new();
+        let mut text = String::from("abc");
+        input.handle_key(&mut text, press(KeyCode::Right));
+        input.handle_key(&mut text, press(KeyCode::Right));
+        let ctrl_h = KeyEvent::new(KeyCode::Char('h'), KeyModifiers::CONTROL);
+        assert_eq!(input.handle_key(&mut text, ctrl_h), InputOutcome::Edited);
+        assert_eq!(text, "ac");
+        assert_eq!(input.cursor(), 1);
+
+        let ctrl_shift_h = KeyEvent::new(
+            KeyCode::Char('H'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        );
+        assert_eq!(
+            input.handle_key(&mut text, ctrl_shift_h),
+            InputOutcome::Edited
+        );
+        assert_eq!(text, "c");
+        assert_eq!(input.cursor(), 0);
+
+        // Start.
+        assert_eq!(input.handle_key(&mut text, ctrl_h), InputOutcome::Moved);
+        assert_eq!(text, "c");
+        assert_eq!(input.cursor(), 0);
+    }
+
+    #[test]
+    fn ctrl_alt_h_is_ignored() {
+        let mut input = TextInput::new();
+        let mut text = String::from("abc");
+        input.move_to_end(&text);
+        let ctrl_alt_h = KeyEvent::new(
+            KeyCode::Char('h'),
+            KeyModifiers::CONTROL | KeyModifiers::ALT,
+        );
+        assert_eq!(
+            input.handle_key(&mut text, ctrl_alt_h),
+            InputOutcome::Ignored
+        );
+        assert_eq!(text, "abc");
+        assert_eq!(input.cursor(), 3);
     }
 
     #[test]
