@@ -4,6 +4,7 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::hash::{DefaultHasher, Hash, Hasher};
+use std::path::Path;
 
 use super::worker::{CheckRequest, CheckResult, Worker};
 use super::{Diagnostic, DiagnosticKind, IgnoreKey};
@@ -61,10 +62,11 @@ impl Proofreading {
         };
     }
 
-    /// Ask for `text` to be checked, unless this exact (text, language) was
-    /// already requested for the tab. Cheap to call every frame.
-    pub fn request(&mut self, tab_id: u64, text: &str, language: &str) {
-        let revision = revision(text, language);
+    /// Ask for `text` (the buffer of the file at `path`) to be checked,
+    /// unless this exact (text, path) was already requested for the tab.
+    /// Cheap to call every frame.
+    pub fn request(&mut self, tab_id: u64, text: &str, path: Option<&Path>) {
+        let revision = revision(text, path);
         if self.requested.get(&tab_id) == Some(&revision) {
             return;
         }
@@ -75,7 +77,7 @@ impl Proofreading {
             tab_id,
             revision,
             text: text.to_owned(),
-            language: language.to_owned(),
+            path: path.map(Path::to_path_buf),
         });
         if sent {
             self.requested.insert(tab_id, revision);
@@ -98,25 +100,50 @@ impl Proofreading {
     /// Store a result. Results for an older revision are kept too: until the
     /// newer one lands, [`Diagnostic::is_current`] filters whatever no longer
     /// matches the buffer, which beats flickering every squiggle off.
-    fn accept(&mut self, result: CheckResult) {
+    fn accept(&mut self, mut result: CheckResult) {
+        // `diagnostics` validates in one forward pass, which needs them in
+        // position order.
+        result
+            .diagnostics
+            .sort_by_key(|d| (d.bytes.start, d.bytes.end));
         self.results.insert(result.tab_id, result.diagnostics);
     }
 
     /// The diagnostics to show for `tab_id` whose buffer is now `text`:
-    /// still current, not ignored, and not a word just added to the
-    /// dictionary (which the worker has yet to re-check).
-    pub fn diagnostics<'a>(
-        &'a self,
-        tab_id: u64,
-        text: &'a str,
-    ) -> impl Iterator<Item = &'a Diagnostic> + 'a {
-        self.results
-            .get(&tab_id)
-            .into_iter()
-            .flatten()
-            .filter(move |d| d.is_current(text))
-            .filter(|d| !self.ignored.contains(&d.ignore_key()))
-            .filter(|d| !(d.kind == DiagnosticKind::Spelling && self.knows_word(&d.flagged)))
+    /// still current (see [`Diagnostic::is_current`]), not ignored, and not
+    /// a word just added to the dictionary (which the worker has yet to
+    /// re-check).
+    ///
+    /// Called every frame, so currency is validated in one forward pass over
+    /// `text` rather than rescanning the buffer prefix per diagnostic.
+    #[must_use]
+    pub fn diagnostics<'a>(&'a self, tab_id: u64, text: &str) -> Vec<&'a Diagnostic> {
+        let Some(all) = self.results.get(&tab_id) else {
+            return Vec::new();
+        };
+        let mut shown = Vec::new();
+        // Char offset of byte `byte` in `text`, advanced monotonically.
+        let mut byte = 0;
+        let mut chars = 0;
+        for diagnostic in all {
+            let char_start = match text.get(byte..diagnostic.bytes.start) {
+                Some(between) => {
+                    chars += between.chars().count();
+                    byte = diagnostic.bytes.start;
+                    Some(chars)
+                }
+                // Out of range or not on a char boundary: stale.
+                None => None,
+            };
+            if diagnostic.matches_at(text, char_start)
+                && !self.ignored.contains(&diagnostic.ignore_key())
+                && !(diagnostic.kind == DiagnosticKind::Spelling
+                    && self.knows_word(&diagnostic.flagged))
+            {
+                shown.push(diagnostic);
+            }
+        }
+        shown
     }
 
     /// The diagnostic under the cursor position `char_idx`, preferring a
@@ -133,6 +160,7 @@ impl Proofreading {
     ) -> Option<&'a Diagnostic> {
         let mut hits = self
             .diagnostics(tab_id, text)
+            .into_iter()
             .filter(|d| d.chars.start <= char_idx && char_idx <= d.chars.end);
         let first = hits.next()?;
         if first.kind == DiagnosticKind::Spelling {
@@ -189,13 +217,12 @@ impl Proofreading {
     }
 }
 
-/// A revision id for a (text, language) pair. Only ever compared for
-/// equality with the previous request, so a collision merely skips one
-/// re-check.
-fn revision(text: &str, language: &str) -> u64 {
+/// A revision id for a (text, path) pair. Only ever compared for equality
+/// with the previous request, so a collision merely skips one re-check.
+fn revision(text: &str, path: Option<&Path>) -> u64 {
     let mut hasher = DefaultHasher::new();
     text.hash(&mut hasher);
-    language.hash(&mut hasher);
+    path.hash(&mut hasher);
     hasher.finish()
 }
 
@@ -233,6 +260,7 @@ mod tests {
     fn flagged<'a>(state: &'a Proofreading, tab_id: u64, text: &'a str) -> Vec<&'a str> {
         state
             .diagnostics(tab_id, text)
+            .into_iter()
             .map(|d| d.flagged.as_str())
             .collect()
     }
@@ -252,6 +280,40 @@ mod tests {
         assert!(flagged(&state, 1, "a word").is_empty());
         // An edit earlier in the buffer shifts the range: also stale.
         assert!(flagged(&state, 1, "xa wrrod").is_empty());
+    }
+
+    #[test]
+    fn a_char_shift_with_the_same_byte_offset_hides_results() {
+        // `é` -> `ab` keeps "wrrod" at the same bytes but one char later;
+        // the old char range would put the squiggle under the wrong glyphs.
+        let text = "é wrrod";
+        let state = with_results(1, vec![diagnostic(DiagnosticKind::Spelling, text, "wrrod")]);
+        assert_eq!(flagged(&state, 1, text), vec!["wrrod"]);
+        assert!(flagged(&state, 1, "ab wrrod").is_empty());
+    }
+
+    #[test]
+    fn every_current_diagnostic_survives_the_single_pass() {
+        let text = "café wrrod, naïve wrrod and more wrrod";
+        let mut all = Vec::new();
+        let mut from = 0;
+        while let Some(at) = text[from..].find("wrrod") {
+            let start = from + at;
+            let char_start = text[..start].chars().count();
+            all.push(Diagnostic {
+                kind: DiagnosticKind::Spelling,
+                bytes: start..start + 5,
+                chars: char_start..char_start + 5,
+                flagged: "wrrod".to_owned(),
+                message: String::new(),
+                suggestions: Vec::new(),
+            });
+            from = start + 5;
+        }
+        // Accepted out of order: `accept` sorts them for the single pass.
+        all.reverse();
+        let state = with_results(1, all);
+        assert_eq!(flagged(&state, 1, text).len(), 3);
     }
 
     #[test]
@@ -280,7 +342,7 @@ mod tests {
         );
         assert!(state.add_word("Wrrod"));
         assert!(!state.add_word("Wrrod"), "adding twice is a no-op");
-        let kinds: Vec<_> = state.diagnostics(1, text).map(|d| d.kind).collect();
+        let kinds: Vec<_> = state.diagnostics(1, text).iter().map(|d| d.kind).collect();
         assert_eq!(kinds, vec![DiagnosticKind::Grammar]);
         assert_eq!(state.user_words().collect::<Vec<_>>(), vec!["Wrrod"]);
     }
@@ -319,17 +381,19 @@ mod tests {
     }
 
     #[test]
-    fn revision_tracks_text_and_language() {
-        assert_eq!(revision("a", "rs"), revision("a", "rs"));
-        assert_ne!(revision("a", "rs"), revision("b", "rs"));
-        assert_ne!(revision("a", "rs"), revision("a", "md"));
+    fn revision_tracks_text_and_path() {
+        let rs = Some(Path::new("a.rs"));
+        assert_eq!(revision("a", rs), revision("a", rs));
+        assert_ne!(revision("a", rs), revision("b", rs));
+        assert_ne!(revision("a", rs), revision("a", Some(Path::new("a.md"))));
+        assert_ne!(revision("a", rs), revision("a", None));
     }
 
     #[test]
     fn requests_without_a_worker_are_harmless() {
         let mut state = Proofreading::new(Vec::new());
-        state.request(1, "text", "");
+        state.request(1, "text", None);
         state.poll();
-        assert!(state.diagnostics(1, "text").next().is_none());
+        assert!(state.diagnostics(1, "text").is_empty());
     }
 }

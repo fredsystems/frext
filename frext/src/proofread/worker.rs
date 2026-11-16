@@ -7,6 +7,7 @@
 
 use std::collections::HashMap;
 use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, Sender};
 
 use super::{Diagnostic, Proofreader};
@@ -17,13 +18,14 @@ use crate::error::ProofreadError;
 pub struct CheckRequest {
     /// The tab the text belongs to.
     pub tab_id: u64,
-    /// An opaque revision for the (text, language) pair, echoed back in the
+    /// An opaque revision for the (text, path) pair, echoed back in the
     /// result.
     pub revision: u64,
     /// The full buffer text.
     pub text: String,
-    /// The buffer's file-extension token.
-    pub language: String,
+    /// The file the buffer belongs to (`None` for an untitled buffer); picks
+    /// what to check (see [`super::regions::check_scope`]).
+    pub path: Option<PathBuf>,
 }
 
 /// The outcome of a [`CheckRequest`].
@@ -127,7 +129,7 @@ fn run(
             // Harper is third-party code with internal assertions; a panic in
             // one check must not take proofreading down for the session.
             let checked = catch_unwind(AssertUnwindSafe(|| {
-                proofreader.check(&request.text, &request.language)
+                proofreader.check(&request.text, request.path.as_deref())
             }));
             let diagnostics = checked.unwrap_or_else(|_| {
                 log::error!("proofreading tab {} panicked; skipping", request.tab_id);
@@ -165,7 +167,7 @@ mod tests {
             tab_id,
             revision,
             text: text.to_owned(),
-            language: String::new(),
+            path: None,
         }
     }
 

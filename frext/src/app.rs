@@ -1788,8 +1788,11 @@ impl eframe::App for FrextApp {
 
                             // Wavy underlines for spelling (red) and grammar
                             // (green) issues, painted over the laid-out text.
-                            let underlines =
-                                self.proofread.diagnostics(tab.id, &tab.text).map(|d| {
+                            let underlines = self
+                                .proofread
+                                .diagnostics(tab.id, &tab.text)
+                                .into_iter()
+                                .map(|d| {
                                     let color = match d.kind {
                                         DiagnosticKind::Spelling => {
                                             crate::theme::spelling_squiggle()
@@ -1898,10 +1901,10 @@ impl eframe::App for FrextApp {
         self.search.selection = new_selection;
 
         // Queue a proofread of the active buffer; a no-op unless its text
-        // (or language) changed since the last request.
+        // (or path) changed since the last request.
         if let Some(tab) = self.tabs.get(self.active) {
-            let language = crate::highlight::language_from_path(tab.path.as_deref());
-            self.proofread.request(tab.id, &tab.text, &language);
+            self.proofread
+                .request(tab.id, &tab.text, tab.path.as_deref());
         }
 
         match action {

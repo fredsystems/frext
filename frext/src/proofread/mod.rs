@@ -18,6 +18,7 @@ pub mod state;
 pub mod worker;
 
 use std::ops::Range;
+use std::path::Path;
 use std::sync::Arc;
 
 use harper_core::{
@@ -27,7 +28,7 @@ use harper_core::{
     spell::{FstDictionary, MergedDictionary, MutableDictionary},
 };
 
-use self::regions::{CheckScope, ProseFormat, Region, RegionKind};
+use self::regions::{Boundary, CheckScope, ProseFormat, Region, RegionKind};
 
 /// Upper bound on suggestions kept per diagnostic; the context menu stays
 /// short and the rest are rarely what the user meant anyway.
@@ -70,12 +71,27 @@ pub struct Diagnostic {
 
 impl Diagnostic {
     /// Whether this diagnostic still describes `text`: its byte range is in
-    /// bounds, on char boundaries, and still holds the flagged text. Results
-    /// arrive asynchronously, so a buffer edited since the check would
-    /// otherwise get squiggles in the wrong place.
+    /// bounds, on char boundaries, and still holds the flagged text, and its
+    /// char range still starts at the same character. Results arrive
+    /// asynchronously, so a buffer edited since the check would otherwise get
+    /// squiggles in the wrong place. (An edit can keep the byte offset while
+    /// changing the char offset, e.g. `é` -> `ab`.)
+    ///
+    /// This scans `text` up to the diagnostic; to validate many sorted
+    /// diagnostics in one pass, use [`state::Proofreading::diagnostics`].
     #[must_use]
     pub fn is_current(&self, text: &str) -> bool {
-        text.get(self.bytes.clone()) == Some(self.flagged.as_str())
+        self.matches_at(
+            text,
+            text.get(..self.bytes.start).map(|p| p.chars().count()),
+        )
+    }
+
+    /// [`Self::is_current`] with the char offset of `bytes.start` already
+    /// known (`None` if `bytes.start` is not a char boundary of `text`).
+    fn matches_at(&self, text: &str, char_start: Option<usize>) -> bool {
+        char_start == Some(self.chars.start)
+            && text.get(self.bytes.clone()) == Some(self.flagged.as_str())
     }
 
     /// The key that "Ignore" records for this diagnostic.
@@ -122,10 +138,10 @@ impl Proofreader {
         Self { dictionary, linter }
     }
 
-    /// Check `text`, whose file-extension token is `language`. Diagnostics
-    /// are sorted by position.
-    pub fn check(&mut self, text: &str, language: &str) -> Vec<Diagnostic> {
-        let scope = regions::check_scope(text, language);
+    /// Check `text`, the buffer of the file at `path` (`None` for an
+    /// untitled buffer). Diagnostics are sorted by position.
+    pub fn check(&mut self, text: &str, path: Option<&Path>) -> Vec<Diagnostic> {
+        let scope = regions::check_scope(text, path);
         self.check_scope(text, scope)
     }
 
@@ -139,10 +155,21 @@ impl Proofreader {
             CheckScope::Document(ProseFormat::Markdown) => {
                 self.lint_with(text, &Markdown::default())
             }
+            CheckScope::Skip => Vec::new(),
             CheckScope::Regions(regions) if regions.is_empty() => Vec::new(),
             CheckScope::Regions(regions) => {
                 let parser = RegionParser::new(text, &regions);
-                self.lint_with(text, &parser)
+                let mut diagnostics = self.lint_with(text, &parser);
+                // A lint across two regions (say, a repeated word over a line
+                // break) also covers the comment markers or code between
+                // them. Show it, but offer no one-click fix that could
+                // rewrite that code.
+                for diagnostic in &mut diagnostics {
+                    if !within_one_region(&regions, &diagnostic.bytes) {
+                        diagnostic.suggestions.clear();
+                    }
+                }
+                diagnostics
             }
         }
     }
@@ -159,6 +186,15 @@ impl Proofreader {
         out.sort_by_key(|d| (d.bytes.start, d.bytes.end));
         out
     }
+}
+
+/// Whether `bytes` lies entirely inside one of the sorted `regions`.
+fn within_one_region(regions: &[Region], bytes: &Range<usize>) -> bool {
+    let after = regions.partition_point(|r| r.bytes.start <= bytes.start);
+    after
+        .checked_sub(1)
+        .and_then(|i| regions.get(i))
+        .is_some_and(|r| bytes.end <= r.bytes.end)
 }
 
 /// `offsets[i]` is the byte offset of char `i`; the final entry is
@@ -221,17 +257,19 @@ struct CharRegion {
     kind: RegionKind,
     start: usize,
     end: usize,
+    boundary: Boundary,
 }
 
 /// A Harper [`Parser`] that tokenises only the given regions of a code
 /// buffer, leaving everything else out of the document. Token spans stay
 /// relative to the whole buffer, so lint positions need no remapping.
 ///
-/// This is Harper's `Mask` parser plus one refinement: consecutive line
-/// comments (`// a\n// b`) are joined by a single newline token rather than
-/// a paragraph break, so a sentence wrapped across comment lines reads as
-/// one sentence. The token spans just the `\n`, so the indentation and
-/// comment markers around it never reach whitespace lints.
+/// This is Harper's `Mask` parser plus one refinement: a run of comment lines
+/// that continue one another (`/// a\n/// b`) is joined with plain newlines
+/// and parsed as *one* Markdown document, then mapped back onto the buffer.
+/// A sentence wrapped across lines reads as one sentence, and Markdown
+/// spanning lines (fenced code examples in doc comments) is recognised as
+/// such instead of being checked as prose.
 struct RegionParser {
     regions: Vec<CharRegion>,
 }
@@ -246,62 +284,93 @@ impl RegionParser {
                 kind: region.kind,
                 start: to_char(region.bytes.start),
                 end: to_char(region.bytes.end),
+                boundary: region.boundary,
             })
+            .filter(|region| region.start < region.end)
             .collect();
         Self { regions }
+    }
+
+    /// Split the regions into runs: a region plus every following one that
+    /// continues it.
+    fn runs(&self) -> impl Iterator<Item = &[CharRegion]> {
+        self.regions
+            .chunk_by(|_, next| next.boundary == Boundary::ContinuesComment)
     }
 }
 
 impl Parser for RegionParser {
     fn parse(&self, source: &[char]) -> Vec<Token> {
         let mut tokens = Vec::new();
-        let mut previous: Option<&CharRegion> = None;
+        let mut previous_end: Option<usize> = None;
 
-        for region in &self.regions {
-            if region.start >= region.end {
-                continue;
-            }
-            let Some(content) = source.get(region.start..region.end) else {
+        for run in self.runs() {
+            let (Some(first), Some(last)) = (run.first(), run.last()) else {
                 continue;
             };
-
-            if let Some(prev) = previous
-                && prev.end < region.start
-                && let Some(gap) = source.get(prev.end..region.start)
+            if let Some(end) = previous_end
+                && end < first.start
             {
-                let newline = gap.iter().position(|&c| c == '\n');
-                let token = match newline {
-                    Some(at) if continues_comment(prev, region, gap) => Token::new(
-                        Span::new(prev.end + at, prev.end + at + 1),
-                        TokenKind::Newline(1),
-                    ),
-                    _ => Token::new(Span::new(prev.end, region.start), TokenKind::ParagraphBreak),
-                };
-                tokens.push(token);
+                tokens.push(Token::new(
+                    Span::new(end, first.start),
+                    TokenKind::ParagraphBreak,
+                ));
             }
-
-            let mut inner = match region.kind {
-                RegionKind::Comment => Markdown::default().parse(content),
-                RegionKind::String => PlainEnglish.parse(content),
-            };
-            for token in &mut inner {
-                token.span.push_by(region.start);
-            }
-            tokens.append(&mut inner);
-            previous = Some(region);
+            tokens.extend(parse_run(source, run));
+            previous_end = Some(last.end);
         }
 
         tokens
     }
 }
 
-/// Whether `next` continues the comment `prev` on the following line: both
-/// are comments and the gap is a single line break plus comment markers.
-fn continues_comment(prev: &CharRegion, next: &CharRegion, gap: &[char]) -> bool {
-    prev.kind == RegionKind::Comment
-        && next.kind == RegionKind::Comment
-        && gap.iter().filter(|&&c| c == '\n').count() == 1
-        && !gap.iter().any(|c| c.is_alphanumeric())
+/// Parse one run of regions as a single document. The run's contents are
+/// concatenated (joined by `\n`) with a map from each concatenated char back
+/// to its buffer position; token spans are translated through that map.
+fn parse_run(source: &[char], run: &[CharRegion]) -> Vec<Token> {
+    let mut joined: Vec<char> = Vec::new();
+    let mut origin: Vec<usize> = Vec::new();
+    let mut previous: Option<&CharRegion> = None;
+    for region in run {
+        let Some(content) = source.get(region.start..region.end) else {
+            continue;
+        };
+        if let Some(prev) = previous {
+            // The joiner stands for the real line break between the two.
+            let newline = source
+                .get(prev.end..region.start)
+                .and_then(|gap| gap.iter().position(|&c| c == '\n'))
+                .map_or(prev.end, |at| prev.end + at);
+            joined.push('\n');
+            origin.push(newline);
+        }
+        joined.extend_from_slice(content);
+        origin.extend(region.start..region.end);
+        previous = Some(region);
+    }
+
+    let parsed = match run.first().map(|r| r.kind) {
+        Some(RegionKind::Comment) => Markdown::default().parse(&joined),
+        Some(RegionKind::String) => PlainEnglish.parse(&joined),
+        None => Vec::new(),
+    };
+
+    parsed
+        .into_iter()
+        .filter_map(|mut token| {
+            let start = *origin.get(token.span.start)?;
+            let end = if token.span.end > token.span.start {
+                *origin.get(token.span.end - 1)? + 1
+            } else {
+                start
+            };
+            if end < start {
+                return None;
+            }
+            token.span = Span::new(start, end);
+            Some(token)
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -312,8 +381,10 @@ mod tests {
 
     use super::*;
 
-    fn check(text: &str, language: &str) -> Vec<Diagnostic> {
-        Proofreader::new(&[]).check(text, language)
+    /// Check `text` as the file `name` (`""` for an untitled buffer).
+    fn check(text: &str, name: &str) -> Vec<Diagnostic> {
+        let path = (!name.is_empty()).then(|| Path::new(name));
+        Proofreader::new(&[]).check(text, path)
     }
 
     fn spelling(diagnostics: &[Diagnostic]) -> Vec<&str> {
@@ -361,7 +432,7 @@ mod tests {
     fn user_words_are_accepted() {
         let text = "I love frext a lot.";
         assert_eq!(spelling(&check(text, "")), vec!["frext"]);
-        let with_word = Proofreader::new(&["frext".to_owned()]).check(text, "");
+        let with_word = Proofreader::new(&["frext".to_owned()]).check(text, None);
         assert!(spelling(&with_word).is_empty());
     }
 
@@ -388,7 +459,7 @@ mod tests {
                     fn mispelld_fn(arguumnt: u32) {\n\
                     \x20   println!(\"an erorrr in a string\");\n\
                     }\n";
-        let diagnostics = check(text, "rs");
+        let diagnostics = check(text, "x.rs");
         let flagged = spelling(&diagnostics);
         assert!(flagged.contains(&"kommentt"), "flagged: {flagged:?}");
         assert!(flagged.contains(&"erorrr"), "flagged: {flagged:?}");
@@ -404,14 +475,18 @@ mod tests {
     fn wrapped_line_comments_have_no_whitespace_complaints() {
         let text =
             "fn f() {\n    /// This sentence is wrapped across\n    /// two comment lines.\n}\n";
-        let diagnostics = check(text, "rs");
+        let diagnostics = check(text, "x.rs");
         assert!(diagnostics.is_empty(), "got {diagnostics:?}");
     }
 
     #[test]
     fn lowercase_sentences_are_fine_in_code_but_not_in_prose() {
         let code = "log::error!(\"failed to open the file\");\n";
-        assert!(check(code, "rs").is_empty(), "got {:?}", check(code, "rs"));
+        assert!(
+            check(code, "x.rs").is_empty(),
+            "got {:?}",
+            check(code, "x.rs")
+        );
         let prose = check("This is fine. failed to open the file.", "");
         assert!(
             prose.iter().any(|d| d.kind == DiagnosticKind::Grammar),
@@ -422,13 +497,13 @@ mod tests {
     #[test]
     fn code_spans_in_doc_comments_are_not_checked() {
         let text = "/// Returns `xyzzyfoo` when ready.\nfn f() {}\n";
-        assert!(spelling(&check(text, "rs")).is_empty());
+        assert!(spelling(&check(text, "x.rs")).is_empty());
     }
 
     #[test]
     fn markdown_code_is_not_checked() {
         let text = "# Notes\n\nRun `cargo xyzzyfoo` first.\n\n```\nqwzrtx\n```\n";
-        assert!(spelling(&check(text, "md")).is_empty());
+        assert!(spelling(&check(text, "x.md")).is_empty());
     }
 
     #[test]
@@ -444,25 +519,68 @@ mod tests {
     }
 
     #[test]
-    fn continued_line_comments_join_but_code_breaks_them() {
-        let comment = |start, end| CharRegion {
+    fn a_char_shift_with_the_same_byte_offset_is_stale() {
+        // `é` (2 bytes, 1 char) -> `ab` (2 bytes, 2 chars): the flagged word
+        // keeps its byte range but moves one character to the right.
+        let text = "é wrrod";
+        let diagnostic = check(text, "")
+            .into_iter()
+            .find(|d| d.flagged == "wrrod")
+            .expect("the typo is flagged");
+        assert!(diagnostic.is_current(text));
+        assert!(!diagnostic.is_current("ab wrrod"));
+    }
+
+    #[test]
+    fn fenced_code_in_a_doc_comment_is_not_checked() {
+        let text = "/// Example:\n///\n/// ```\n/// let qwzrtx = zorbify();\n/// ```\nfn f() {}\n";
+        let diagnostics = check(text, "x.rs");
+        assert!(
+            spelling(&diagnostics).is_empty(),
+            "code inside the fence was checked: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn a_typo_on_a_continued_comment_line_maps_back_to_the_buffer() {
+        let text = "/// The first line and\n/// a wrrod on the second.\nfn f() {}\n";
+        let typo = check(text, "x.rs")
+            .into_iter()
+            .find(|d| d.flagged == "wrrod")
+            .expect("the typo is flagged");
+        assert_eq!(&text[typo.bytes.clone()], "wrrod");
+        assert!(typo.is_current(text));
+    }
+
+    #[test]
+    fn a_lint_spanning_comment_lines_offers_no_fixes() {
+        // Harper flags the repeated "the" across the line break. Its range
+        // covers the `///` marker between them, so applying a fix could
+        // rewrite comment syntax: it is shown, but with no fixes.
+        let text = "/// Please read the\n/// the docs first.\nfn f() {}\n";
+        let repeated = check(text, "x.rs")
+            .into_iter()
+            .find(|d| d.flagged.contains("///"))
+            .expect("the repeated word across lines is flagged");
+        assert!(repeated.suggestions.is_empty(), "{repeated:?}");
+    }
+
+    #[test]
+    fn within_one_region_requires_full_containment() {
+        let region = |bytes: Range<usize>| Region {
             kind: RegionKind::Comment,
-            start,
-            end,
+            bytes,
+            boundary: Boundary::Separate,
         };
-        let gap: Vec<char> = "\n    // ".chars().collect();
-        assert!(continues_comment(&comment(0, 1), &comment(2, 3), &gap));
-        let code_gap: Vec<char> = "\nlet x = 1; // ".chars().collect();
-        assert!(!continues_comment(
-            &comment(0, 1),
-            &comment(2, 3),
-            &code_gap
-        ));
-        let blank_gap: Vec<char> = "\n//\n// ".chars().collect();
-        assert!(!continues_comment(
-            &comment(0, 1),
-            &comment(2, 3),
-            &blank_gap
-        ));
+        let regions = [region(0..10), region(20..30)];
+        assert!(within_one_region(&regions, &(2..8)));
+        assert!(within_one_region(&regions, &(20..30)));
+        assert!(!within_one_region(&regions, &(8..22)));
+        assert!(!within_one_region(&regions, &(12..14)));
+    }
+
+    #[test]
+    fn skipped_files_have_no_diagnostics() {
+        assert!(check("A wrrod here.", "a.definitelynotalang").is_empty());
     }
 }
