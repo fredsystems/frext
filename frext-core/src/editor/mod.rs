@@ -11,13 +11,14 @@ mod effect;
 mod prompt;
 mod search;
 mod tabs;
+mod tree;
 
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 
-pub use command::{Command, SearchBar, SearchOption, StepDirection};
+pub use command::{Command, FolderState, SearchBar, SearchOption, StepDirection};
 pub use effect::{BufferChange, EditorFocus, Effect, Outcome};
-pub use prompt::{AfterSave, CloseChoice, Prompt};
+pub use prompt::{AfterSave, CloseChoice, NameKind, NamePrompt, Prompt};
 pub use search::SearchState;
 
 use crate::{
@@ -194,6 +195,16 @@ impl Editor {
             Command::ResolveClose(choice) => self.resolve_close(choice),
             Command::SubmitSavePath(path) => self.submit_save_path(path),
             Command::CancelPrompt => self.prompt = None,
+            Command::SubmitName => return self.submit_name(),
+            Command::SetExpanded { dir, state } => self.set_expanded(&dir, state),
+            Command::CloseWorkspace => self.close_workspace(),
+            Command::CopyPath(path) => self.copy_path(&path),
+            Command::CopyRelativePath(path) => self.copy_relative_path(&path),
+            Command::Reveal(path) => crate::fs_ops::reveal(&path),
+            Command::BeginRename(path) => return self.begin_rename(path),
+            Command::BeginNewFile(dir) => return self.begin_name(NameKind::NewFile, dir),
+            Command::BeginNewFolder(dir) => return self.begin_name(NameKind::NewFolder, dir),
+            Command::Trash(path) => self.trash_path(&path),
             Command::OpenSearch(bar) => return self.open_search(bar),
             Command::CloseSearch => {
                 self.close_search();
@@ -284,21 +295,14 @@ impl Editor {
 }
 
 // Transitional API: direct access for logic that still lives in the front
-// end. These are removed as the workspace tree (01.10) and editing plus
-// the frame hooks (01.11) move into the editor.
+// end. These are removed as editing plus the frame hooks (01.11) move into
+// the editor.
 impl Editor {
     /// Mutable access to every open tab.
     ///
-    /// Transitional: removed in 01.10.
+    /// Transitional: removed in 01.11.
     pub fn tabs_mut(&mut self) -> &mut [Tab] {
         &mut self.tabs
-    }
-
-    /// Mutable access to the workspace slot (to open, close or edit it).
-    ///
-    /// Transitional: removed in 01.10.
-    pub fn workspace_slot_mut(&mut self) -> &mut Option<Workspace> {
-        &mut self.workspace
     }
 
     /// The clipboard.

@@ -31,6 +31,37 @@ pub enum Command {
     SubmitSavePath(PathBuf),
     /// Dismiss whatever prompt is pending.
     CancelPrompt,
+    /// Answer a pending [`Prompt::Name`](super::Prompt::Name) with the
+    /// name currently entered. A failure keeps the prompt open with its
+    /// error set.
+    SubmitName,
+    // Workspace.
+    /// Record a sidebar folder as expanded or collapsed.
+    SetExpanded {
+        /// The folder whose state changed.
+        dir: PathBuf,
+        /// Its new state.
+        state: FolderState,
+    },
+    /// Close the sidebar workspace and drop it from the session.
+    CloseWorkspace,
+    /// Copy this path, absolute, to the clipboard.
+    CopyPath(PathBuf),
+    /// Copy this path, relative to the workspace root, to the clipboard.
+    CopyRelativePath(PathBuf),
+    /// Open this path (or its containing directory) in the OS file manager.
+    Reveal(PathBuf),
+    /// Begin renaming this path: raises [`Prompt::Name`](super::Prompt::Name).
+    BeginRename(PathBuf),
+    /// Begin creating a new file inside this directory: raises
+    /// [`Prompt::Name`](super::Prompt::Name).
+    BeginNewFile(PathBuf),
+    /// Begin creating a new folder inside this directory: raises
+    /// [`Prompt::Name`](super::Prompt::Name).
+    BeginNewFolder(PathBuf),
+    /// Move this path to the OS trash, closing any tab on a file at or
+    /// under it.
+    Trash(PathBuf),
     // Search.
     /// Show the find bar (seeding the pattern from a single-line selection)
     /// and focus its find field.
@@ -49,6 +80,15 @@ pub enum Command {
     ReplaceCurrent,
     /// Replace every match in the active buffer.
     ReplaceAll,
+}
+
+/// A sidebar folder's open/closed state, set by [`Command::SetExpanded`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FolderState {
+    /// The folder's contents are shown.
+    Expanded,
+    /// The folder's contents are hidden.
+    Collapsed,
 }
 
 /// Which rows of the search bar [`Command::OpenSearch`] shows.

@@ -9,8 +9,8 @@ use eframe::egui;
 use frext_core::{
     clipboard::SystemClipboard,
     editor::{
-        BufferChange, CloseChoice, Command, Editor, EditorFocus, Effect, Prompt, SearchBar,
-        SearchOption, StepDirection,
+        BufferChange, CloseChoice, Command, Editor, EditorFocus, Effect, FolderState, NameKind,
+        Prompt, SearchBar, SearchOption, StepDirection,
     },
     persistence::Store,
     proofread::{Diagnostic, DiagnosticKind, IgnoreKey},
@@ -23,9 +23,6 @@ pub struct FrextApp {
     /// The editor controller: tabs, session, workspace, prompts,
     /// proofreading and clipboard.
     editor: Editor,
-    /// A pending name-entry prompt (rename / new file / new folder) from a
-    /// sidebar context menu, if any. While set, a modal collects the name.
-    pending_fs: Option<FsPrompt>,
     /// The diagnostic under the pointer when the editor was last
     /// right-clicked; drives the suggestion entries of the context menu.
     menu_diagnostic: Option<Diagnostic>,
@@ -45,32 +42,6 @@ struct FrameEffects {
     focus_search: bool,
     /// Focus the name prompt's field (`FocusPromptField`).
     focus_prompt: bool,
-}
-
-/// A pending filesystem name-entry prompt driven by a modal dialog.
-struct FsPrompt {
-    /// Which operation the entered name applies to.
-    kind: FsPromptKind,
-    /// The path the operation targets: the entry being renamed, or the
-    /// directory a new file/folder is created inside.
-    target: PathBuf,
-    /// The live text of the name field.
-    name: String,
-    /// Set on the first frame so the text field can grab keyboard focus.
-    focus_requested: bool,
-    /// An error message from the previous attempt, shown inline in red.
-    error: Option<String>,
-}
-
-/// The operation a [`FsPrompt`] collects a name for.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum FsPromptKind {
-    /// Rename `target` to the entered name.
-    Rename,
-    /// Create a new file named by the entry inside `target` (a directory).
-    NewFile,
-    /// Create a new folder named by the entry inside `target` (a directory).
-    NewFolder,
 }
 
 /// A reserved line-number gutter column, to be filled by
@@ -124,7 +95,6 @@ impl FrextApp {
     fn from_editor(editor: Editor) -> Self {
         Self {
             editor,
-            pending_fs: None,
             menu_diagnostic: None,
             effects: Vec::new(),
         }
@@ -303,14 +273,6 @@ impl FrextApp {
         self.send(command);
     }
 
-    /// Close the sidebar workspace, removing it from the persisted session so
-    /// it stays closed on the next launch. A no-op when no workspace is open.
-    fn close_workspace(&mut self) {
-        if self.editor.workspace_slot_mut().take().is_some() {
-            self.editor.persist_session();
-        }
-    }
-
     /// Apply a deferred editor context-menu action after the editor borrow has
     /// ended.
     ///
@@ -441,190 +403,20 @@ impl FrextApp {
         });
     }
 
-    /// Apply a deferred sidebar context-menu action after the tree borrow has
-    /// ended. The mutating actions (rename, create, trash) open a modal or
-    /// touch the filesystem and reconcile any affected open tabs.
-    fn apply_tree_action(&mut self, action: TreeAction) {
-        match action {
-            TreeAction::Open(path) => {
-                self.send(Command::OpenPath(path));
-            }
-            TreeAction::CopyPath(path) => {
-                self.editor
-                    .clipboard_mut()
-                    .write_text(path.display().to_string());
-            }
-            TreeAction::CopyRelativePath(path) => {
-                let relative = self.relative_to_root(&path);
-                self.editor.clipboard_mut().write_text(relative);
-            }
-            TreeAction::Reveal(path) => frext_core::fs_ops::reveal(&path),
-            TreeAction::Rename(path) => {
-                self.pending_fs = Some(FsPrompt {
-                    kind: FsPromptKind::Rename,
-                    name: path
-                        .file_name()
-                        .map_or_else(String::new, |n| n.to_string_lossy().into_owned()),
-                    target: path,
-                    focus_requested: true,
-                    error: None,
-                });
-            }
-            TreeAction::NewFile(dir) => {
-                self.pending_fs = Some(FsPrompt {
-                    kind: FsPromptKind::NewFile,
-                    target: dir,
-                    name: String::new(),
-                    focus_requested: true,
-                    error: None,
-                });
-            }
-            TreeAction::NewFolder(dir) => {
-                self.pending_fs = Some(FsPrompt {
-                    kind: FsPromptKind::NewFolder,
-                    target: dir,
-                    name: String::new(),
-                    focus_requested: true,
-                    error: None,
-                });
-            }
-            TreeAction::Trash(path) => self.trash_path(&path),
-        }
-    }
-
-    /// Render `path` relative to the workspace root for "Copy relative path".
-    /// Falls back to the full path display when there is no workspace or the
-    /// path is not under the root.
-    fn relative_to_root(&self, path: &Path) -> String {
-        if let Some(ws) = self.editor.workspace()
-            && let Ok(rel) = path.strip_prefix(&ws.root)
-        {
-            return rel.display().to_string();
-        }
-        path.display().to_string()
-    }
-
-    /// Move `path` to the OS trash, then reconcile editor state: any tab whose
-    /// file was trashed (the file itself, or a file under a trashed directory)
-    /// is closed, since its backing file no longer exists.
-    fn trash_path(&mut self, path: &Path) {
-        if let Err(err) = frext_core::fs_ops::move_to_trash(path) {
-            log::error!("{err}");
-            return;
-        }
-
-        self.close_tabs_under(path);
-
-        // Drop any now-stale expanded-folder entries under the trashed path.
-        self.prune_workspace_expanded();
-    }
-
-    /// Close any tab whose backing file is `path` or lives under it (when
-    /// `path` is a directory). Iterates from the end so removals do not shift
-    /// unscanned indices. Split out from [`Self::trash_path`] so the
-    /// tab-reconciliation can be tested without touching the OS trash.
-    fn close_tabs_under(&mut self, path: &Path) {
-        for index in (0..self.editor.tabs().len()).rev() {
-            let affected = self.editor.tabs()[index]
-                .path
-                .as_ref()
-                .is_some_and(|p| p == path || p.starts_with(path));
-            if affected {
-                self.editor.close_tab(index);
-            }
-        }
-    }
-
-    /// Rename `from` to `new_name`, then reconcile editor and workspace state:
-    /// rewrite the path of any open tab whose file lived at (or under) `from`,
-    /// and migrate matching entries in the workspace's expanded-folder set.
-    ///
-    /// Returns the rename result so the caller can keep the modal open and
-    /// show the error on failure.
-    fn rename_path(
-        &mut self,
-        from: &Path,
-        new_name: &str,
-    ) -> Result<(), frext_core::error::FsError> {
-        let to = frext_core::fs_ops::rename(from, new_name)?;
-        if to == from {
-            return Ok(());
-        }
-
-        // Repoint any open tab whose path was `from` or lived beneath it.
-        let mut touched_tabs = false;
-        for tab in self.editor.tabs_mut() {
-            if let Some(tab_path) = tab.path.as_ref() {
-                if tab_path == from {
-                    tab.path = Some(to.clone());
-                    touched_tabs = true;
-                } else if let Ok(rest) = tab_path.strip_prefix(from) {
-                    tab.path = Some(to.join(rest));
-                    touched_tabs = true;
-                }
-            }
-        }
-
-        // Migrate expanded-folder entries under the old path to the new one.
-        if let Some(ws) = self.editor.workspace_slot_mut().as_mut() {
-            let migrated: Vec<(PathBuf, PathBuf)> = ws
-                .expanded
-                .iter()
-                .filter_map(|dir| {
-                    if dir == from {
-                        Some((dir.clone(), to.clone()))
-                    } else {
-                        dir.strip_prefix(from)
-                            .ok()
-                            .map(|rest| (dir.clone(), to.join(rest)))
-                    }
-                })
-                .collect();
-            for (old, new) in migrated {
-                ws.expanded.remove(&old);
-                ws.expanded.insert(new);
-            }
-        }
-
-        if touched_tabs {
-            self.editor.persist_active_swap();
-        }
-        self.editor.persist_session();
-        Ok(())
-    }
-
-    /// Drop expanded-folder entries that no longer point at a directory on
-    /// disk (e.g. after the folder was renamed away or trashed).
-    fn prune_workspace_expanded(&mut self) {
-        if let Some(ws) = self.editor.workspace_slot_mut().as_mut() {
-            let stale: Vec<PathBuf> = ws
-                .expanded
-                .iter()
-                .filter(|dir| !dir.is_dir())
-                .cloned()
-                .collect();
-            if !stale.is_empty() {
-                for dir in stale {
-                    ws.expanded.remove(&dir);
-                }
-                self.editor.persist_session();
-            }
-        }
-    }
-
     /// Render and resolve the filesystem name-entry modal (rename / new file /
-    /// new folder). A no-op when nothing is pending. On a successful create,
-    /// a new file is also opened in a tab.
-    fn resolve_pending_fs(&mut self, ctx: &egui::Context, effects: &FrameEffects) {
-        let Some(prompt) = self.pending_fs.as_mut() else {
+    /// new folder). A no-op unless the editor is waiting on
+    /// [`Prompt::Name`]. `focus_prompt` gives the name field keyboard focus.
+    fn resolve_name_prompt(&mut self, ctx: &egui::Context, focus_prompt: bool) {
+        let Some(Prompt::Name(prompt)) = self.editor.prompt() else {
             return;
         };
 
         let (title, hint, action_label) = match prompt.kind {
-            FsPromptKind::Rename => ("Rename", "New name", "Rename"),
-            FsPromptKind::NewFile => ("New file", "File name", "Create"),
-            FsPromptKind::NewFolder => ("New folder", "Folder name", "Create"),
+            NameKind::Rename => ("Rename", "New name", "Rename"),
+            NameKind::NewFile => ("New file", "File name", "Create"),
+            NameKind::NewFolder => ("New folder", "Folder name", "Create"),
         };
+        let error = prompt.error.clone();
 
         let mut submit = false;
         let mut cancel = false;
@@ -634,20 +426,21 @@ impl FrextApp {
             ui.heading(title);
             ui.add_space(8.0);
 
-            let field = ui.add(
-                egui::TextEdit::singleline(&mut prompt.name)
-                    .hint_text(hint)
-                    .desired_width(f32::INFINITY),
-            );
-            if prompt.focus_requested || effects.focus_prompt {
-                field.request_focus();
-                prompt.focus_requested = false;
-            }
-            if field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                submit = true;
+            if let Some(name) = self.editor.prompt_name_mut() {
+                let field = ui.add(
+                    egui::TextEdit::singleline(name)
+                        .hint_text(hint)
+                        .desired_width(f32::INFINITY),
+                );
+                if focus_prompt {
+                    field.request_focus();
+                }
+                if field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    submit = true;
+                }
             }
 
-            if let Some(error) = &prompt.error {
+            if let Some(error) = &error {
                 ui.add_space(4.0);
                 ui.colored_label(ui.visuals().error_fg_color, error);
             }
@@ -668,45 +461,10 @@ impl FrextApp {
         }
 
         if cancel {
-            self.pending_fs = None;
-            return;
-        }
-        if !submit {
-            return;
-        }
-
-        // Apply the submitted name. On failure, keep the modal open and show
-        // the error inline.
-        // `pending_fs` is Some by the guard at the top of this method.
-        let Some(prompt) = self.pending_fs.take() else {
-            return;
-        };
-        let result = match prompt.kind {
-            FsPromptKind::Rename => self
-                .rename_path(&prompt.target, &prompt.name)
-                .map(|()| None),
-            FsPromptKind::NewFile => {
-                frext_core::fs_ops::create_file(&prompt.target, &prompt.name).map(Some)
-            }
-            FsPromptKind::NewFolder => {
-                frext_core::fs_ops::create_dir(&prompt.target, &prompt.name).map(|_| None)
-            }
-        };
-
-        match result {
-            Ok(created_file) => {
-                if let Some(path) = created_file {
-                    self.send(Command::OpenPath(path));
-                }
-            }
-            Err(err) => {
-                // Re-open the prompt carrying the error message.
-                self.pending_fs = Some(FsPrompt {
-                    error: Some(err.to_string()),
-                    focus_requested: true,
-                    ..prompt
-                });
-            }
+            self.send(Command::CancelPrompt);
+        } else if submit {
+            // On failure the editor keeps the prompt open with the error.
+            self.send(Command::SubmitName);
         }
     }
 
@@ -862,8 +620,8 @@ impl FrextApp {
         dir: &Path,
         active_canonical: Option<&Path>,
         file_to_open: &mut Option<PathBuf>,
-        expand_changes: &mut Vec<(PathBuf, bool)>,
-        tree_action: &mut Option<TreeAction>,
+        expand_changes: &mut Vec<Command>,
+        tree_action: &mut Option<Command>,
     ) {
         let (dirs, files) = frext_core::workspace::read_dir_split(dir);
 
@@ -909,7 +667,15 @@ impl FrextApp {
                 .context_menu(|ui| Self::dir_context_menu(ui, &sub, tree_action));
 
             if header.response.clicked() {
-                expand_changes.push((sub.clone(), !was_open));
+                let state = if was_open {
+                    FolderState::Collapsed
+                } else {
+                    FolderState::Expanded
+                };
+                expand_changes.push(Command::SetExpanded {
+                    dir: sub.clone(),
+                    state,
+                });
             }
         }
 
@@ -939,66 +705,66 @@ impl FrextApp {
 
     /// The right-click menu for a file row. Choices are recorded in
     /// `tree_action` and applied after the tree borrow ends.
-    fn file_context_menu(ui: &mut egui::Ui, file: &Path, tree_action: &mut Option<TreeAction>) {
+    fn file_context_menu(ui: &mut egui::Ui, file: &Path, tree_action: &mut Option<Command>) {
         if ui.button("Open").clicked() {
-            *tree_action = Some(TreeAction::Open(file.to_path_buf()));
+            *tree_action = Some(Command::OpenPath(file.to_path_buf()));
             ui.close();
         }
         ui.separator();
         if ui.button("Copy path").clicked() {
-            *tree_action = Some(TreeAction::CopyPath(file.to_path_buf()));
+            *tree_action = Some(Command::CopyPath(file.to_path_buf()));
             ui.close();
         }
         if ui.button("Copy relative path").clicked() {
-            *tree_action = Some(TreeAction::CopyRelativePath(file.to_path_buf()));
+            *tree_action = Some(Command::CopyRelativePath(file.to_path_buf()));
             ui.close();
         }
         if ui.button("Reveal in file manager").clicked() {
-            *tree_action = Some(TreeAction::Reveal(file.to_path_buf()));
+            *tree_action = Some(Command::Reveal(file.to_path_buf()));
             ui.close();
         }
         ui.separator();
         if ui.button("Rename\u{2026}").clicked() {
-            *tree_action = Some(TreeAction::Rename(file.to_path_buf()));
+            *tree_action = Some(Command::BeginRename(file.to_path_buf()));
             ui.close();
         }
         if ui.button("Delete (move to trash)").clicked() {
-            *tree_action = Some(TreeAction::Trash(file.to_path_buf()));
+            *tree_action = Some(Command::Trash(file.to_path_buf()));
             ui.close();
         }
     }
 
     /// The right-click menu for a folder header. Choices are recorded in
     /// `tree_action` and applied after the tree borrow ends.
-    fn dir_context_menu(ui: &mut egui::Ui, dir: &Path, tree_action: &mut Option<TreeAction>) {
+    fn dir_context_menu(ui: &mut egui::Ui, dir: &Path, tree_action: &mut Option<Command>) {
         if ui.button("New file\u{2026}").clicked() {
-            *tree_action = Some(TreeAction::NewFile(dir.to_path_buf()));
+            *tree_action = Some(Command::BeginNewFile(dir.to_path_buf()));
             ui.close();
         }
         if ui.button("New folder\u{2026}").clicked() {
-            *tree_action = Some(TreeAction::NewFolder(dir.to_path_buf()));
+            *tree_action = Some(Command::BeginNewFolder(dir.to_path_buf()));
             ui.close();
         }
         ui.separator();
         if ui.button("Copy path").clicked() {
-            *tree_action = Some(TreeAction::CopyPath(dir.to_path_buf()));
+            *tree_action = Some(Command::CopyPath(dir.to_path_buf()));
             ui.close();
         }
         if ui.button("Copy relative path").clicked() {
-            *tree_action = Some(TreeAction::CopyRelativePath(dir.to_path_buf()));
+            *tree_action = Some(Command::CopyRelativePath(dir.to_path_buf()));
             ui.close();
         }
         if ui.button("Reveal in file manager").clicked() {
-            *tree_action = Some(TreeAction::Reveal(dir.to_path_buf()));
+            *tree_action = Some(Command::Reveal(dir.to_path_buf()));
             ui.close();
         }
         ui.separator();
         if ui.button("Rename\u{2026}").clicked() {
-            *tree_action = Some(TreeAction::Rename(dir.to_path_buf()));
+            *tree_action = Some(Command::BeginRename(dir.to_path_buf()));
             ui.close();
         }
         if ui.button("Delete (move to trash)").clicked() {
-            *tree_action = Some(TreeAction::Trash(dir.to_path_buf()));
+            *tree_action = Some(Command::Trash(dir.to_path_buf()));
             ui.close();
         }
     }
@@ -1268,8 +1034,8 @@ impl eframe::App for FrextApp {
         // Left sidebar: file tree for the open workspace, if any.
         if self.editor.workspace().is_some() {
             let mut file_to_open: Option<PathBuf> = None;
-            let mut expand_changes: Vec<(PathBuf, bool)> = Vec::new();
-            let mut tree_action: Option<TreeAction> = None;
+            let mut expand_changes: Vec<Command> = Vec::new();
+            let mut tree_action: Option<Command> = None;
             let mut close_workspace = false;
 
             // The active tab's file, so the tree can highlight it. Compared
@@ -1332,20 +1098,16 @@ impl eframe::App for FrextApp {
             if close_workspace {
                 // Drop the sidebar and remove it from the persisted session
                 // so it stays closed on the next launch.
-                self.close_workspace();
+                self.send(Command::CloseWorkspace);
             } else {
-                for (dir, expanded) in expand_changes {
-                    if let Some(ws) = self.editor.workspace_slot_mut().as_mut()
-                        && ws.set_expanded(&dir, expanded)
-                    {
-                        self.editor.persist_session();
-                    }
+                for command in expand_changes {
+                    self.send(command);
                 }
                 if let Some(path) = file_to_open {
                     self.send(Command::OpenPath(path));
                 }
-                if let Some(action) = tree_action {
-                    self.apply_tree_action(action);
+                if let Some(command) = tree_action {
+                    self.send(command);
                 }
             }
         }
@@ -1551,7 +1313,7 @@ impl eframe::App for FrextApp {
 
         // Filesystem name-entry modal (rename / new file / new folder),
         // resolved after rendering for the same borrow-simplicity reason.
-        self.resolve_pending_fs(&ctx, &effects);
+        self.resolve_name_prompt(&ctx, effects.focus_prompt);
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
@@ -1615,27 +1377,6 @@ enum EditorAction {
     Ignore(IgnoreKey),
 }
 
-/// A deferred sidebar context-menu action, collected while the file tree is
-/// borrowed and applied after the borrow ends.
-enum TreeAction {
-    /// Open `path` in a tab (reusing one already on that path).
-    Open(PathBuf),
-    /// Copy `path`'s absolute path to the clipboard.
-    CopyPath(PathBuf),
-    /// Copy `path`'s path relative to the workspace root to the clipboard.
-    CopyRelativePath(PathBuf),
-    /// Open `path` (or its containing directory) in the OS file manager.
-    Reveal(PathBuf),
-    /// Begin a rename of `path` (opens the name-entry modal).
-    Rename(PathBuf),
-    /// Begin creating a new file inside the directory `path`.
-    NewFile(PathBuf),
-    /// Begin creating a new folder inside the directory `path`.
-    NewFolder(PathBuf),
-    /// Move `path` to the OS trash.
-    Trash(PathBuf),
-}
-
 /// Show a native "open file" picker. Returns `None` if cancelled or if no
 /// picker backend is available.
 fn rfd_pick_file() -> Option<std::path::PathBuf> {
@@ -1675,169 +1416,6 @@ mod tests {
     fn app_in(dir: &std::path::Path) -> FrextApp {
         let store = Store::at(dir.join("state")).unwrap();
         FrextApp::with_clipboard(store, Box::new(MemoryClipboard::default()))
-    }
-
-    #[test]
-    fn closing_the_workspace_drops_it_from_the_session() {
-        let dir = temp_dir("ws-close");
-        let project = dir.join("project");
-        fs::create_dir_all(&project).unwrap();
-
-        {
-            let store = Store::at(dir.join("state")).unwrap();
-            let mut app = FrextApp::with_args(store, &[], Some(project.as_path()));
-            assert!(app.editor.workspace().is_some());
-
-            app.close_workspace();
-            assert!(app.editor.workspace().is_none());
-
-            // Closing again is a harmless no-op.
-            app.close_workspace();
-            assert!(app.editor.workspace().is_none());
-        }
-
-        // The closed workspace must not come back on the next launch.
-        let store = Store::at(dir.join("state")).unwrap();
-        let restored = store.load().unwrap();
-        assert!(restored.workspace.is_none());
-
-        fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn renaming_a_file_repoints_its_open_tab() {
-        let dir = temp_dir("rename-tab");
-        let file = dir.join("old.txt");
-        fs::write(&file, "body").unwrap();
-
-        let store = Store::at(dir.join("state")).unwrap();
-        let mut app = FrextApp::with_files(store, std::slice::from_ref(&file));
-        assert_eq!(
-            app.editor.active_tab().unwrap().path.as_deref(),
-            Some(file.as_path())
-        );
-
-        app.rename_path(&file, "new.txt").unwrap();
-
-        let renamed = dir.join("new.txt");
-        assert!(renamed.is_file());
-        assert!(!file.exists());
-        // The open tab now points at the new path.
-        assert_eq!(
-            app.editor.active_tab().unwrap().path.as_deref(),
-            Some(renamed.as_path())
-        );
-
-        fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn renaming_a_directory_repoints_tabs_and_expanded_set() {
-        let dir = temp_dir("rename-dir");
-        let sub = dir.join("src");
-        fs::create_dir(&sub).unwrap();
-        let file = sub.join("main.rs");
-        fs::write(&file, "fn main() {}").unwrap();
-
-        let store = Store::at(dir.join("state")).unwrap();
-        let mut app = FrextApp::with_args(store, std::slice::from_ref(&file), Some(dir.as_path()));
-        // Mark the sub-directory expanded so the rename must migrate it.
-        if let Some(ws) = app.editor.workspace_slot_mut().as_mut() {
-            ws.set_expanded(&sub, true);
-        }
-
-        app.rename_path(&sub, "lib").unwrap();
-
-        let new_sub = dir.join("lib");
-        let new_file = new_sub.join("main.rs");
-        assert!(new_file.is_file());
-        // The tab under the renamed directory was repointed.
-        assert_eq!(
-            app.editor.active_tab().unwrap().path.as_deref(),
-            Some(new_file.as_path())
-        );
-        // The expanded-folder entry migrated to the new path.
-        let ws = app.editor.workspace().unwrap();
-        assert!(ws.is_expanded(&new_sub));
-        assert!(!ws.is_expanded(&sub));
-
-        fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn rename_refusing_to_clobber_surfaces_an_error() {
-        let dir = temp_dir("rename-clobber");
-        let a = dir.join("a.txt");
-        let b = dir.join("b.txt");
-        fs::write(&a, "a").unwrap();
-        fs::write(&b, "b").unwrap();
-
-        let mut app = app_in(&dir);
-        let err = app.rename_path(&a, "b.txt").unwrap_err();
-        assert!(matches!(err, frext_core::error::FsError::AlreadyExists(_)));
-        // Both files remain.
-        assert!(a.exists() && b.exists());
-
-        fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn close_tabs_under_closes_a_directorys_open_files() {
-        let dir = temp_dir("close-under");
-        let sub = dir.join("pkg");
-        fs::create_dir(&sub).unwrap();
-        let inside = sub.join("a.txt");
-        let outside = dir.join("b.txt");
-        fs::write(&inside, "a").unwrap();
-        fs::write(&outside, "b").unwrap();
-
-        let store = Store::at(dir.join("state")).unwrap();
-        let mut app = FrextApp::with_files(store, &[inside.clone(), outside.clone()]);
-        // Both files are open (alongside the initial untitled tab).
-        let opened: Vec<_> = app
-            .editor
-            .tabs()
-            .iter()
-            .filter_map(|t| t.path.clone())
-            .collect();
-        assert!(opened.contains(&inside) && opened.contains(&outside));
-
-        // Simulate the bookkeeping half of trashing the directory.
-        app.close_tabs_under(&sub);
-
-        // The tab inside the directory is gone; the outside one survives.
-        let remaining: Vec<_> = app
-            .editor
-            .tabs()
-            .iter()
-            .filter_map(|t| t.path.clone())
-            .collect();
-        assert!(remaining.contains(&outside));
-        assert!(!remaining.contains(&inside));
-
-        fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn relative_to_root_strips_the_workspace_root() {
-        let dir = temp_dir("relpath");
-        let nested = dir.join("a").join("b.txt");
-
-        let store = Store::at(dir.join("state")).unwrap();
-        let app = FrextApp::with_args(store, &[], Some(dir.as_path()));
-
-        assert_eq!(
-            app.relative_to_root(&nested),
-            PathBuf::from("a/b.txt").display().to_string()
-        );
-        // A path outside the root falls back to its full display.
-        let outside = PathBuf::from("/etc/hosts");
-        assert_eq!(
-            app.relative_to_root(&outside),
-            outside.display().to_string()
-        );
-
-        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -1891,52 +1469,6 @@ mod tests {
 
         assert!(!changed);
         assert_eq!(app.editor.active_tab().unwrap().text, "unchanged");
-
-        fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn copy_path_writes_the_absolute_path_to_the_clipboard() {
-        let dir = temp_dir("copy-path");
-        let nested = dir.join("a").join("b.txt");
-
-        let store = Store::at(dir.join("state")).unwrap();
-        let mut app = FrextApp::from_editor(Editor::open(
-            store,
-            Box::new(MemoryClipboard::default()),
-            &[],
-            Some(dir.as_path()),
-        ));
-
-        app.apply_tree_action(TreeAction::CopyPath(nested.clone()));
-
-        assert_eq!(
-            app.editor.clipboard_mut().read_text(),
-            Some(nested.display().to_string())
-        );
-
-        fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn copy_relative_path_writes_the_root_relative_path() {
-        let dir = temp_dir("copy-relpath");
-        let nested = dir.join("a").join("b.txt");
-
-        let store = Store::at(dir.join("state")).unwrap();
-        let mut app = FrextApp::from_editor(Editor::open(
-            store,
-            Box::new(MemoryClipboard::default()),
-            &[],
-            Some(dir.as_path()),
-        ));
-
-        app.apply_tree_action(TreeAction::CopyRelativePath(nested));
-
-        assert_eq!(
-            app.editor.clipboard_mut().read_text(),
-            Some(PathBuf::from("a/b.txt").display().to_string())
-        );
 
         fs::remove_dir_all(&dir).unwrap();
     }

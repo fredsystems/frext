@@ -203,15 +203,14 @@ impl Editor {
     }
 }
 
-// Transitional API: persistence and closing that the front end's tree and
-// editing code still call directly. Made private again as the workspace
-// tree (01.10) and editing plus the frame hooks (01.11) move into the
-// editor.
+// Transitional API: persistence that the front end's frame-top reload and
+// editing code still call directly. Made private again as editing plus the
+// frame hooks (01.11) move into the editor.
 impl Editor {
     /// Persist the session index, logging (but not propagating) failures so
     /// a transient write error never crashes the editor.
     ///
-    /// Transitional: removed from the public API in 01.10.
+    /// Transitional: removed from the public API in 01.11.
     pub fn persist_session(&self) {
         if let Err(err) = self.store.save_session(
             &self.tabs,
@@ -234,12 +233,12 @@ impl Editor {
             log::error!("failed to write swap file for tab {}: {err}", tab.id);
         }
     }
+}
 
+impl Editor {
     /// Close the tab at `index`, removing its swap file. Closing the last
     /// tab replaces it with a fresh untitled one.
-    ///
-    /// Transitional: removed from the public API in 01.10.
-    pub fn close_tab(&mut self, index: usize) {
+    pub(super) fn close_tab(&mut self, index: usize) {
         if index >= self.tabs.len() {
             return;
         }
