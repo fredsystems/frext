@@ -61,9 +61,19 @@ pub struct Editor {
     dictionary_file: DictionaryFile,
     /// The clipboard used by cut/copy/paste and the copy-path actions.
     clipboard: Box<dyn Clipboard>,
-    /// The editor's current selection as a char range, as reported by the
-    /// view.
-    selection: Option<Range<usize>>,
+    /// The editor's current selection, as reported by the view, together
+    /// with the tab it was reported for.
+    selection: Option<ViewSelection>,
+}
+
+/// A selection reported by the view, tied to the tab that was active when
+/// it was reported so it is never applied to a different buffer.
+#[derive(Debug, Clone)]
+struct ViewSelection {
+    /// The id of the tab the selection belongs to.
+    tab_id: u64,
+    /// The selected char range within that tab's buffer.
+    chars: Range<usize>,
 }
 
 /// Split borrow for the editor surface: the active tab's buffer (mutable,
@@ -269,9 +279,23 @@ impl Editor {
     }
 
     /// Record the editor's current selection as a char range (`None` when
-    /// the view has no cursor).
+    /// the view has no cursor). The selection applies to the tab that is
+    /// active when it is reported.
     pub fn set_selection(&mut self, chars: Option<Range<usize>>) {
-        self.selection = chars;
+        self.selection = chars
+            .zip(self.tabs.get(self.active))
+            .map(|(chars, tab)| ViewSelection {
+                tab_id: tab.id,
+                chars,
+            });
+    }
+
+    /// The reported selection's char range, if it belongs to the active
+    /// tab.
+    fn active_selection(&self) -> Option<Range<usize>> {
+        let selection = self.selection.as_ref()?;
+        let tab = self.tabs.get(self.active)?;
+        (selection.tab_id == tab.id).then(|| selection.chars.clone())
     }
 
     /// The active tab and the proofreading results, borrowed together for

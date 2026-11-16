@@ -125,7 +125,7 @@ impl Editor {
 
     /// The current selection as a byte range of the active buffer.
     fn selection_bytes(&self) -> Option<Range<usize>> {
-        let chars = self.selection.clone()?;
+        let chars = self.active_selection()?;
         let text = &self.tabs.get(self.active)?.text;
         Some(offsets::byte_of_char(text, chars.start)..offsets::byte_of_char(text, chars.end))
     }
@@ -923,6 +923,32 @@ mod tests {
             assert!(text.is_char_boundary(range.end), "{range:?}");
         }
         assert!(editor.search().matches().is_empty());
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn in_selection_ignores_another_tabs_selection() {
+        let dir = temp_dir("in-selection-other-tab");
+        let a = file(&dir, "a.txt", "foo foo foo");
+        let b = file(&dir, "b.txt", "foo foo foo");
+        let mut editor = searching_foo(&dir, &[a.clone(), b.clone()]);
+        let index_of = |editor: &Editor, path: &Path| {
+            editor
+                .tabs()
+                .iter()
+                .position(|t| t.path.as_deref() == Some(path))
+                .unwrap()
+        };
+        editor.apply(Command::SelectTab(index_of(&editor, &a)));
+        editor.set_selection(Some(0..3));
+        editor.apply(Command::ToggleSearchOption(SearchOption::InSelection));
+        assert_eq!(editor.search().matches(), [Range { start: 0, end: 3 }]);
+
+        // Tab B never reported a selection: A's range must not scope it.
+        editor.apply(Command::SelectTab(index_of(&editor, &b)));
+
+        assert_eq!(editor.search().matches(), [0..3, 4..7, 8..11]);
 
         fs::remove_dir_all(&dir).unwrap();
     }

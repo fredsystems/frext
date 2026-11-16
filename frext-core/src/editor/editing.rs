@@ -120,7 +120,7 @@ impl Editor {
 
     /// The selection the editing commands act on.
     fn current_selection(&self) -> Range<usize> {
-        self.selection.clone().unwrap_or(0..0)
+        self.active_selection().unwrap_or(0..0)
     }
 
     /// The active buffer was just edited: persist it, refresh any open
@@ -480,6 +480,44 @@ mod tests {
         );
         // ...but the unreadable file is left exactly as it was.
         assert_eq!(fs::read(state.join("dictionary.txt")).unwrap(), original);
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn editing_ignores_another_tabs_selection() {
+        let dir = temp_dir("edit-other-tab");
+        let mut editor = editor_with_text(&dir, "hello world");
+        let tab_a = editor.active_index();
+        editor.set_selection(Some(0..6));
+
+        editor.apply(Command::NewTab);
+        let tab_b = editor.active_index();
+        editor.tabs[tab_b].text = "other text".to_owned();
+        let outcome = editor.apply(Command::Cut);
+
+        // B's selection is the empty caret, so nothing is cut from either tab.
+        assert_eq!(outcome.buffer, BufferChange::Unchanged);
+        assert_eq!(editor.tabs[tab_b].text, "other text");
+        assert_eq!(editor.tabs[tab_a].text, "hello world");
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_selection_reported_for_the_active_tab_is_used() {
+        let dir = temp_dir("edit-active-tab-selection");
+        let mut editor = editor_with_text(&dir, "hello world");
+        editor.set_selection(Some(0..6));
+
+        editor.apply(Command::NewTab);
+        let tab_b = editor.active_index();
+        editor.tabs[tab_b].text = "other text".to_owned();
+        editor.set_selection(Some(0..6));
+        let outcome = editor.apply(Command::Cut);
+
+        assert_eq!(outcome.buffer, BufferChange::Edited);
+        assert_eq!(editor.tabs[tab_b].text, "text");
 
         fs::remove_dir_all(&dir).unwrap();
     }
