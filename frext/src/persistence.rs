@@ -145,6 +145,10 @@ impl Store {
 
     /// Write the personal proofreading dictionary, one word per line.
     ///
+    /// The words are written to a temporary file that is then renamed over
+    /// `dictionary.txt`, so a failed write (e.g. a full disk) leaves the
+    /// previous dictionary intact instead of truncated.
+    ///
     /// # Errors
     ///
     /// Returns [`PersistenceError`] on I/O failure.
@@ -158,7 +162,13 @@ impl Store {
             raw.push('\n');
         }
         let path = self.dictionary_path();
-        fs::write(&path, raw).map_err(|source| PersistenceError::Io { path, source })
+        let temp = self.root.join("dictionary.txt.tmp");
+        if let Err(source) = fs::write(&temp, raw) {
+            // Best effort: a partial temp file is harmless but untidy.
+            let _ = fs::remove_file(&temp);
+            return Err(PersistenceError::Io { path: temp, source });
+        }
+        fs::rename(&temp, &path).map_err(|source| PersistenceError::Io { path, source })
     }
 
     /// Load the previous session, restoring each tab's content from its
@@ -418,6 +428,25 @@ mod tests {
         // A hand-edited file with stray blank lines and padding still loads.
         fs::write(dir.join("dictionary.txt"), "\n  nixos \n\nharper\n").unwrap();
         assert_eq!(store.load_dictionary().unwrap(), vec!["nixos", "harper"]);
+
+        // Saving replaces the file and leaves no temporary behind.
+        store.save_dictionary(["replaced"]).unwrap();
+        assert_eq!(store.load_dictionary().unwrap(), vec!["replaced"]);
+        assert!(!dir.join("dictionary.txt.tmp").exists());
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_failed_dictionary_save_keeps_the_old_file() {
+        let dir = temp_dir("dict-failed-save");
+        let store = store_at(&dir);
+        store.save_dictionary(["original"]).unwrap();
+
+        // A directory squatting on the temp path makes the write fail.
+        fs::create_dir(dir.join("dictionary.txt.tmp")).unwrap();
+        assert!(store.save_dictionary(["new"]).is_err());
+        assert_eq!(store.load_dictionary().unwrap(), vec!["original"]);
 
         fs::remove_dir_all(&dir).unwrap();
     }

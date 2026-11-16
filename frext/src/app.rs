@@ -66,6 +66,8 @@ pub struct FrextApp {
     /// Spelling/grammar checking: background worker, per-tab results, the
     /// personal dictionary, and ignored diagnostics.
     proofread: Proofreading,
+    /// Whether the personal dictionary file may be rewritten.
+    dictionary_file: DictionaryFile,
     /// The diagnostic under the pointer when the editor was last
     /// right-clicked; drives the suggestion entries of the context menu.
     menu_diagnostic: Option<Diagnostic>,
@@ -95,6 +97,17 @@ enum FsPromptKind {
     NewFile,
     /// Create a new folder named by the entry inside `target` (a directory).
     NewFolder,
+}
+
+/// What happened when the personal dictionary was loaded at startup.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DictionaryFile {
+    /// Loaded (or absent, which is an empty dictionary): safe to rewrite.
+    Loaded,
+    /// The file exists but could not be read (e.g. invalid UTF-8). Saving
+    /// the in-memory word set would destroy its contents, so new words are
+    /// kept for this session only.
+    Unreadable,
 }
 
 /// A reserved line-number gutter column, to be filled by
@@ -144,10 +157,16 @@ impl FrextApp {
         let mut next_id = restored.next_id;
         let mut workspace = restored.workspace;
         let restored_search = restored.search;
-        let user_words = store.load_dictionary().unwrap_or_else(|err| {
-            log::error!("failed to load the personal dictionary: {err}");
-            Vec::new()
-        });
+        let (user_words, dictionary_file) = match store.load_dictionary() {
+            Ok(words) => (words, DictionaryFile::Loaded),
+            Err(err) => {
+                log::error!(
+                    "failed to load the personal dictionary; words added this \
+                     session will not be saved over it: {err}"
+                );
+                (Vec::new(), DictionaryFile::Unreadable)
+            }
+        };
 
         // Always guarantee at least one tab to edit.
         if tabs.is_empty() {
@@ -179,6 +198,7 @@ impl FrextApp {
             pending_close: None,
             pending_fs: None,
             proofread: Proofreading::new(user_words),
+            dictionary_file,
             menu_diagnostic: None,
         };
 
@@ -574,10 +594,19 @@ impl FrextApp {
                 true
             }
             EditorAction::AddToDictionary(word) => {
-                if self.proofread.add_word(&word)
-                    && let Err(err) = self.store.save_dictionary(self.proofread.user_words())
-                {
-                    log::error!("failed to save the personal dictionary: {err}");
+                if !self.proofread.add_word(&word) {
+                    return false;
+                }
+                match self.dictionary_file {
+                    DictionaryFile::Loaded => {
+                        if let Err(err) = self.store.save_dictionary(self.proofread.user_words()) {
+                            log::error!("failed to save the personal dictionary: {err}");
+                        }
+                    }
+                    DictionaryFile::Unreadable => log::warn!(
+                        "added {word:?} for this session only: the dictionary file could \
+                         not be read at startup, so it is not being overwritten"
+                    ),
                 }
                 false
             }
@@ -2847,6 +2876,35 @@ mod tests {
             reopened.proofread.user_words().collect::<Vec<_>>(),
             vec!["frext"]
         );
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn an_unreadable_dictionary_is_never_overwritten() {
+        let dir = temp_dir("editor-dictionary-unreadable");
+        let state = dir.join("state");
+        fs::create_dir_all(&state).unwrap();
+        // Invalid UTF-8: `load_dictionary` fails rather than returning words.
+        let original: &[u8] = b"kept\n\xff\xfe broken\n";
+        fs::write(state.join("dictionary.txt"), original).unwrap();
+
+        let mut app = app_in(&dir);
+        let ctx = egui::Context::default();
+        app.apply_editor_action(
+            &ctx,
+            EditorAction::AddToDictionary("frext".to_owned()),
+            None,
+            None,
+        );
+
+        // The word works for this session...
+        assert_eq!(
+            app.proofread.user_words().collect::<Vec<_>>(),
+            vec!["frext"]
+        );
+        // ...but the unreadable file is left exactly as it was.
+        assert_eq!(fs::read(state.join("dictionary.txt")).unwrap(), original);
 
         fs::remove_dir_all(&dir).unwrap();
     }
