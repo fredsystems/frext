@@ -7,4 +7,5 @@
 pub mod cli;
 pub mod clipboard;
 pub mod logging;
+pub mod terminal;
 pub mod theme;
