@@ -623,9 +623,9 @@ follows as its `tab.title()` padded the same way (`SelectTab(i)`), then
 `×` followed by one space (`CloseTab(i)`), then a `│`. Widths use `unicode-width` (via ratatui's `Span::width`, so no
 direct dependency is needed yet). When the tabs overflow, the tab
 region scrolls just enough for the active tab and its `×` to be fully
-visible. The fixed items never scroll. Items left of the visible
-window are omitted, and an item cut off on the right is omitted
-entirely. `pub fn render(items, active, hovered: Option<Target>, area,
+visible. The fixed items never scroll. A tab is atomic: its title and
+`×` are shown only if both fit fully inside the visible window, so a
+close glyph is never shown for a hidden title. `pub fn render(items, active, hovered: Option<Target>, area,
 buf, hits: &mut HitMap)` fills the row with `theme::chrome()`, draws
 the active tab with `theme::active_tab()` and `×` with
 `theme::close_glyph()`, sets `theme::hover_bg()` as the background of

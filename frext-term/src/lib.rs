@@ -11,5 +11,6 @@ pub mod hit;
 pub mod layout;
 pub mod logging;
 pub mod status;
+pub mod tab_bar;
 pub mod terminal;
 pub mod theme;
