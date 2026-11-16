@@ -857,6 +857,55 @@ Stop: report and await review.
   application.
 - **Scheduling:** before the PR is marked `pending merge`.
 
+### 01.16 -- Review fixes (PR #39)
+
+Surfaced by the Copilot and CodeRabbit reviews of PR #39 (`1342dc2`).
+Every item except J was pre-existing on `main`; J was introduced by
+01.8. Each lands as its own commit with a regression test, followed by
+the standard ritual.
+
+- **A -- Cut on clipboard failure.** Cut deleted the selection even when
+  the clipboard write failed. Fix: on a failed write, return
+  `Unchanged` and leave the buffer untouched. (`editor/editing.rs`)
+- **B -- Stale search matches.** `OpenPath`, `NewTab`, closing a tab and
+  an external reload changed the active buffer without recomputing
+  matches; stale ranges could fall inside a multi-byte char. Fix:
+  recompute after every active-buffer change. (`editor/tabs.rs`,
+  `editor/mod.rs`)
+- **C -- Selection from another tab.** The view-reported selection was
+  not tied to a tab, so "In sel" after a tab switch scoped the new
+  buffer with the old tab's selection. Fix: store the selection with
+  its tab id and ignore it for any other tab. (`editor/mod.rs`,
+  `editor/search.rs`, `editor/editing.rs`)
+- **D -- Replace All ignored "In sel".** Fix: a scoped
+  `Matcher::replace_all_in`, used when "In sel" has a non-empty
+  selection. (`search.rs`, `editor/search.rs`)
+- **E -- Closing an earlier tab moved focus.** Fix: decrement `active`
+  when a tab before it closes. (`editor/tabs.rs`)
+- **F -- First launch lost an unsaved fallback tab.** With no session
+  and no arguments the fallback tab's swap and session index were not
+  written until exit. Fix: persist them when the fallback tab is
+  created. (`editor/mod.rs`)
+- **G -- Renaming the workspace root.** `ws.root` kept the old path.
+  Fix: repoint the root when it is the renamed path. (`editor/tree.rs`)
+- **H -- Rename matched tabs lexically.** A tab opened through a
+  different spelling of the same path (relative, `./`) kept its old
+  path. Fix: match by canonical path, resolved before the rename.
+  (`editor/tree.rs`)
+- **I -- Reveal left zombie processes.** Fix: reap the opener on a
+  background thread. (`fs_ops.rs`)
+- **J -- Effects not bound to a tab.** A queued `SetSelection` /
+  `RevealSelection` could land on a different tab after a tab switch
+  (`store_caret` was bound to the tab's egui id before 01.8). Fix:
+  both effects carry the target `tab_id`; the front end applies them
+  only to that tab. (`editor/effect.rs`, its producers,
+  `frext/src/app.rs`)
+- **K -- Plan 02 dictionary race.** Concurrent GUI and TUI writes could
+  drop words. Fix (doc): hold an advisory lock across read, union and
+  rename. (`02-term-shell.md`)
+- **L -- Plan 08 kitty upload.** The raw RGBA upload omitted the `s` /
+  `v` pixel dimensions. Fix (doc). (`08-term-file-icons.md`)
+
 ## Manual smoke checklist (whole plan)
 
 The GUI is not covered by UI tests, so before the PR is marked
