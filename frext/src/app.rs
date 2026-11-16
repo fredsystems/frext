@@ -7,21 +7,20 @@ use std::path::{Path, PathBuf};
 use eframe::egui;
 
 use frext_core::{
-    clipboard::{Clipboard, SystemClipboard},
+    clipboard::SystemClipboard,
+    editor::{BufferChange, CloseChoice, Command, Editor, EditorFocus, Effect, Prompt},
     highlight::MatchHighlights,
     persistence::Store,
-    proofread::{Diagnostic, DiagnosticKind, IgnoreKey, state::Proofreading},
-    search::SearchQuery,
+    proofread::{Diagnostic, DiagnosticKind, IgnoreKey},
     tab::Tab,
     workspace::Workspace,
 };
 
 /// Live state for the find/replace bar, kept separate from the persisted
-/// [`SearchQuery`] (only the query itself survives across sessions).
+/// search query (owned by the [`Editor`]; only the query itself survives
+/// across sessions).
 #[derive(Default)]
 struct SearchState {
-    /// The query and its toggles (persisted).
-    query: SearchQuery,
     /// Whether the find/replace bar is currently shown.
     open: bool,
     /// Whether the replace row is shown.
@@ -50,31 +49,33 @@ struct SearchState {
 
 /// The top-level application state.
 pub struct FrextApp {
-    store: Store,
-    tabs: Vec<Tab>,
-    active: usize,
-    next_id: u64,
-    /// The sidebar workspace (root directory + expanded folders), if open.
-    workspace: Option<Workspace>,
+    /// The editor controller: tabs, session, workspace, prompts,
+    /// proofreading and clipboard.
+    editor: Editor,
     /// Find/replace bar state.
     search: SearchState,
-    /// Index of a tab awaiting unsaved-changes close confirmation, if any.
-    /// While set, a modal dialog asks whether to save, discard, or cancel.
-    pending_close: Option<usize>,
     /// A pending name-entry prompt (rename / new file / new folder) from a
     /// sidebar context menu, if any. While set, a modal collects the name.
     pending_fs: Option<FsPrompt>,
-    /// Spelling/grammar checking: background worker, per-tab results, the
-    /// personal dictionary, and ignored diagnostics.
-    proofread: Proofreading,
-    /// Whether the personal dictionary file may be rewritten.
-    dictionary_file: DictionaryFile,
     /// The diagnostic under the pointer when the editor was last
     /// right-clicked; drives the suggestion entries of the context menu.
     menu_diagnostic: Option<Diagnostic>,
-    /// The clipboard used by cut/copy/paste and the sidebar's copy-path
-    /// actions.
-    clipboard: Box<dyn Clipboard>,
+    /// Effects returned by the editor, applied during the next frame.
+    effects: Vec<Effect>,
+}
+
+/// This frame's view-state changes, drained from the queued [`Effect`]s
+/// before anything renders.
+#[derive(Default)]
+struct FrameEffects {
+    /// The last `SetSelection` queued, applied to the editor before it renders.
+    selection: Option<(Range<usize>, EditorFocus)>,
+    /// Scroll the editor so its selection is visible (`RevealSelection`).
+    reveal: bool,
+    /// Focus the find field (`FocusSearchField`).
+    focus_search: bool,
+    /// Focus the name prompt's field (`FocusPromptField`).
+    focus_prompt: bool,
 }
 
 /// A pending filesystem name-entry prompt driven by a modal dialog.
@@ -103,17 +104,6 @@ enum FsPromptKind {
     NewFolder,
 }
 
-/// What happened when the personal dictionary was loaded at startup.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum DictionaryFile {
-    /// Loaded (or absent, which is an empty dictionary): safe to rewrite.
-    Loaded,
-    /// The file exists but could not be read (e.g. invalid UTF-8). Saving
-    /// the in-memory word set would destroy its contents, so new words are
-    /// kept for this session only.
-    Unreadable,
-}
-
 /// A reserved line-number gutter column, to be filled by
 /// [`FrextApp::paint_line_numbers`] once the editor has laid out.
 struct Gutter {
@@ -137,10 +127,8 @@ impl FrextApp {
     /// Build the app like [`FrextApp::new`], but backed by `clipboard`
     /// instead of the system clipboard.
     #[cfg(test)]
-    fn with_clipboard(store: Store, clipboard: Box<dyn Clipboard>) -> Self {
-        let mut app = Self::new(store);
-        app.clipboard = clipboard;
-        app
+    fn with_clipboard(store: Store, clipboard: Box<dyn frext_core::clipboard::Clipboard>) -> Self {
+        Self::from_editor(Editor::open(store, clipboard, &[], None))
     }
 
     /// Build the app, restoring the previous session and then opening any
@@ -160,138 +148,40 @@ impl FrextApp {
     /// unchanged).
     #[must_use]
     pub fn with_args(store: Store, files: &[PathBuf], dir: Option<&Path>) -> Self {
-        let restored = store.load().unwrap_or_else(|err| {
-            log::error!("failed to load session, starting fresh: {err}");
-            frext_core::persistence::RestoredSession::default()
-        });
+        Self::from_editor(Editor::open(store, Box::new(SystemClipboard), files, dir))
+    }
 
-        let mut tabs = restored.tabs;
-        let active = restored.active;
-        let mut next_id = restored.next_id;
-        let mut workspace = restored.workspace;
-        let restored_search = restored.search;
-        let (user_words, dictionary_file) = match store.load_dictionary() {
-            Ok(words) => (words, DictionaryFile::Loaded),
-            Err(err) => {
-                log::error!(
-                    "failed to load the personal dictionary; words added this \
-                     session will not be saved over it: {err}"
-                );
-                (Vec::new(), DictionaryFile::Unreadable)
-            }
-        };
-
-        // Always guarantee at least one tab to edit.
-        if tabs.is_empty() {
-            tabs.push(Tab::new_untitled(next_id));
-            next_id += 1;
-        }
-
-        // A directory argument sets / replaces the workspace root. If it
-        // matches the restored root, keep the expanded set; otherwise start
-        // fresh.
-        if let Some(dir) = dir {
-            let dir = dir.to_path_buf();
-            match workspace.as_ref() {
-                Some(ws) if ws.root == dir => {}
-                _ => workspace = Some(Workspace::new(dir)),
-            }
-        }
-
-        let mut app = Self {
-            store,
-            tabs,
-            active,
-            next_id,
-            workspace,
-            search: SearchState {
-                query: restored_search,
-                ..SearchState::default()
-            },
-            pending_close: None,
+    /// Wrap `editor` with fresh view state.
+    fn from_editor(editor: Editor) -> Self {
+        Self {
+            editor,
+            search: SearchState::default(),
             pending_fs: None,
-            proofread: Proofreading::new(user_words),
-            dictionary_file,
             menu_diagnostic: None,
-            clipboard: Box::new(SystemClipboard),
-        };
-
-        for file in files {
-            app.open_path(file);
+            effects: Vec::new(),
         }
-        if !files.is_empty() || dir.is_some() {
-            app.persist_session();
-        }
-
-        app
     }
 
-    /// Open `path` into a tab and focus it. If a tab with the same path is
-    /// already open it is focused instead of opening a duplicate. Returns
-    /// `true` when a tab is now focused on the path (whether reused or newly
-    /// opened), `false` when the file could not be read.
-    ///
-    /// Does not itself persist the session index; callers batch that.
-    fn open_path(&mut self, path: &std::path::Path) -> bool {
-        // Reuse an already-open tab. Compare canonicalized paths so that
-        // e.g. `./foo.txt` and an absolute `foo.txt` are treated as one.
-        let canonical = path.canonicalize().ok();
-        if let Some(index) = self.tabs.iter().position(|tab| {
-            tab.path.as_ref().is_some_and(|tab_path| {
-                tab_path == path
-                    || (canonical.is_some() && tab_path.canonicalize().ok() == canonical)
-            })
-        }) {
-            self.active = index;
-            return true;
-        }
+    /// Apply `command` to the editor, queueing its effects for the next
+    /// frame. Returns whether the buffer changed.
+    fn send(&mut self, command: Command) -> BufferChange {
+        let outcome = self.editor.apply(command);
+        self.effects.extend(outcome.effects);
+        outcome.buffer
+    }
 
-        match std::fs::read_to_string(path) {
-            Ok(text) => {
-                let id = self.alloc_id();
-                let tab = Tab::from_file(id, path.to_path_buf(), text);
-                if let Err(err) = self.store.save_swap(&tab) {
-                    log::error!("failed to write swap for opened file: {err}");
-                }
-                self.tabs.push(tab);
-                self.active = self.tabs.len() - 1;
-                true
-            }
-            Err(err) => {
-                log::error!("failed to open {}: {err}", path.display());
-                false
+    /// Drain the queued effects into this frame's view-state changes.
+    fn apply_effects(&mut self) -> FrameEffects {
+        let mut frame = FrameEffects::default();
+        for effect in self.effects.drain(..) {
+            match effect {
+                Effect::SetSelection { chars, focus } => frame.selection = Some((chars, focus)),
+                Effect::RevealSelection => frame.reveal = true,
+                Effect::FocusSearchField => frame.focus_search = true,
+                Effect::FocusPromptField => frame.focus_prompt = true,
             }
         }
-    }
-
-    /// Hand out a fresh, unique tab id.
-    fn alloc_id(&mut self) -> u64 {
-        let id = self.next_id;
-        self.next_id += 1;
-        id
-    }
-
-    /// Persist the session index, logging (but not propagating) failures so
-    /// a transient write error never crashes the editor.
-    fn persist_session(&self) {
-        if let Err(err) = self.store.save_session(
-            &self.tabs,
-            self.active,
-            self.next_id,
-            self.workspace.as_ref(),
-            &self.search.query,
-        ) {
-            log::error!("failed to save session index: {err}");
-        }
-    }
-
-    /// Write the active tab's buffer to its swap file.
-    fn persist_active_swap(&self) {
-        if let Some(tab) = self.tabs.get(self.active)
-            && let Err(err) = self.store.save_swap(tab)
-        {
-            log::error!("failed to write swap file for tab {}: {err}", tab.id);
-        }
+        frame
     }
 
     /// Reserve the line-number gutter column to the left of the editor.
@@ -371,54 +261,35 @@ impl FrextApp {
         }
     }
 
-    /// Open a new, empty, untitled tab and focus it.
-    fn new_tab(&mut self) {
-        let id = self.alloc_id();
-        self.tabs.push(Tab::new_untitled(id));
-        self.active = self.tabs.len() - 1;
-        self.persist_active_swap();
-        self.persist_session();
-    }
-
-    /// Request to close the tab at `index`.
-    ///
-    /// A clean buffer is closed immediately. A buffer with unsaved changes
-    /// instead opens the confirmation modal (save / discard / cancel) by
-    /// recording `index` in `pending_close`; the actual close happens when the
-    /// user chooses save or discard.
-    fn request_close_tab(&mut self, index: usize) {
-        let Some(tab) = self.tabs.get(index) else {
-            return;
-        };
-        if tab.is_dirty() {
-            self.pending_close = Some(index);
-        } else {
-            self.close_tab(index);
-        }
-    }
-
     /// Render and resolve the unsaved-changes confirmation modal.
     ///
-    /// A no-op when no close is pending. Otherwise it shows a modal with
-    /// "Save and close", "Discard changes", and "Cancel". Clicking the
-    /// backdrop or pressing Escape cancels (keeping the tab open). A
-    /// "Save and close" that is itself cancelled (an untitled tab whose
-    /// save-as dialog is dismissed, or a write error) leaves the tab open and
-    /// dismisses the modal rather than silently discarding the buffer.
-    fn resolve_pending_close(&mut self, ctx: &egui::Context) {
-        let Some(index) = self.pending_close else {
+    /// A no-op unless the editor is waiting on [`Prompt::ConfirmClose`].
+    /// Otherwise it shows a modal with "Save and close", "Discard changes",
+    /// and "Cancel". Clicking the backdrop or pressing Escape cancels
+    /// (keeping the tab open). A "Save and close" that is itself cancelled
+    /// (an untitled tab whose save-as dialog is dismissed, or a write error)
+    /// leaves the tab open and dismisses the modal rather than silently
+    /// discarding the buffer.
+    fn resolve_close_prompt(&mut self, ctx: &egui::Context) {
+        let Some(&Prompt::ConfirmClose { tab_id }) = self.editor.prompt() else {
             return;
         };
 
         // The tab may have been removed out from under a stale request.
-        let Some(title) = self.tabs.get(index).map(Tab::display_name) else {
-            self.pending_close = None;
+        let Some(title) = self
+            .editor
+            .tabs()
+            .iter()
+            .find(|tab| tab.id == tab_id)
+            .map(Tab::display_name)
+        else {
+            self.send(Command::CancelPrompt);
             return;
         };
 
-        let mut choice = CloseChoice::Pending;
+        let mut choice: Option<CloseChoice> = None;
         let modal =
-            egui::Modal::new(egui::Id::unique(("frext_confirm_close", index))).show(ctx, |ui| {
+            egui::Modal::new(egui::Id::unique(("frext_confirm_close", tab_id))).show(ctx, |ui| {
                 ui.set_min_width(320.0);
                 ui.heading("Unsaved changes");
                 ui.add_space(4.0);
@@ -429,108 +300,79 @@ impl FrextApp {
                 ui.add_space(12.0);
                 ui.horizontal(|ui| {
                     if ui.button("Save and close").clicked() {
-                        choice = CloseChoice::Save;
+                        choice = Some(CloseChoice::Save);
                     }
                     if ui.button("Discard changes").clicked() {
-                        choice = CloseChoice::Discard;
+                        choice = Some(CloseChoice::Discard);
                     }
                     if ui.button("Cancel").clicked() {
-                        choice = CloseChoice::Cancel;
+                        choice = Some(CloseChoice::Cancel);
                     }
                 });
             });
 
         // Clicking outside the dialog, or pressing Escape, cancels the close.
         if modal.should_close() {
-            choice = CloseChoice::Cancel;
+            choice = Some(CloseChoice::Cancel);
         }
 
-        match choice {
-            CloseChoice::Pending => {}
-            CloseChoice::Cancel => self.pending_close = None,
-            CloseChoice::Discard => {
-                self.pending_close = None;
-                self.close_tab(index);
-            }
-            CloseChoice::Save => {
-                self.pending_close = None;
-                // Only close if the save actually succeeded; a cancelled
-                // save-as or a write error keeps the buffer open.
-                if self.save_tab(index) {
-                    self.close_tab(index);
-                }
-            }
+        if let Some(choice) = choice {
+            self.send(Command::ResolveClose(choice));
         }
     }
 
-    /// Close the tab at `index`, removing its swap file.
-    fn close_tab(&mut self, index: usize) {
-        if index >= self.tabs.len() {
+    /// Answer a pending [`Prompt::SavePath`] straight away with the native
+    /// save-file dialog: the chosen path is submitted, a dismissed dialog
+    /// cancels the save.
+    fn resolve_save_path_prompt(&mut self) {
+        if !matches!(self.editor.prompt(), Some(Prompt::SavePath { .. })) {
             return;
         }
-
-        let tab = self.tabs.remove(index);
-        self.proofread.forget_tab(tab.id);
-        if let Err(err) = self.store.remove_swap(tab.id) {
-            log::error!("failed to remove swap file for tab {}: {err}", tab.id);
-        }
-
-        if self.tabs.is_empty() {
-            let id = self.alloc_id();
-            self.tabs.push(Tab::new_untitled(id));
-            self.active = 0;
-            self.persist_active_swap();
-        } else if self.active >= self.tabs.len() {
-            self.active = self.tabs.len() - 1;
-        }
-
-        self.persist_session();
+        let command = match rfd_save_file() {
+            Some(path) => Command::SubmitSavePath(path),
+            None => Command::CancelPrompt,
+        };
+        self.send(command);
     }
 
     /// Close the sidebar workspace, removing it from the persisted session so
     /// it stays closed on the next launch. A no-op when no workspace is open.
     fn close_workspace(&mut self) {
-        if self.workspace.take().is_some() {
-            self.persist_session();
+        if self.editor.workspace_slot_mut().take().is_some() {
+            self.editor.persist_session();
         }
     }
 
     /// Apply a deferred editor context-menu action after the editor borrow has
     /// ended.
     ///
-    /// Clipboard text edits (cut/copy/paste) act on the captured char
-    /// `selection` over the active buffer, then store the resulting caret back
-    /// into the live `TextEdit` state under `editor_id` so the cursor follows
-    /// the edit. Find/replace and save reuse the existing deferred actions.
+    /// Clipboard text edits (cut/copy/paste) act on the editor's char
+    /// selection over the active buffer, then queue the resulting caret as a
+    /// [`Effect::SetSelection`] so the cursor follows the edit next frame.
+    /// Find/replace and save reuse the existing deferred actions.
     ///
     /// Returns `true` when the buffer changed (so the caller can persist and
     /// refresh matches), matching how the editor's own `changed()` is handled.
-    fn apply_editor_action(
-        &mut self,
-        ctx: &egui::Context,
-        action: EditorAction,
-        editor_id: Option<egui::Id>,
-        selection: Option<Range<usize>>,
-    ) -> bool {
-        let selection = selection.unwrap_or(0..0);
+    fn apply_editor_action(&mut self, action: EditorAction) -> bool {
+        let selection = self.editor.selection().unwrap_or(0..0);
 
         match action {
             EditorAction::None => false,
             EditorAction::Copy => {
-                if let Some(tab) = self.tabs.get(self.active) {
+                if let Some(tab) = self.editor.active_tab() {
                     let text = frext_core::edit_ops::selected_text(
                         &tab.text,
                         selection.start,
                         selection.end,
                     );
                     if !text.is_empty() {
-                        self.clipboard.write_text(text);
+                        self.editor.clipboard_mut().write_text(text);
                     }
                 }
                 false
             }
             EditorAction::Cut => {
-                let Some(tab) = self.tabs.get_mut(self.active) else {
+                let Some(tab) = self.editor.active_tab() else {
                     return false;
                 };
                 let text =
@@ -538,47 +380,44 @@ impl FrextApp {
                 if text.is_empty() {
                     return false;
                 }
-                self.clipboard.write_text(text);
+                self.editor.clipboard_mut().write_text(text);
+                let Some(view) = self.editor.active_view_mut() else {
+                    return false;
+                };
                 let caret = frext_core::edit_ops::delete_range(
-                    &mut tab.text,
+                    &mut view.tab.text,
                     selection.start,
                     selection.end,
                 );
-                Self::store_caret(ctx, editor_id, caret);
+                self.focus_caret(caret);
                 true
             }
             EditorAction::Paste => {
-                let Some(clip) = self.clipboard.read_text() else {
+                let Some(clip) = self.editor.clipboard_mut().read_text() else {
                     return false;
                 };
                 if clip.is_empty() {
                     return false;
                 }
-                let Some(tab) = self.tabs.get_mut(self.active) else {
+                let Some(view) = self.editor.active_view_mut() else {
                     return false;
                 };
                 let caret = frext_core::edit_ops::replace_range(
-                    &mut tab.text,
+                    &mut view.tab.text,
                     selection.start,
                     selection.end,
                     &clip,
                 );
-                Self::store_caret(ctx, editor_id, caret);
+                self.focus_caret(caret);
                 true
             }
             EditorAction::SelectAll => {
-                if let (Some(tab), Some(id)) = (self.tabs.get(self.active), editor_id) {
+                if let Some(tab) = self.editor.active_tab() {
                     let len = tab.text.chars().count();
-                    if let Some(mut state) = egui::text_edit::TextEditState::load(ctx, id) {
-                        state
-                            .cursor
-                            .set_char_range(Some(egui::text::CCursorRange::two(
-                                egui::text::CCursor::new(0),
-                                egui::text::CCursor::new(len),
-                            )));
-                        state.store(ctx, id);
-                    }
-                    ctx.memory_mut(|m| m.request_focus(id));
+                    self.effects.push(Effect::SetSelection {
+                        chars: 0..len,
+                        focus: EditorFocus::Focus,
+                    });
                 }
                 false
             }
@@ -591,7 +430,7 @@ impl FrextApp {
                 false
             }
             EditorAction::Save => {
-                self.save_active();
+                self.send(Command::Save);
                 false
             }
             EditorAction::ApplySuggestion {
@@ -599,9 +438,10 @@ impl FrextApp {
                 flagged,
                 replacement,
             } => {
-                let Some(tab) = self.tabs.get_mut(self.active) else {
+                let Some(view) = self.editor.active_view_mut() else {
                     return false;
                 };
+                let tab = view.tab;
                 // The buffer may have changed since the menu opened; only
                 // replace text that is still exactly what was flagged.
                 if tab.text.get(bytes.clone()) != Some(flagged.as_str()) {
@@ -610,49 +450,27 @@ impl FrextApp {
                 let caret = tab.text.get(..bytes.start).map_or(0, |s| s.chars().count())
                     + replacement.chars().count();
                 tab.text.replace_range(bytes, &replacement);
-                Self::store_caret(ctx, editor_id, caret);
+                self.focus_caret(caret);
                 true
             }
             EditorAction::AddToDictionary(word) => {
-                if !self.proofread.add_word(&word) {
-                    return false;
-                }
-                match self.dictionary_file {
-                    DictionaryFile::Loaded => {
-                        if let Err(err) = self.store.save_dictionary(self.proofread.user_words()) {
-                            log::error!("failed to save the personal dictionary: {err}");
-                        }
-                    }
-                    DictionaryFile::Unreadable => log::warn!(
-                        "added {word:?} for this session only: the dictionary file could \
-                         not be read at startup, so it is not being overwritten"
-                    ),
-                }
+                self.editor.add_to_dictionary(&word);
                 false
             }
             EditorAction::Ignore(key) => {
-                self.proofread.ignore(key);
+                self.editor.proofread_mut().ignore(key);
                 false
             }
         }
     }
 
-    /// Store `caret` (a character index) as a collapsed selection into the
-    /// `TextEdit` state under `editor_id`, and refocus the editor, so the
-    /// cursor tracks a programmatic edit. A no-op when there is no id or no
-    /// stored state yet.
-    fn store_caret(ctx: &egui::Context, editor_id: Option<egui::Id>, caret: usize) {
-        let Some(id) = editor_id else {
-            return;
-        };
-        if let Some(mut state) = egui::text_edit::TextEditState::load(ctx, id) {
-            let cursor = egui::text::CCursor::new(caret);
-            state
-                .cursor
-                .set_char_range(Some(egui::text::CCursorRange::one(cursor)));
-            state.store(ctx, id);
-        }
-        ctx.memory_mut(|m| m.request_focus(id));
+    /// Queue `caret` (a character index) as a collapsed, focused editor
+    /// selection, so the cursor tracks a programmatic edit.
+    fn focus_caret(&mut self, caret: usize) {
+        self.effects.push(Effect::SetSelection {
+            chars: caret..caret,
+            focus: EditorFocus::Focus,
+        });
     }
 
     /// Apply a deferred sidebar context-menu action after the tree borrow has
@@ -661,16 +479,16 @@ impl FrextApp {
     fn apply_tree_action(&mut self, action: TreeAction) {
         match action {
             TreeAction::Open(path) => {
-                if self.open_path(&path) {
-                    self.persist_session();
-                }
+                self.send(Command::OpenPath(path));
             }
             TreeAction::CopyPath(path) => {
-                self.clipboard.write_text(path.display().to_string());
+                self.editor
+                    .clipboard_mut()
+                    .write_text(path.display().to_string());
             }
             TreeAction::CopyRelativePath(path) => {
                 let relative = self.relative_to_root(&path);
-                self.clipboard.write_text(relative);
+                self.editor.clipboard_mut().write_text(relative);
             }
             TreeAction::Reveal(path) => frext_core::fs_ops::reveal(&path),
             TreeAction::Rename(path) => {
@@ -710,7 +528,7 @@ impl FrextApp {
     /// Falls back to the full path display when there is no workspace or the
     /// path is not under the root.
     fn relative_to_root(&self, path: &Path) -> String {
-        if let Some(ws) = self.workspace.as_ref()
+        if let Some(ws) = self.editor.workspace()
             && let Ok(rel) = path.strip_prefix(&ws.root)
         {
             return rel.display().to_string();
@@ -738,13 +556,13 @@ impl FrextApp {
     /// unscanned indices. Split out from [`Self::trash_path`] so the
     /// tab-reconciliation can be tested without touching the OS trash.
     fn close_tabs_under(&mut self, path: &Path) {
-        for index in (0..self.tabs.len()).rev() {
-            let affected = self.tabs[index]
+        for index in (0..self.editor.tabs().len()).rev() {
+            let affected = self.editor.tabs()[index]
                 .path
                 .as_ref()
                 .is_some_and(|p| p == path || p.starts_with(path));
             if affected {
-                self.close_tab(index);
+                self.editor.close_tab(index);
             }
         }
     }
@@ -767,7 +585,7 @@ impl FrextApp {
 
         // Repoint any open tab whose path was `from` or lived beneath it.
         let mut touched_tabs = false;
-        for tab in &mut self.tabs {
+        for tab in self.editor.tabs_mut() {
             if let Some(tab_path) = tab.path.as_ref() {
                 if tab_path == from {
                     tab.path = Some(to.clone());
@@ -780,7 +598,7 @@ impl FrextApp {
         }
 
         // Migrate expanded-folder entries under the old path to the new one.
-        if let Some(ws) = self.workspace.as_mut() {
+        if let Some(ws) = self.editor.workspace_slot_mut().as_mut() {
             let migrated: Vec<(PathBuf, PathBuf)> = ws
                 .expanded
                 .iter()
@@ -801,16 +619,16 @@ impl FrextApp {
         }
 
         if touched_tabs {
-            self.persist_active_swap();
+            self.editor.persist_active_swap();
         }
-        self.persist_session();
+        self.editor.persist_session();
         Ok(())
     }
 
     /// Drop expanded-folder entries that no longer point at a directory on
     /// disk (e.g. after the folder was renamed away or trashed).
     fn prune_workspace_expanded(&mut self) {
-        if let Some(ws) = self.workspace.as_mut() {
+        if let Some(ws) = self.editor.workspace_slot_mut().as_mut() {
             let stale: Vec<PathBuf> = ws
                 .expanded
                 .iter()
@@ -821,7 +639,7 @@ impl FrextApp {
                 for dir in stale {
                     ws.expanded.remove(&dir);
                 }
-                self.persist_session();
+                self.editor.persist_session();
             }
         }
     }
@@ -829,7 +647,7 @@ impl FrextApp {
     /// Render and resolve the filesystem name-entry modal (rename / new file /
     /// new folder). A no-op when nothing is pending. On a successful create,
     /// a new file is also opened in a tab.
-    fn resolve_pending_fs(&mut self, ctx: &egui::Context) {
+    fn resolve_pending_fs(&mut self, ctx: &egui::Context, effects: &FrameEffects) {
         let Some(prompt) = self.pending_fs.as_mut() else {
             return;
         };
@@ -853,7 +671,7 @@ impl FrextApp {
                     .hint_text(hint)
                     .desired_width(f32::INFINITY),
             );
-            if prompt.focus_requested {
+            if prompt.focus_requested || effects.focus_prompt {
                 field.request_focus();
                 prompt.focus_requested = false;
             }
@@ -909,10 +727,8 @@ impl FrextApp {
 
         match result {
             Ok(created_file) => {
-                if let Some(path) = created_file
-                    && self.open_path(&path)
-                {
-                    self.persist_session();
+                if let Some(path) = created_file {
+                    self.send(Command::OpenPath(path));
                 }
             }
             Err(err) => {
@@ -936,10 +752,10 @@ impl FrextApp {
             // A single-line selection is a sensible search seed; multi-line
             // selections are left alone (they are usually a scope, not a
             // pattern).
-            self.search.query.pattern = selected;
+            self.editor.search_query_mut().pattern = selected;
             // Plain mode for a seeded literal, so regex metacharacters in
             // the selected text match literally.
-            self.search.query.regex = false;
+            self.editor.search_query_mut().regex = false;
         }
         self.search.open = true;
         self.search.replace_open = replace;
@@ -954,7 +770,7 @@ impl FrextApp {
         if range.start >= range.end {
             return None;
         }
-        let tab = self.tabs.get(self.active)?;
+        let tab = self.editor.active_tab()?;
         tab.text.get(range).map(str::to_owned)
     }
 
@@ -972,17 +788,17 @@ impl FrextApp {
         self.search.error = None;
         self.search.matches.clear();
 
-        if self.search.query.is_empty() {
+        if self.editor.search_query().is_empty() {
             self.search.current = None;
             return;
         }
 
-        let Some(tab) = self.tabs.get(self.active) else {
+        let Some(tab) = self.editor.active_tab() else {
             self.search.current = None;
             return;
         };
 
-        let matcher = match self.search.query.compile() {
+        let matcher = match self.editor.search_query().compile() {
             Ok(matcher) => matcher,
             Err(err) => {
                 self.search.error = Some(err.to_string());
@@ -1034,22 +850,23 @@ impl FrextApp {
         let Some(range) = self.search.matches.get(index).cloned() else {
             return;
         };
-        let matcher = match self.search.query.compile() {
+        let matcher = match self.editor.search_query().compile() {
             Ok(matcher) => matcher,
             Err(err) => {
                 self.search.error = Some(err.to_string());
                 return;
             }
         };
-        let Some(tab) = self.tabs.get_mut(self.active) else {
+        let Some(view) = self.editor.active_view_mut() else {
             return;
         };
+        let tab = view.tab;
 
         if let Some((new_text, _)) =
             matcher.replace_one_at(&tab.text, range.start, &self.search.replacement)
         {
             tab.text = new_text;
-            self.persist_active_swap();
+            self.editor.persist_active_swap();
             // Keep the cursor near where we just replaced.
             self.recompute_matches();
             // Focus the match at (or after) the replaced position.
@@ -1066,24 +883,25 @@ impl FrextApp {
 
     /// Replace every match in the active buffer with the replacement text.
     fn replace_all(&mut self) {
-        if self.search.query.is_empty() {
+        if self.editor.search_query().is_empty() {
             return;
         }
-        let matcher = match self.search.query.compile() {
+        let matcher = match self.editor.search_query().compile() {
             Ok(matcher) => matcher,
             Err(err) => {
                 self.search.error = Some(err.to_string());
                 return;
             }
         };
-        let Some(tab) = self.tabs.get_mut(self.active) else {
+        let Some(view) = self.editor.active_view_mut() else {
             return;
         };
+        let tab = view.tab;
 
         let new_text = matcher.replace_all(&tab.text, &self.search.replacement);
         if new_text != tab.text {
             tab.text = new_text;
-            self.persist_active_swap();
+            self.editor.persist_active_swap();
         }
         self.search.current = None;
         self.recompute_matches();
@@ -1104,7 +922,7 @@ impl FrextApp {
     /// Render the find / replace bar. Pushes the chosen action into `action`
     /// and recomputes matches when the query or toggles change so highlights
     /// track typing live.
-    fn search_bar_ui(&mut self, ui: &mut egui::Ui, action: &mut SearchAction) {
+    fn search_bar_ui(&mut self, ui: &mut egui::Ui, action: &mut SearchAction, focus_search: bool) {
         let panel_frame =
             egui::Frame::side_top_panel(ui.style()).fill(ui.style().visuals.panel_fill);
 
@@ -1116,11 +934,11 @@ impl FrextApp {
                 ui.horizontal(|ui| {
                     ui.label("Find");
                     let field = ui.add(
-                        egui::TextEdit::singleline(&mut self.search.query.pattern)
+                        egui::TextEdit::singleline(&mut self.editor.search_query_mut().pattern)
                             .desired_width(220.0)
                             .hint_text("search…"),
                     );
-                    if self.search.focus_requested {
+                    if self.search.focus_requested || focus_search {
                         field.request_focus();
                         self.search.focus_requested = false;
                     }
@@ -1137,27 +955,30 @@ impl FrextApp {
 
                     // Toggles.
                     if ui
-                        .selectable_label(self.search.query.case_sensitive, "Aa")
+                        .selectable_label(self.editor.search_query().case_sensitive, "Aa")
                         .on_hover_text("Match case")
                         .clicked()
                     {
-                        self.search.query.case_sensitive = !self.search.query.case_sensitive;
+                        let query = self.editor.search_query_mut();
+                        query.case_sensitive = !query.case_sensitive;
                         query_changed = true;
                     }
                     if ui
-                        .selectable_label(self.search.query.whole_word, "W")
+                        .selectable_label(self.editor.search_query().whole_word, "W")
                         .on_hover_text("Whole word")
                         .clicked()
                     {
-                        self.search.query.whole_word = !self.search.query.whole_word;
+                        let query = self.editor.search_query_mut();
+                        query.whole_word = !query.whole_word;
                         query_changed = true;
                     }
                     if ui
-                        .selectable_label(self.search.query.regex, ".*")
+                        .selectable_label(self.editor.search_query().regex, ".*")
                         .on_hover_text("Regular expression")
                         .clicked()
                     {
-                        self.search.query.regex = !self.search.query.regex;
+                        let query = self.editor.search_query_mut();
+                        query.regex = !query.regex;
                         query_changed = true;
                     }
                     if ui
@@ -1210,7 +1031,7 @@ impl FrextApp {
                         ui.add(
                             egui::TextEdit::singleline(&mut self.search.replacement)
                                 .desired_width(220.0)
-                                .hint_text(if self.search.query.regex {
+                                .hint_text(if self.editor.search_query().regex {
                                     "replacement ($1 for groups)…"
                                 } else {
                                     "replacement…"
@@ -1233,7 +1054,7 @@ impl FrextApp {
 
     /// A short "current/total" (or "no results") label for the find bar.
     fn match_count_label(&self) -> String {
-        if self.search.query.is_empty() {
+        if self.editor.search_query().is_empty() {
             String::new()
         } else if self.search.matches.is_empty() {
             "no results".to_owned()
@@ -1249,44 +1070,7 @@ impl FrextApp {
             return;
         };
 
-        if self.open_path(&path) {
-            self.persist_session();
-        }
-    }
-
-    /// Save the active tab. Prompts for a path when the buffer is untitled.
-    fn save_active(&mut self) {
-        self.save_tab(self.active);
-    }
-
-    /// Save the tab at `index` to disk, prompting for a path when the tab is
-    /// untitled. Returns `true` when the buffer was written (so it is now
-    /// clean), and `false` when the save did not happen — an out-of-range
-    /// index, a cancelled save-as dialog, or an I/O error.
-    fn save_tab(&mut self, index: usize) -> bool {
-        let Some(tab) = self.tabs.get(index) else {
-            return false;
-        };
-
-        let path = match tab.path.clone() {
-            Some(path) => path,
-            None => match rfd_save_file() {
-                Some(path) => path,
-                None => return false,
-            },
-        };
-
-        if let Err(err) = std::fs::write(&path, &tab.text) {
-            log::error!("failed to save {}: {err}", path.display());
-            return false;
-        }
-
-        if let Some(tab) = self.tabs.get_mut(index) {
-            tab.path = Some(path);
-            tab.saved_text = tab.text.clone();
-        }
-        self.persist_session();
-        true
+        self.send(Command::OpenPath(path));
     }
 
     /// Render the contents of one directory in the file tree.
@@ -1560,25 +1344,30 @@ impl FrextApp {
 impl eframe::App for FrextApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
-        let mut action = MenuAction::None;
+        // Effects queued by last frame's commands, applied while rendering.
+        let effects = self.apply_effects();
+        // A deferred tab-bar / shortcut command (the last one chosen wins),
+        // and whether the open-file dialog was asked for.
+        let mut action: Option<Command> = None;
+        let mut open_dialog = false;
 
         // Proofreading runs on a background thread that repaints when a
         // result lands, so squiggles appear without further input.
-        self.proofread.ensure_started({
+        self.editor.proofread_mut().ensure_started({
             let ctx = ctx.clone();
             move || ctx.request_repaint()
         });
-        self.proofread.poll();
+        self.editor.proofread_mut().poll();
 
         // Pick up external modifications to the active tab's file (detected
         // by a change in on-disk size). A clean buffer is reloaded; a dirty
         // one is left untouched. Keeping the swap file and session index in
         // step after a reload preserves crash-safety.
-        if let Some(tab) = self.tabs.get_mut(self.active)
-            && tab.reload_if_changed_on_disk()
+        if let Some(view) = self.editor.active_view_mut()
+            && view.tab.reload_if_changed_on_disk()
         {
-            self.persist_active_swap();
-            self.persist_session();
+            self.editor.persist_active_swap();
+            self.editor.persist_session();
         }
 
         // Keyboard shortcuts. Search actions are deferred like menu actions so
@@ -1589,25 +1378,29 @@ impl eframe::App for FrextApp {
                 egui::Modifiers::COMMAND,
                 egui::Key::N,
             )) {
-                action = MenuAction::NewTab;
+                action = Some(Command::NewTab);
+                open_dialog = false;
             }
             if i.consume_shortcut(&egui::KeyboardShortcut::new(
                 egui::Modifiers::COMMAND,
                 egui::Key::O,
             )) {
-                action = MenuAction::Open;
+                action = None;
+                open_dialog = true;
             }
             if i.consume_shortcut(&egui::KeyboardShortcut::new(
                 egui::Modifiers::COMMAND,
                 egui::Key::S,
             )) {
-                action = MenuAction::Save;
+                action = Some(Command::Save);
+                open_dialog = false;
             }
             if i.consume_shortcut(&egui::KeyboardShortcut::new(
                 egui::Modifiers::COMMAND,
                 egui::Key::W,
             )) {
-                action = MenuAction::CloseActive;
+                action = Some(Command::RequestCloseActive);
+                open_dialog = false;
             }
             if i.consume_shortcut(&egui::KeyboardShortcut::new(
                 egui::Modifiers::COMMAND,
@@ -1649,37 +1442,42 @@ impl eframe::App for FrextApp {
                     .on_hover_text("New tab (Ctrl+N)")
                     .clicked()
                 {
-                    action = MenuAction::NewTab;
+                    action = Some(Command::NewTab);
+                    open_dialog = false;
                 }
                 if ui
                     .button("Open")
                     .on_hover_text("Open file (Ctrl+O)")
                     .clicked()
                 {
-                    action = MenuAction::Open;
+                    action = None;
+                    open_dialog = true;
                 }
                 if ui.button("Save").on_hover_text("Save (Ctrl+S)").clicked() {
-                    action = MenuAction::Save;
+                    action = Some(Command::Save);
+                    open_dialog = false;
                 }
                 ui.separator();
 
-                for index in 0..self.tabs.len() {
-                    let selected = index == self.active;
-                    let title = self.tabs[index].title();
+                for index in 0..self.editor.tabs().len() {
+                    let selected = index == self.editor.active_index();
+                    let title = self.editor.tabs()[index].title();
                     let label = if selected {
                         egui::RichText::new(title).color(crate::theme::accent())
                     } else {
                         egui::RichText::new(title)
                     };
                     if ui.selectable_label(selected, label).clicked() {
-                        action = MenuAction::Select(index);
+                        action = Some(Command::SelectTab(index));
+                        open_dialog = false;
                     }
                     if ui
                         .small_button("\u{00d7}")
                         .on_hover_text("Close tab (Ctrl+W)")
                         .clicked()
                     {
-                        action = MenuAction::Close(index);
+                        action = Some(Command::RequestClose(index));
+                        open_dialog = false;
                     }
                     ui.separator();
                 }
@@ -1688,11 +1486,11 @@ impl eframe::App for FrextApp {
 
         // Find / replace bar, shown directly under the tab bar.
         if self.search.open {
-            self.search_bar_ui(ui, &mut search_action);
+            self.search_bar_ui(ui, &mut search_action, effects.focus_search);
         }
 
         // Left sidebar: file tree for the open workspace, if any.
-        if self.workspace.is_some() {
+        if self.editor.workspace().is_some() {
             let mut file_to_open: Option<PathBuf> = None;
             let mut expand_changes: Vec<(PathBuf, bool)> = Vec::new();
             let mut tree_action: Option<TreeAction> = None;
@@ -1701,7 +1499,7 @@ impl eframe::App for FrextApp {
             // The active tab's file, so the tree can highlight it. Compared
             // canonicalised so a relative tree path matches an absolute tab
             // path (and vice versa).
-            let active_path = self.tabs.get(self.active).and_then(|tab| tab.path.clone());
+            let active_path = self.editor.active_tab().and_then(|tab| tab.path.clone());
             let active_canonical = active_path.as_ref().and_then(|p| p.canonicalize().ok());
 
             // Match the sidebar fill to the central panel so the two panes
@@ -1714,7 +1512,7 @@ impl eframe::App for FrextApp {
                 .frame(panel_frame)
                 .show(ui, |ui| {
                     // `workspace` is Some by the guard above.
-                    if let Some(ws) = self.workspace.as_ref() {
+                    if let Some(ws) = self.editor.workspace() {
                         let root = ws.root.clone();
                         // Show the resolved root with the home directory
                         // collapsed to `~` (so `frext .` reads as a real
@@ -1761,16 +1559,14 @@ impl eframe::App for FrextApp {
                 self.close_workspace();
             } else {
                 for (dir, expanded) in expand_changes {
-                    if let Some(ws) = self.workspace.as_mut()
+                    if let Some(ws) = self.editor.workspace_slot_mut().as_mut()
                         && ws.set_expanded(&dir, expanded)
                     {
-                        self.persist_session();
+                        self.editor.persist_session();
                     }
                 }
-                if let Some(path) = file_to_open
-                    && self.open_path(&path)
-                {
-                    self.persist_session();
+                if let Some(path) = file_to_open {
+                    self.send(Command::OpenPath(path));
                 }
                 if let Some(action) = tree_action {
                     self.apply_tree_action(action);
@@ -1784,15 +1580,16 @@ impl eframe::App for FrextApp {
         let scroll_to = self.search.scroll_to.take();
         let mut new_selection: Option<Range<usize>> = None;
         let mut changed = false;
-        // Editor context-menu plumbing: the chosen action plus what applying
-        // it needs (the editor's id and the live char selection), captured
-        // inside the closure and applied after the borrow ends.
+        // Editor context-menu plumbing: the chosen action plus the live char
+        // selection it acts on, captured inside the closure and applied after
+        // the borrow ends.
         let mut editor_action = EditorAction::None;
         let mut editor_char_selection: Option<Range<usize>> = None;
-        let mut editor_id_out: Option<egui::Id> = None;
 
         egui::CentralPanel::default().show(ui, |ui| {
-            if let Some(tab) = self.tabs.get_mut(self.active) {
+            if let Some(view) = self.editor.active_view_mut() {
+                let tab = view.tab;
+                let proofread = view.proofread;
                 let language = frext_core::syntax::language_from_path(tab.path.as_deref());
                 let mut layouter = crate::editor_layout::layouter(&language, &highlights);
 
@@ -1826,6 +1623,23 @@ impl eframe::App for FrextApp {
                                 .fill(ui.visuals().extreme_bg_color)
                                 .inner_margin(egui::Margin::symmetric(4, 2));
                             let editor_id = egui::Id::unique(("frext_editor", tab.id));
+                            // Apply a queued selection (and focus) before the
+                            // editor reads its state this frame.
+                            if let Some((chars, focus)) = &effects.selection {
+                                let mut state =
+                                    egui::text_edit::TextEditState::load(ui.ctx(), editor_id)
+                                        .unwrap_or_default();
+                                state
+                                    .cursor
+                                    .set_char_range(Some(egui::text::CCursorRange::two(
+                                        egui::text::CCursor::new(chars.start),
+                                        egui::text::CCursor::new(chars.end),
+                                    )));
+                                state.store(ui.ctx(), editor_id);
+                                if *focus == EditorFocus::Focus {
+                                    ui.ctx().memory_mut(|m| m.request_focus(editor_id));
+                                }
+                            }
                             let mut output = egui::TextEdit::multiline(&mut tab.text)
                                 .id(editor_id)
                                 .code_editor()
@@ -1842,8 +1656,7 @@ impl eframe::App for FrextApp {
 
                             // Wavy underlines for spelling (red) and grammar
                             // (green) issues, painted over the laid-out text.
-                            let underlines = self
-                                .proofread
+                            let underlines = proofread
                                 .diagnostics(tab.id, &tab.text)
                                 .into_iter()
                                 .map(|d| {
@@ -1869,7 +1682,7 @@ impl eframe::App for FrextApp {
                                     output.response.interact_pointer_pos().and_then(|pos| {
                                         let cursor =
                                             output.galley.cursor_from_pos(pos - output.galley_pos);
-                                        self.proofread
+                                        proofread
                                             .diagnostic_at(tab.id, &tab.text, cursor.index.0)
                                             .cloned()
                                     });
@@ -1891,6 +1704,12 @@ impl eframe::App for FrextApp {
                                 output.response.scroll_to_me(Some(egui::Align::Center));
                             }
 
+                            // A queued `RevealSelection`: scroll the editor's
+                            // selection into view.
+                            if effects.reveal {
+                                output.response.scroll_to_me(Some(egui::Align::Center));
+                            }
+
                             // Capture the live selection as char and byte
                             // ranges: the byte range scopes a
                             // search-within-selection, the char range drives
@@ -1908,7 +1727,6 @@ impl eframe::App for FrextApp {
                                 editor_char_selection = None;
                                 new_selection = None;
                             }
-                            editor_id_out = Some(editor_id);
 
                             // Right-click menu for the editing surface. egui's
                             // `TextEdit` ships no context menu of its own, so
@@ -1937,18 +1755,21 @@ impl eframe::App for FrextApp {
             }
         });
 
+        // Report the live char selection to the editor; the context-menu
+        // actions below act on it.
+        self.editor.set_selection(editor_char_selection);
+
         // Apply a deferred editor context-menu action (cut/copy/paste/select
         // all/find/save). A clipboard edit that mutates the buffer is folded
         // into `changed` so it persists and refreshes matches just like a
         // typed edit.
         if !matches!(editor_action, EditorAction::None) {
-            let edited =
-                self.apply_editor_action(&ctx, editor_action, editor_id_out, editor_char_selection);
+            let edited = self.apply_editor_action(editor_action);
             changed = changed || edited;
         }
 
         if changed {
-            self.persist_active_swap();
+            self.editor.commit_edit();
             // The buffer was edited this frame: refresh matches and the count
             // so the search bar tracks live edits, not just query changes.
             if self.search.open {
@@ -1959,21 +1780,15 @@ impl eframe::App for FrextApp {
 
         // Queue a proofread of the active buffer; a no-op unless its text
         // (or path) changed since the last request.
-        if let Some(tab) = self.tabs.get(self.active) {
-            self.proofread
-                .request(tab.id, &tab.text, tab.path.as_deref());
-        }
+        self.editor.end_frame();
 
-        match action {
-            MenuAction::None => {}
-            MenuAction::NewTab => self.new_tab(),
-            MenuAction::Open => self.open_file(),
-            MenuAction::Save => self.save_active(),
-            MenuAction::CloseActive => self.request_close_tab(self.active),
-            MenuAction::Close(index) => self.request_close_tab(index),
-            MenuAction::Select(index) => {
-                self.active = index;
-                self.persist_session();
+        if open_dialog {
+            self.open_file();
+        }
+        if let Some(command) = action {
+            let select = matches!(command, Command::SelectTab(_));
+            self.send(command);
+            if select {
                 self.recompute_matches();
             }
         }
@@ -1984,7 +1799,7 @@ impl eframe::App for FrextApp {
             SearchAction::Close => {
                 self.close_search();
                 // Persist the (possibly edited) query when the bar closes.
-                self.persist_session();
+                self.editor.persist_session();
             }
             SearchAction::Step { forward } => self.step_match(forward),
             SearchAction::Recompute => self.recompute_matches(),
@@ -1994,21 +1809,20 @@ impl eframe::App for FrextApp {
 
         // Unsaved-changes confirmation modal, shown when a dirty tab's close
         // was requested. Resolved after rendering to keep the borrow simple.
-        self.resolve_pending_close(&ctx);
+        self.resolve_close_prompt(&ctx);
+
+        // An untitled save (Ctrl+S, or "Save and close" above) waits on a
+        // path: ask for it straight away with the native dialog.
+        self.resolve_save_path_prompt();
 
         // Filesystem name-entry modal (rename / new file / new folder),
         // resolved after rendering for the same borrow-simplicity reason.
-        self.resolve_pending_fs(&ctx);
+        self.resolve_pending_fs(&ctx, &effects);
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         // Final flush: make sure swap files and the index are current.
-        for tab in &self.tabs {
-            if let Err(err) = self.store.save_swap(tab) {
-                log::error!("failed to flush swap for tab {} on exit: {err}", tab.id);
-            }
-        }
-        self.persist_session();
+        self.editor.shutdown();
     }
 }
 
@@ -2036,33 +1850,8 @@ fn stem_uri(stem: &str) -> String {
     format!("frext-file-icon://{stem}.svg")
 }
 
-/// A deferred action chosen from the menu/tab bar, applied after the borrow
-/// of `self.tabs` ends.
-enum MenuAction {
-    None,
-    NewTab,
-    Open,
-    Save,
-    CloseActive,
-    Close(usize),
-    Select(usize),
-}
-
-/// The user's choice in the unsaved-changes confirmation modal, collected
-/// while the modal is borrowed and applied afterwards.
-enum CloseChoice {
-    /// No button pressed yet this frame.
-    Pending,
-    /// Save the buffer, then close the tab.
-    Save,
-    /// Close the tab without saving.
-    Discard,
-    /// Keep the tab open.
-    Cancel,
-}
-
 /// A deferred editor context-menu action, collected while the editor is
-/// borrowed and applied after the borrow ends (mirroring [`MenuAction`]).
+/// borrowed and applied after the borrow ends.
 enum EditorAction {
     None,
     /// Copy the selection to the clipboard, then delete it from the buffer.
@@ -2093,7 +1882,7 @@ enum EditorAction {
 }
 
 /// A deferred sidebar context-menu action, collected while the file tree is
-/// borrowed and applied after the borrow ends (mirroring [`MenuAction`]).
+/// borrowed and applied after the borrow ends.
 enum TreeAction {
     /// Open `path` in a tab (reusing one already on that path).
     Open(PathBuf),
@@ -2156,80 +1945,6 @@ mod tests {
     use super::*;
     use frext_core::clipboard::MemoryClipboard;
 
-    #[test]
-    fn requesting_close_of_a_clean_tab_closes_immediately() {
-        let dir = temp_dir("close-clean");
-        let mut app = app_in(&dir);
-
-        // Two clean tabs so closing one does not hit the "always keep one"
-        // replacement path.
-        app.new_tab();
-        let before = app.tabs.len();
-        assert!(!app.tabs[0].is_dirty());
-
-        app.request_close_tab(0);
-
-        assert!(app.pending_close.is_none(), "a clean close needs no prompt");
-        assert_eq!(app.tabs.len(), before - 1);
-
-        fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn requesting_close_of_a_dirty_tab_prompts_instead_of_closing() {
-        let dir = temp_dir("close-dirty");
-        let mut app = app_in(&dir);
-        app.new_tab();
-        let before = app.tabs.len();
-
-        // Make tab 0 dirty.
-        app.tabs[0].text.push_str("unsaved work");
-        assert!(app.tabs[0].is_dirty());
-
-        app.request_close_tab(0);
-
-        assert_eq!(
-            app.pending_close,
-            Some(0),
-            "a dirty close must open the confirmation prompt"
-        );
-        assert_eq!(app.tabs.len(), before, "the tab must not be closed yet");
-
-        fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn saving_a_dirty_tab_clears_its_dirty_state() {
-        let dir = temp_dir("save-clears-dirty");
-        let file = dir.join("doc.txt");
-        fs::write(&file, "original").unwrap();
-
-        let mut app = app_in(&dir);
-        assert!(app.open_path(&file));
-        let index = app.active;
-
-        app.tabs[index].text = "edited".to_owned();
-        assert!(app.tabs[index].is_dirty());
-
-        // save_tab is what "Save and close" calls; it must succeed and clean
-        // the buffer, gating the subsequent close.
-        assert!(app.save_tab(index));
-        assert!(!app.tabs[index].is_dirty());
-        assert_eq!(fs::read_to_string(&file).unwrap(), "edited");
-
-        fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn save_tab_on_out_of_range_index_is_a_noop_failure() {
-        let dir = temp_dir("save-oob");
-        let mut app = app_in(&dir);
-
-        assert!(!app.save_tab(app.tabs.len() + 5));
-
-        fs::remove_dir_all(&dir).unwrap();
-    }
-
     /// Create an isolated temp directory unique to this test.
     fn temp_dir(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
@@ -2250,81 +1965,6 @@ mod tests {
     }
 
     #[test]
-    fn opening_cli_file_loads_its_contents_and_focuses_it() {
-        let dir = temp_dir("cli-open");
-        let file = dir.join("hello.txt");
-        fs::write(&file, "hello from disk").unwrap();
-
-        let store = Store::at(dir.join("state")).unwrap();
-        let app = FrextApp::with_files(store, std::slice::from_ref(&file));
-
-        let active = &app.tabs[app.active];
-        assert_eq!(active.path.as_deref(), Some(file.as_path()));
-        assert_eq!(active.text, "hello from disk");
-        assert!(!active.is_dirty());
-
-        fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn opening_same_path_twice_reuses_the_tab() {
-        let dir = temp_dir("reuse");
-        let file = dir.join("notes.txt");
-        fs::write(&file, "body").unwrap();
-
-        let mut app = app_in(&dir);
-        let baseline = app.tabs.len();
-
-        assert!(app.open_path(&file));
-        let after_first = app.tabs.len();
-        assert_eq!(after_first, baseline + 1);
-        let first_index = app.active;
-
-        // Opening the same file again must not add a second tab.
-        assert!(app.open_path(&file));
-        assert_eq!(app.tabs.len(), after_first);
-        assert_eq!(app.active, first_index);
-
-        fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn opening_nonexistent_file_reports_failure_and_adds_no_tab() {
-        let dir = temp_dir("missing");
-        let mut app = app_in(&dir);
-        let before = app.tabs.len();
-
-        assert!(!app.open_path(&dir.join("does-not-exist.txt")));
-        assert_eq!(app.tabs.len(), before);
-
-        fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn cli_files_persist_into_session_for_next_launch() {
-        let dir = temp_dir("persist");
-        let file = dir.join("restore-me.txt");
-        fs::write(&file, "keep me").unwrap();
-
-        {
-            let store = Store::at(dir.join("state")).unwrap();
-            let _app = FrextApp::with_files(store, std::slice::from_ref(&file));
-        }
-
-        // A fresh store at the same root must see the opened file restored.
-        let store = Store::at(dir.join("state")).unwrap();
-        let restored = store.load().unwrap();
-        assert!(
-            restored
-                .tabs
-                .iter()
-                .any(|tab| tab.path.as_deref() == Some(file.as_path()))
-        );
-
-        fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
     fn closing_the_workspace_drops_it_from_the_session() {
         let dir = temp_dir("ws-close");
         let project = dir.join("project");
@@ -2333,43 +1973,20 @@ mod tests {
         {
             let store = Store::at(dir.join("state")).unwrap();
             let mut app = FrextApp::with_args(store, &[], Some(project.as_path()));
-            assert!(app.workspace.is_some());
+            assert!(app.editor.workspace().is_some());
 
             app.close_workspace();
-            assert!(app.workspace.is_none());
+            assert!(app.editor.workspace().is_none());
 
             // Closing again is a harmless no-op.
             app.close_workspace();
-            assert!(app.workspace.is_none());
+            assert!(app.editor.workspace().is_none());
         }
 
         // The closed workspace must not come back on the next launch.
         let store = Store::at(dir.join("state")).unwrap();
         let restored = store.load().unwrap();
         assert!(restored.workspace.is_none());
-
-        fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn directory_argument_opens_a_workspace_and_persists_it() {
-        let dir = temp_dir("ws-arg");
-        let project = dir.join("project");
-        fs::create_dir_all(&project).unwrap();
-
-        {
-            let store = Store::at(dir.join("state")).unwrap();
-            let app = FrextApp::with_args(store, &[], Some(project.as_path()));
-            assert_eq!(
-                app.workspace.as_ref().map(|ws| ws.root.clone()),
-                Some(project.clone())
-            );
-        }
-
-        // The workspace root must survive into the next launch.
-        let store = Store::at(dir.join("state")).unwrap();
-        let restored = store.load().unwrap();
-        assert_eq!(restored.workspace.map(|ws| ws.root), Some(project.clone()));
 
         fs::remove_dir_all(&dir).unwrap();
     }
@@ -2385,11 +2002,13 @@ mod tests {
         let store = Store::at(dir.join("state")).unwrap();
         let mut app = FrextApp::with_files(store, &[a, b]);
         // Focus the tab backed by a.txt (its content is `first`).
-        app.active = app
-            .tabs
+        let index = app
+            .editor
+            .tabs()
             .iter()
             .position(|t| t.text == first)
             .expect("a tab holding the first content");
+        app.send(Command::SelectTab(index));
         app
     }
 
@@ -2398,7 +2017,7 @@ mod tests {
         let dir = temp_dir("search-active");
         let mut app = app_with_two_tabs(&dir, "foo here foo", "foo and foo and foo");
 
-        app.search.query.pattern = "foo".to_owned();
+        app.editor.search_query_mut().pattern = "foo".to_owned();
         app.recompute_matches();
 
         // The active tab ("foo here foo") has two "foo"s; the other tab's
@@ -2406,11 +2025,13 @@ mod tests {
         assert_eq!(app.search.matches, vec![0..3, 9..12]);
 
         // Switching the active tab re-scopes the search to that buffer.
-        app.active = app
-            .tabs
+        let index = app
+            .editor
+            .tabs()
             .iter()
             .position(|t| t.text == "foo and foo and foo")
             .unwrap();
+        app.send(Command::SelectTab(index));
         app.recompute_matches();
         assert_eq!(app.search.matches.len(), 3);
 
@@ -2421,7 +2042,7 @@ mod tests {
     fn stepping_matches_wraps_around() {
         let dir = temp_dir("search-step");
         let mut app = app_with_two_tabs(&dir, "x x x", "");
-        app.search.query.pattern = "x".to_owned();
+        app.editor.search_query_mut().pattern = "x".to_owned();
         app.recompute_matches();
         assert_eq!(app.search.current, Some(0));
 
@@ -2444,21 +2065,22 @@ mod tests {
         let dir = temp_dir("search-replace-all");
         // Distinct contents so we can tell the two file tabs apart.
         let mut app = app_with_two_tabs(&dir, "cat cat", "cat in tab two");
-        let active = app.active;
+        let active = app.editor.active_index();
         let other = app
-            .tabs
+            .editor
+            .tabs()
             .iter()
             .position(|t| t.text == "cat in tab two")
             .unwrap();
 
-        app.search.query.pattern = "cat".to_owned();
+        app.editor.search_query_mut().pattern = "cat".to_owned();
         app.search.replacement = "dog".to_owned();
         app.recompute_matches();
         app.replace_all();
 
-        assert_eq!(app.tabs[active].text, "dog dog");
+        assert_eq!(app.editor.tabs()[active].text, "dog dog");
         // The inactive tab is untouched.
-        assert_eq!(app.tabs[other].text, "cat in tab two");
+        assert_eq!(app.editor.tabs()[other].text, "cat in tab two");
 
         fs::remove_dir_all(&dir).unwrap();
     }
@@ -2467,15 +2089,15 @@ mod tests {
     fn replace_current_replaces_one_match_and_advances() {
         let dir = temp_dir("search-replace-one");
         let mut app = app_with_two_tabs(&dir, "cat cat cat", "");
-        app.search.query.pattern = "cat".to_owned();
+        app.editor.search_query_mut().pattern = "cat".to_owned();
         app.search.replacement = "dog".to_owned();
         app.recompute_matches();
 
         // Replace the first match only.
         app.search.current = Some(0);
         app.replace_current();
-        let active = app.active;
-        assert_eq!(app.tabs[active].text, "dog cat cat");
+        let active = app.editor.active_index();
+        assert_eq!(app.editor.tabs()[active].text, "dog cat cat");
         // Two "cat" matches remain.
         assert_eq!(app.search.matches.len(), 2);
 
@@ -2486,14 +2108,14 @@ mod tests {
     fn regex_replace_expands_capture_groups() {
         let dir = temp_dir("search-regex-replace");
         let mut app = app_with_two_tabs(&dir, "user@host", "");
-        app.search.query.pattern = r"(\w+)@(\w+)".to_owned();
-        app.search.query.regex = true;
+        app.editor.search_query_mut().pattern = r"(\w+)@(\w+)".to_owned();
+        app.editor.search_query_mut().regex = true;
         app.search.replacement = "$2.$1".to_owned();
         app.recompute_matches();
         app.replace_all();
 
-        let active = app.active;
-        assert_eq!(app.tabs[active].text, "host.user");
+        let active = app.editor.active_index();
+        assert_eq!(app.editor.tabs()[active].text, "host.user");
 
         fs::remove_dir_all(&dir).unwrap();
     }
@@ -2503,21 +2125,21 @@ mod tests {
         let dir = temp_dir("search-live-edit");
         let mut app = app_with_two_tabs(&dir, "foo", "");
         app.search.open = true;
-        app.search.query.pattern = "foo".to_owned();
+        app.editor.search_query_mut().pattern = "foo".to_owned();
         app.recompute_matches();
         assert_eq!(app.search.matches.len(), 1);
 
         // Simulate a buffer edit that adds two more occurrences, the way the
         // editor mutates the active tab in place.
-        let active = app.active;
-        app.tabs[active].text = "foo foo foo".to_owned();
+        let active = app.editor.active_index();
+        app.editor.tabs_mut()[active].text = "foo foo foo".to_owned();
         // The same recompute the edit path triggers.
         app.recompute_matches();
 
         assert_eq!(app.search.matches, vec![0..3, 4..7, 8..11]);
 
         // And removing all occurrences clears the count.
-        app.tabs[active].text = "nothing here".to_owned();
+        app.editor.tabs_mut()[active].text = "nothing here".to_owned();
         app.recompute_matches();
         assert!(app.search.matches.is_empty());
         assert_eq!(app.search.current, None);
@@ -2529,8 +2151,8 @@ mod tests {
     fn invalid_regex_sets_inline_error_and_no_matches() {
         let dir = temp_dir("search-bad-regex");
         let mut app = app_with_two_tabs(&dir, "anything", "");
-        app.search.query.pattern = "(".to_owned();
-        app.search.query.regex = true;
+        app.editor.search_query_mut().pattern = "(".to_owned();
+        app.editor.search_query_mut().regex = true;
         app.recompute_matches();
 
         assert!(app.search.error.is_some());
@@ -2547,7 +2169,10 @@ mod tests {
 
         let store = Store::at(dir.join("state")).unwrap();
         let mut app = FrextApp::with_files(store, std::slice::from_ref(&file));
-        assert_eq!(app.tabs[app.active].path.as_deref(), Some(file.as_path()));
+        assert_eq!(
+            app.editor.active_tab().unwrap().path.as_deref(),
+            Some(file.as_path())
+        );
 
         app.rename_path(&file, "new.txt").unwrap();
 
@@ -2556,7 +2181,7 @@ mod tests {
         assert!(!file.exists());
         // The open tab now points at the new path.
         assert_eq!(
-            app.tabs[app.active].path.as_deref(),
+            app.editor.active_tab().unwrap().path.as_deref(),
             Some(renamed.as_path())
         );
 
@@ -2574,7 +2199,7 @@ mod tests {
         let store = Store::at(dir.join("state")).unwrap();
         let mut app = FrextApp::with_args(store, std::slice::from_ref(&file), Some(dir.as_path()));
         // Mark the sub-directory expanded so the rename must migrate it.
-        if let Some(ws) = app.workspace.as_mut() {
+        if let Some(ws) = app.editor.workspace_slot_mut().as_mut() {
             ws.set_expanded(&sub, true);
         }
 
@@ -2585,11 +2210,11 @@ mod tests {
         assert!(new_file.is_file());
         // The tab under the renamed directory was repointed.
         assert_eq!(
-            app.tabs[app.active].path.as_deref(),
+            app.editor.active_tab().unwrap().path.as_deref(),
             Some(new_file.as_path())
         );
         // The expanded-folder entry migrated to the new path.
-        let ws = app.workspace.as_ref().unwrap();
+        let ws = app.editor.workspace().unwrap();
         assert!(ws.is_expanded(&new_sub));
         assert!(!ws.is_expanded(&sub));
 
@@ -2626,14 +2251,24 @@ mod tests {
         let store = Store::at(dir.join("state")).unwrap();
         let mut app = FrextApp::with_files(store, &[inside.clone(), outside.clone()]);
         // Both files are open (alongside the initial untitled tab).
-        let opened: Vec<_> = app.tabs.iter().filter_map(|t| t.path.clone()).collect();
+        let opened: Vec<_> = app
+            .editor
+            .tabs()
+            .iter()
+            .filter_map(|t| t.path.clone())
+            .collect();
         assert!(opened.contains(&inside) && opened.contains(&outside));
 
         // Simulate the bookkeeping half of trashing the directory.
         app.close_tabs_under(&sub);
 
         // The tab inside the directory is gone; the outside one survives.
-        let remaining: Vec<_> = app.tabs.iter().filter_map(|t| t.path.clone()).collect();
+        let remaining: Vec<_> = app
+            .editor
+            .tabs()
+            .iter()
+            .filter_map(|t| t.path.clone())
+            .collect();
         assert!(remaining.contains(&outside));
         assert!(!remaining.contains(&inside));
 
@@ -2666,15 +2301,19 @@ mod tests {
     fn cut_deletes_the_selection_from_the_buffer() {
         let dir = temp_dir("editor-cut");
         let mut app = app_in(&dir);
-        app.tabs[app.active].text = "hello world".to_owned();
+        let active = app.editor.active_index();
+        app.editor.tabs_mut()[active].text = "hello world".to_owned();
 
         // Cut "hello " (chars 0..6).
-        let ctx = egui::Context::default();
-        let changed = app.apply_editor_action(&ctx, EditorAction::Cut, None, Some(0..6));
+        app.editor.set_selection(Some(0..6));
+        let changed = app.apply_editor_action(EditorAction::Cut);
 
         assert!(changed);
-        assert_eq!(app.tabs[app.active].text, "world");
-        assert_eq!(app.clipboard.read_text().as_deref(), Some("hello "));
+        assert_eq!(app.editor.active_tab().unwrap().text, "world");
+        assert_eq!(
+            app.editor.clipboard_mut().read_text().as_deref(),
+            Some("hello ")
+        );
 
         fs::remove_dir_all(&dir).unwrap();
     }
@@ -2683,15 +2322,16 @@ mod tests {
     fn paste_replaces_the_selection_with_clipboard_text() {
         let dir = temp_dir("editor-paste");
         let mut app = app_in(&dir);
-        app.tabs[app.active].text = "hello world".to_owned();
-        assert!(app.clipboard.write_text("there".to_owned()));
+        let active = app.editor.active_index();
+        app.editor.tabs_mut()[active].text = "hello world".to_owned();
+        assert!(app.editor.clipboard_mut().write_text("there".to_owned()));
 
         // Paste over "world" (chars 6..11).
-        let ctx = egui::Context::default();
-        let changed = app.apply_editor_action(&ctx, EditorAction::Paste, None, Some(6..11));
+        app.editor.set_selection(Some(6..11));
+        let changed = app.apply_editor_action(EditorAction::Paste);
 
         assert!(changed);
-        assert_eq!(app.tabs[app.active].text, "hello there");
+        assert_eq!(app.editor.active_tab().unwrap().text, "hello there");
 
         fs::remove_dir_all(&dir).unwrap();
     }
@@ -2700,13 +2340,14 @@ mod tests {
     fn paste_with_an_empty_clipboard_is_a_noop() {
         let dir = temp_dir("editor-paste-empty");
         let mut app = app_in(&dir);
-        app.tabs[app.active].text = "unchanged".to_owned();
+        let active = app.editor.active_index();
+        app.editor.tabs_mut()[active].text = "unchanged".to_owned();
 
-        let ctx = egui::Context::default();
-        let changed = app.apply_editor_action(&ctx, EditorAction::Paste, None, Some(0..2));
+        app.editor.set_selection(Some(0..2));
+        let changed = app.apply_editor_action(EditorAction::Paste);
 
         assert!(!changed);
-        assert_eq!(app.tabs[app.active].text, "unchanged");
+        assert_eq!(app.editor.active_tab().unwrap().text, "unchanged");
 
         fs::remove_dir_all(&dir).unwrap();
     }
@@ -2717,13 +2358,17 @@ mod tests {
         let nested = dir.join("a").join("b.txt");
 
         let store = Store::at(dir.join("state")).unwrap();
-        let mut app = FrextApp::with_args(store, &[], Some(dir.as_path()));
-        app.clipboard = Box::new(MemoryClipboard::default());
+        let mut app = FrextApp::from_editor(Editor::open(
+            store,
+            Box::new(MemoryClipboard::default()),
+            &[],
+            Some(dir.as_path()),
+        ));
 
         app.apply_tree_action(TreeAction::CopyPath(nested.clone()));
 
         assert_eq!(
-            app.clipboard.read_text(),
+            app.editor.clipboard_mut().read_text(),
             Some(nested.display().to_string())
         );
 
@@ -2736,13 +2381,17 @@ mod tests {
         let nested = dir.join("a").join("b.txt");
 
         let store = Store::at(dir.join("state")).unwrap();
-        let mut app = FrextApp::with_args(store, &[], Some(dir.as_path()));
-        app.clipboard = Box::new(MemoryClipboard::default());
+        let mut app = FrextApp::from_editor(Editor::open(
+            store,
+            Box::new(MemoryClipboard::default()),
+            &[],
+            Some(dir.as_path()),
+        ));
 
         app.apply_tree_action(TreeAction::CopyRelativePath(nested));
 
         assert_eq!(
-            app.clipboard.read_text(),
+            app.editor.clipboard_mut().read_text(),
             Some(PathBuf::from("a/b.txt").display().to_string())
         );
 
@@ -2753,14 +2402,18 @@ mod tests {
     fn copy_does_not_mutate_the_buffer() {
         let dir = temp_dir("editor-copy");
         let mut app = app_in(&dir);
-        app.tabs[app.active].text = "keep me".to_owned();
+        let active = app.editor.active_index();
+        app.editor.tabs_mut()[active].text = "keep me".to_owned();
 
-        let ctx = egui::Context::default();
-        let changed = app.apply_editor_action(&ctx, EditorAction::Copy, None, Some(0..4));
+        app.editor.set_selection(Some(0..4));
+        let changed = app.apply_editor_action(EditorAction::Copy);
 
         assert!(!changed);
-        assert_eq!(app.tabs[app.active].text, "keep me");
-        assert_eq!(app.clipboard.read_text().as_deref(), Some("keep"));
+        assert_eq!(app.editor.active_tab().unwrap().text, "keep me");
+        assert_eq!(
+            app.editor.clipboard_mut().read_text().as_deref(),
+            Some("keep")
+        );
 
         fs::remove_dir_all(&dir).unwrap();
     }
@@ -2771,8 +2424,7 @@ mod tests {
         let mut app = app_in(&dir);
         assert!(!app.search.open);
 
-        let ctx = egui::Context::default();
-        let changed = app.apply_editor_action(&ctx, EditorAction::Find, None, None);
+        let changed = app.apply_editor_action(EditorAction::Find);
 
         assert!(!changed);
         assert!(app.search.open);
@@ -2793,14 +2445,14 @@ mod tests {
     fn applying_a_suggestion_replaces_the_flagged_text() {
         let dir = temp_dir("editor-suggest");
         let mut app = app_in(&dir);
-        app.tabs[app.active].text = "café wrrod here".to_owned();
+        let active = app.editor.active_index();
+        app.editor.tabs_mut()[active].text = "café wrrod here".to_owned();
 
         // "wrrod" sits after a multi-byte char: bytes 6..11.
-        let ctx = egui::Context::default();
-        let changed = app.apply_editor_action(&ctx, suggestion(6..11, "wrrod", "word"), None, None);
+        let changed = app.apply_editor_action(suggestion(6..11, "wrrod", "word"));
 
         assert!(changed);
-        assert_eq!(app.tabs[app.active].text, "café word here");
+        assert_eq!(app.editor.active_tab().unwrap().text, "café word here");
 
         fs::remove_dir_all(&dir).unwrap();
     }
@@ -2811,13 +2463,13 @@ mod tests {
         let mut app = app_in(&dir);
         // The buffer was edited after the menu opened: the range no longer
         // holds the flagged word.
-        app.tabs[app.active].text = "a word here".to_owned();
+        let active = app.editor.active_index();
+        app.editor.tabs_mut()[active].text = "a word here".to_owned();
 
-        let ctx = egui::Context::default();
-        let changed = app.apply_editor_action(&ctx, suggestion(2..7, "wrrod", "word"), None, None);
+        let changed = app.apply_editor_action(suggestion(2..7, "wrrod", "word"));
 
         assert!(!changed);
-        assert_eq!(app.tabs[app.active].text, "a word here");
+        assert_eq!(app.editor.active_tab().unwrap().text, "a word here");
 
         fs::remove_dir_all(&dir).unwrap();
     }
@@ -2826,13 +2478,13 @@ mod tests {
     fn a_removal_suggestion_deletes_the_flagged_text() {
         let dir = temp_dir("editor-suggest-remove");
         let mut app = app_in(&dir);
-        app.tabs[app.active].text = "the the cat".to_owned();
+        let active = app.editor.active_index();
+        app.editor.tabs_mut()[active].text = "the the cat".to_owned();
 
-        let ctx = egui::Context::default();
-        let changed = app.apply_editor_action(&ctx, suggestion(0..4, "the ", ""), None, None);
+        let changed = app.apply_editor_action(suggestion(0..4, "the ", ""));
 
         assert!(changed);
-        assert_eq!(app.tabs[app.active].text, "the cat");
+        assert_eq!(app.editor.active_tab().unwrap().text, "the cat");
 
         fs::remove_dir_all(&dir).unwrap();
     }
@@ -2842,24 +2494,18 @@ mod tests {
         let dir = temp_dir("editor-dictionary");
         let mut app = app_in(&dir);
 
-        let ctx = egui::Context::default();
-        let changed = app.apply_editor_action(
-            &ctx,
-            EditorAction::AddToDictionary("frext".to_owned()),
-            None,
-            None,
-        );
+        let changed = app.apply_editor_action(EditorAction::AddToDictionary("frext".to_owned()));
 
         assert!(!changed, "the buffer is untouched");
         assert_eq!(
-            app.proofread.user_words().collect::<Vec<_>>(),
+            app.editor.proofread().user_words().collect::<Vec<_>>(),
             vec!["frext"]
         );
 
         // A fresh app over the same store loads the saved word.
         let reopened = app_in(&dir);
         assert_eq!(
-            reopened.proofread.user_words().collect::<Vec<_>>(),
+            reopened.editor.proofread().user_words().collect::<Vec<_>>(),
             vec!["frext"]
         );
 
@@ -2876,17 +2522,11 @@ mod tests {
         fs::write(state.join("dictionary.txt"), original).unwrap();
 
         let mut app = app_in(&dir);
-        let ctx = egui::Context::default();
-        app.apply_editor_action(
-            &ctx,
-            EditorAction::AddToDictionary("frext".to_owned()),
-            None,
-            None,
-        );
+        app.apply_editor_action(EditorAction::AddToDictionary("frext".to_owned()));
 
         // The word works for this session...
         assert_eq!(
-            app.proofread.user_words().collect::<Vec<_>>(),
+            app.editor.proofread().user_words().collect::<Vec<_>>(),
             vec!["frext"]
         );
         // ...but the unreadable file is left exactly as it was.
@@ -2900,8 +2540,7 @@ mod tests {
         let dir = temp_dir("editor-replace");
         let mut app = app_in(&dir);
 
-        let ctx = egui::Context::default();
-        app.apply_editor_action(&ctx, EditorAction::FindReplace, None, None);
+        app.apply_editor_action(EditorAction::FindReplace);
 
         assert!(app.search.open);
         assert!(app.search.replace_open);
