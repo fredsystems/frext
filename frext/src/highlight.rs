@@ -1,75 +1,47 @@
-//! Syntax highlighting, powered by [`syntect`] with the [`two_face`] syntax
-//! and theme bundles.
+//! Frontend-neutral syntax highlighting into styled byte spans.
 //!
-//! `egui_extras` ships a `syntect` backend, but it can only ever use
-//! syntect's default bundled syntaxes, which are missing many everyday
-//! languages (TOML, Nix, Zig, Dockerfile, …). frext therefore owns its own
-//! [`SyntaxSet`] sourced from [`two_face::syntax`], the curated `bat` syntax
-//! collection, which *does* include those languages, and drives `syntect`
-//! directly. The matching Catppuccin Mocha theme from [`two_face::theme`]
-//! keeps highlighting consistent with frext's editor theme.
-//!
-//! The language is auto-detected from a tab's file extension. syntect matches
-//! its Sublime-syntax definitions by extension, so the file suffix is handed
-//! to [`SyntaxSet::find_syntax_by_extension`] directly — no per-extension
-//! remapping is required, as the bundled syntaxes already declare their own
-//! aliases (`yml`, `bash`, `pyw`, …).
+//! [`highlight`] runs syntect (with the syntaxes and theme from
+//! [`crate::syntax`]) over a buffer and produces [`StyledSpan`]s: byte ranges
+//! with a plain [`Rgb`] foreground and font-style flags. [`overlay_matches`]
+//! then splits those spans so search matches carry a [`MatchBackground`]
+//! role. Each front end converts the spans and roles into its own text and
+//! colour types.
 
 use std::ops::Range;
-use std::path::Path;
-use std::sync::OnceLock;
 
-use eframe::egui::{
-    self, Color32, FontId, Stroke, TextStyle,
-    text::{ByteIndex, LayoutJob, LayoutSection, TextFormat},
-};
 use two_face::re_exports::syntect::{
-    easy::HighlightLines,
-    highlighting::{FontStyle, Theme},
-    parsing::SyntaxSet,
-    util::LinesWithEndings,
+    easy::HighlightLines, highlighting::FontStyle, util::LinesWithEndings,
 };
-use two_face::theme::EmbeddedThemeName;
 
-/// The owned highlighting resources: a syntax set with the extra `bat`
-/// languages and the Catppuccin Mocha theme that matches frext's UI.
-struct Highlighter {
-    syntaxes: SyntaxSet,
-    theme: Theme,
-}
+use crate::palette::Rgb;
 
-/// Lazily build (and cache) the highlighter. Loading the bundled dumps is not
-/// free, so it is done once and reused for the lifetime of the process.
-fn highlighter() -> &'static Highlighter {
-    static HIGHLIGHTER: OnceLock<Highlighter> = OnceLock::new();
-    HIGHLIGHTER.get_or_init(|| Highlighter {
-        syntaxes: two_face::syntax::extra_newlines(),
-        // `two_face::theme::extra()` returns a lazy set; clone the one theme
-        // we use out of it so we own a plain `Theme` for `HighlightLines`.
-        theme: two_face::theme::extra()
-            .get(EmbeddedThemeName::CatppuccinMocha)
-            .clone(),
-    })
-}
+/// Foreground of the unhighlighted plain-text fallback: a neutral light grey.
+const PLAIN_FG: Rgb = Rgb::new(220, 220, 220);
 
-/// The shared syntax set, so other modules (the proofreader's comment/string
-/// extraction) resolve languages exactly as the highlighter does.
-pub(crate) fn syntax_set() -> &'static SyntaxSet {
-    &highlighter().syntaxes
-}
-
-/// Map a file path to the file-extension token used to select a syntax.
+/// The background role of a search match.
 ///
-/// Returns an empty string when there is no usable extension; that selects the
-/// plain-text fallback, which is exactly right for untitled or extension-less
-/// buffers. The extension is forwarded to syntect verbatim (lowercased);
-/// syntect's bundled syntaxes already declare their own aliases.
-#[must_use]
-pub fn language_from_path(path: Option<&Path>) -> String {
-    path.and_then(Path::extension)
-        .and_then(|ext| ext.to_str())
-        .map(str::to_ascii_lowercase)
-        .unwrap_or_default()
+/// This is a role, not a colour: each front end maps it to its own colour.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MatchBackground {
+    /// A match that is not the currently-focused one.
+    Other,
+    /// The currently-focused match.
+    Current,
+}
+
+/// A run of text sharing one style.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StyledSpan {
+    /// Byte range of the run within the highlighted text.
+    pub bytes: Range<usize>,
+    /// Foreground colour.
+    pub fg: Rgb,
+    /// Search-match background role, if the run is part of a match.
+    pub background: Option<MatchBackground>,
+    /// Whether the run is italic.
+    pub italic: bool,
+    /// Whether the run is underlined.
+    pub underline: bool,
 }
 
 /// Search matches to paint over the syntax highlighting: every match range
@@ -83,96 +55,114 @@ pub struct MatchHighlights {
     pub current: Option<usize>,
 }
 
-/// Build a `layouter` closure suitable for [`egui::TextEdit::layouter`].
+/// Highlight `text` for the syntax identified by `language` (a file-extension
+/// token, see [`crate::syntax::language_from_path`]).
 ///
-/// The closure highlights the buffer for `language` (a file-extension token,
-/// see [`language_from_path`]) and lays the result out into a [`Galley`]. When
-/// the extension does not resolve to a known syntax the text is laid out
-/// unhighlighted, so the editor always renders. Any `matches` are painted on
-/// top with a background fill so search hits stand out.
-///
-/// [`Galley`]: egui::Galley
-pub fn layouter<'a>(
-    language: &'a str,
-    matches: &'a MatchHighlights,
-) -> impl FnMut(&egui::Ui, &dyn egui::TextBuffer, f32) -> std::sync::Arc<egui::Galley> + 'a {
-    move |ui: &egui::Ui, buf: &dyn egui::TextBuffer, wrap_width: f32| {
-        let font_id = ui
-            .style()
-            .override_font_id
-            .clone()
-            .unwrap_or_else(|| TextStyle::Monospace.resolve(ui.style()));
-        let mut job = layout_job(buf.as_str(), language, font_id, matches);
-        job.wrap.max_width = wrap_width;
-        ui.fonts_mut(|f| f.layout_job(job))
-    }
-}
-
-/// Build the styled [`LayoutJob`] for `text` without laying it out.
-///
-/// Highlights `text` for `language` (a file-extension token, see
-/// [`language_from_path`]) in `font_id`, then paints any search `matches` on
-/// top as background fills. This is exactly what [`layouter`] feeds to egui,
-/// minus the wrap width and galley layout, so it can be tested and
-/// benchmarked without a UI context.
+/// Spans are emitted in order and tile the text. Falls back to a single
+/// unstyled span covering the whole text when no syntax matches or
+/// highlighting fails part-way through.
 #[must_use]
-pub fn layout_job(
-    text: &str,
-    language: &str,
-    font_id: FontId,
-    matches: &MatchHighlights,
-) -> LayoutJob {
-    let mut job = highlight(text, language, font_id);
-    apply_match_highlights(&mut job, matches);
-    job
+pub fn highlight(text: &str, language: &str) -> Vec<StyledSpan> {
+    highlight_impl(text, language).unwrap_or_else(|| {
+        vec![StyledSpan {
+            bytes: 0..text.len(),
+            fg: PLAIN_FG,
+            background: None,
+            italic: false,
+            underline: false,
+        }]
+    })
 }
 
-/// Paint search-match backgrounds onto an already-built [`LayoutJob`].
+/// The fallible highlighting core: `None` signals "no syntax / parse error",
+/// at which point the caller renders plain text.
+fn highlight_impl(text: &str, language: &str) -> Option<Vec<StyledSpan>> {
+    let syntaxes = crate::syntax::syntax_set();
+    let syntax = syntaxes.find_syntax_by_extension(language)?;
+
+    let mut lines = HighlightLines::new(syntax, crate::syntax::theme());
+    let mut spans = Vec::new();
+
+    for line in LinesWithEndings::from(text) {
+        for (style, range) in lines.highlight_line(line, syntaxes).ok()? {
+            let fg = style.foreground;
+            spans.push(StyledSpan {
+                bytes: as_byte_range(text, range),
+                fg: Rgb {
+                    r: fg.r,
+                    g: fg.g,
+                    b: fg.b,
+                },
+                background: None,
+                italic: style.font_style.contains(FontStyle::ITALIC),
+                underline: style.font_style.contains(FontStyle::UNDERLINE),
+            });
+        }
+    }
+
+    Some(spans)
+}
+
+/// Translate a syntect string slice back into a byte range within `whole`.
 ///
-/// Each section that overlaps a match is split so the matched bytes carry the
-/// match background colour; the current match uses a brighter fill. Sections
-/// are kept sorted and non-overlapping, as egui requires.
-fn apply_match_highlights(job: &mut LayoutJob, matches: &MatchHighlights) {
+/// syntect yields sub-`&str`s that point into the line being highlighted,
+/// which itself points into `whole`; pointer arithmetic recovers the offset.
+/// The casts here are pointer-to-address comparisons, not lossy numeric
+/// conversions, and the offset is provably in-bounds because `range` is a
+/// slice of `whole`.
+fn as_byte_range(whole: &str, range: &str) -> Range<usize> {
+    let whole_start = whole.as_ptr() as usize;
+    let range_start = range.as_ptr() as usize;
+    let offset = range_start - whole_start;
+    offset..offset + range.len()
+}
+
+/// Paint search-match background roles onto already-highlighted `spans`.
+///
+/// Each span that overlaps a match is split so the matched bytes carry a
+/// [`MatchBackground`] role; the current match uses
+/// [`MatchBackground::Current`]. Spans stay sorted and non-overlapping. With
+/// no matches the spans are returned unchanged.
+#[must_use]
+pub fn overlay_matches(spans: Vec<StyledSpan>, matches: &MatchHighlights) -> Vec<StyledSpan> {
     if matches.ranges.is_empty() {
-        return;
+        return spans;
     }
 
     let current = matches.current.and_then(|i| matches.ranges.get(i)).cloned();
-    let other = crate::theme::search_match();
-    let current_color = crate::theme::search_current_match();
 
-    // Background colour for byte `b`, if it falls inside any match.
-    let bg_at = |b: usize| -> Option<Color32> {
+    // Background role for byte `b`, if it falls inside any match.
+    let bg_at = |b: usize| -> Option<MatchBackground> {
         if let Some(cur) = &current
             && cur.contains(&b)
         {
-            return Some(current_color);
+            return Some(MatchBackground::Current);
         }
         if matches.ranges.iter().any(|r| r.contains(&b)) {
-            Some(other)
+            Some(MatchBackground::Other)
         } else {
             None
         }
     };
 
-    let original = std::mem::take(&mut job.sections);
-    for section in original {
-        split_section_by_background(job, section, &bg_at);
+    let mut out = Vec::new();
+    for span in spans {
+        split_span_by_background(&mut out, span, &bg_at);
     }
+    out
 }
 
-/// Re-emit `section`, split at every byte where the search-match background
-/// colour changes, so matched runs carry a `background` and unmatched runs do
-/// not.
-fn split_section_by_background(
-    job: &mut LayoutJob,
-    section: LayoutSection,
-    bg_at: &impl Fn(usize) -> Option<Color32>,
+/// Re-emit `span`, split at every byte where the search-match background role
+/// changes, so matched runs carry a `background` and unmatched runs do not.
+fn split_span_by_background(
+    out: &mut Vec<StyledSpan>,
+    span: StyledSpan,
+    bg_at: &impl Fn(usize) -> Option<MatchBackground>,
 ) {
-    let start = section.byte_range.start.0;
-    let end = section.byte_range.end.0;
+    let start = span.bytes.start;
+    let end = span.bytes.end;
     if start >= end {
-        job.sections.push(section);
+        out.push(span);
         return;
     }
 
@@ -181,94 +171,29 @@ fn split_section_by_background(
     for b in (start + 1)..end {
         let bg = bg_at(b);
         if bg != run_bg {
-            job.sections
-                .push(sub_section(&section, run_start, b, run_bg));
+            out.push(sub_span(&span, run_start, b, run_bg));
             run_start = b;
             run_bg = bg;
         }
     }
-    job.sections
-        .push(sub_section(&section, run_start, end, run_bg));
+    out.push(sub_span(&span, run_start, end, run_bg));
 }
 
-/// Clone `section`'s format over the byte range `start..end`, setting (or
-/// clearing) the background fill.
-fn sub_section(
-    section: &LayoutSection,
+/// Clone `span`'s style over the byte range `start..end`, setting (or
+/// clearing) the background role.
+fn sub_span(
+    span: &StyledSpan,
     start: usize,
     end: usize,
-    background: Option<Color32>,
-) -> LayoutSection {
-    let mut format = section.format.clone();
-    format.background = background.unwrap_or(Color32::TRANSPARENT);
-    LayoutSection {
-        leading_space: section.leading_space,
-        byte_range: ByteIndex(start)..ByteIndex(end),
-        format,
+    background: Option<MatchBackground>,
+) -> StyledSpan {
+    StyledSpan {
+        bytes: start..end,
+        fg: span.fg,
+        background,
+        italic: span.italic,
+        underline: span.underline,
     }
-}
-
-/// Highlight `text` for the syntax identified by `language`, producing a
-/// [`LayoutJob`]. Falls back to a single unstyled section when no syntax
-/// matches or highlighting fails part-way through.
-fn highlight(text: &str, language: &str, font_id: FontId) -> LayoutJob {
-    highlight_impl(text, language, &font_id).unwrap_or_else(|| {
-        LayoutJob::simple(text.into(), font_id, Color32::LIGHT_GRAY, f32::INFINITY)
-    })
-}
-
-/// The fallible highlighting core: `None` signals "no syntax / parse error",
-/// at which point the caller renders plain text.
-fn highlight_impl(text: &str, language: &str, font_id: &FontId) -> Option<LayoutJob> {
-    let h = highlighter();
-    let syntax = h.syntaxes.find_syntax_by_extension(language)?;
-
-    let mut lines = HighlightLines::new(syntax, &h.theme);
-    let mut job = LayoutJob {
-        text: text.into(),
-        ..Default::default()
-    };
-
-    for line in LinesWithEndings::from(text) {
-        for (style, range) in lines.highlight_line(line, &h.syntaxes).ok()? {
-            let fg = style.foreground;
-            let color = Color32::from_rgb(fg.r, fg.g, fg.b);
-            let italics = style.font_style.contains(FontStyle::ITALIC);
-            let underline = if style.font_style.contains(FontStyle::UNDERLINE) {
-                Stroke::new(1.0, color)
-            } else {
-                Stroke::NONE
-            };
-            job.sections.push(LayoutSection {
-                leading_space: 0.0,
-                byte_range: as_byte_range(text, range),
-                format: TextFormat {
-                    font_id: font_id.clone(),
-                    color,
-                    italics,
-                    underline,
-                    ..Default::default()
-                },
-            });
-        }
-    }
-
-    Some(job)
-}
-
-/// Translate a syntect string slice back into a [`ByteIndex`] range within
-/// `whole`.
-///
-/// syntect yields sub-`&str`s that point into the line being highlighted,
-/// which itself points into `whole`; pointer arithmetic recovers the offset.
-/// The casts here are pointer-to-address comparisons, not lossy numeric
-/// conversions, and the offset is provably in-bounds because `range` is a
-/// slice of `whole`.
-fn as_byte_range(whole: &str, range: &str) -> std::ops::Range<ByteIndex> {
-    let whole_start = whole.as_ptr() as usize;
-    let range_start = range.as_ptr() as usize;
-    let offset = range_start - whole_start;
-    ByteIndex(offset)..ByteIndex(offset + range.len())
 }
 
 #[cfg(test)]
@@ -279,533 +204,116 @@ mod tests {
 
     use super::*;
 
+    /// A TOML buffer must produce highlighted spans rather than a single
+    /// plain fallback span.
     #[test]
-    fn no_path_yields_plain_text() {
-        assert_eq!(language_from_path(None), "");
-    }
-
-    #[test]
-    fn extensionless_path_yields_plain_text() {
-        assert_eq!(language_from_path(Some(Path::new("/etc/hostname"))), "");
-    }
-
-    #[test]
-    fn extension_is_lowercased_token() {
-        assert_eq!(language_from_path(Some(Path::new("main.rs"))), "rs");
-        assert_eq!(language_from_path(Some(Path::new("a.toml"))), "toml");
-        assert_eq!(language_from_path(Some(Path::new("a.nix"))), "nix");
-    }
-
-    #[test]
-    fn extension_matching_is_case_insensitive() {
-        // The token is the lowercased suffix; syntect resolves `yml` to YAML
-        // by its own extension aliases, so no remap to `yaml` is needed here.
-        assert_eq!(language_from_path(Some(Path::new("MAIN.RS"))), "rs");
-        assert_eq!(language_from_path(Some(Path::new("Config.YML"))), "yml");
-    }
-
-    /// The whole point of owning a `two_face` syntax set: extensions that
-    /// syntect's bundled defaults lack must now resolve to a real syntax.
-    #[test]
-    fn extra_languages_resolve_to_a_syntax() {
-        let h = highlighter();
-        for ext in ["toml", "nix", "zig", "dockerfile"] {
-            assert!(
-                h.syntaxes.find_syntax_by_extension(ext).is_some(),
-                "expected a syntax for .{ext}"
-            );
-        }
-    }
-
-    /// Common languages keep resolving, including suffix aliases that the old
-    /// hand-maintained remap table used to cover.
-    #[test]
-    fn common_extensions_resolve_to_a_syntax() {
-        let h = highlighter();
-        for ext in [
-            "rs", "py", "pyw", "yml", "yaml", "bash", "md", "json", "html",
-        ] {
-            assert!(
-                h.syntaxes.find_syntax_by_extension(ext).is_some(),
-                "expected a syntax for .{ext}"
-            );
-        }
-    }
-
-    /// A TOML buffer must produce highlighted sections rather than a single
-    /// plain fallback span — this is the regression the rewrite fixes.
-    #[test]
-    fn toml_is_highlighted_into_multiple_sections() {
-        let job = highlight(
-            "[package]\nname = \"frext\"\n",
-            "toml",
-            FontId::monospace(12.0),
-        );
+    fn toml_is_highlighted_into_multiple_spans() {
+        let spans = highlight("[package]\nname = \"frext\"\n", "toml");
         assert!(
-            job.sections.len() > 1,
-            "TOML should highlight into multiple styled sections, got {}",
-            job.sections.len()
+            spans.len() > 1,
+            "TOML should highlight into multiple styled spans, got {}",
+            spans.len()
         );
     }
 
     #[test]
     fn unknown_extension_falls_back_to_plain_text() {
-        let job = highlight(
-            "just some text",
-            "definitelynotalang",
-            FontId::monospace(12.0),
+        let spans = highlight("just some text", "definitelynotalang");
+        // The plain fallback is a single span covering the whole buffer.
+        assert_eq!(
+            spans,
+            vec![StyledSpan {
+                bytes: 0.."just some text".len(),
+                fg: Rgb::new(220, 220, 220),
+                background: None,
+                italic: false,
+                underline: false,
+            }]
         );
-        // The plain fallback is a single section covering the whole buffer.
-        assert_eq!(job.sections.len(), 1);
     }
 
-    /// Build the plain (single-section) job for `text`, used by the
+    #[test]
+    fn empty_text_with_a_known_language_yields_no_spans() {
+        assert!(highlight("", "rs").is_empty());
+    }
+
+    #[test]
+    fn empty_text_with_an_unknown_language_yields_one_empty_span() {
+        let spans = highlight("", "definitelynotalang");
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].bytes, 0..0);
+    }
+
+    #[test]
+    fn highlighted_spans_tile_the_text_contiguously() {
+        let text = "fn main() {\n    let x = \"hi\"; // greet\n    println!(\"{x}\");\n}\n";
+        let spans = highlight(text, "rs");
+        assert!(spans.len() > 1);
+        let mut next = 0;
+        for span in &spans {
+            assert_eq!(span.bytes.start, next, "gap or overlap at {span:?}");
+            next = span.bytes.end;
+        }
+        assert_eq!(next, text.len());
+    }
+
+    /// Build the plain (single-span) highlighting for `text`, used by the
     /// match-highlight tests below.
-    fn plain_job(text: &str) -> LayoutJob {
-        highlight(text, "definitelynotalang", FontId::monospace(12.0))
+    fn plain_spans(text: &str) -> Vec<StyledSpan> {
+        highlight(text, "definitelynotalang")
     }
 
-    /// Sections that carry a non-transparent background, as `(start, end)`
-    /// byte pairs.
-    fn highlighted_ranges(job: &LayoutJob) -> Vec<(usize, usize)> {
-        job.sections
+    /// Spans that carry a background role, as `(start, end)` byte pairs.
+    fn highlighted_ranges(spans: &[StyledSpan]) -> Vec<(usize, usize)> {
+        spans
             .iter()
-            .filter(|s| s.format.background != Color32::TRANSPARENT)
-            .map(|s| (s.byte_range.start.0, s.byte_range.end.0))
+            .filter(|s| s.background.is_some())
+            .map(|s| (s.bytes.start, s.bytes.end))
             .collect()
     }
 
     #[test]
-    fn no_matches_leaves_the_job_untouched() {
-        let mut job = plain_job("hello world");
-        let before = job.sections.len();
-        apply_match_highlights(&mut job, &MatchHighlights::default());
-        assert_eq!(job.sections.len(), before);
-        assert!(highlighted_ranges(&job).is_empty());
+    fn no_matches_leaves_the_spans_untouched() {
+        let spans = plain_spans("hello world");
+        let after = overlay_matches(spans.clone(), &MatchHighlights::default());
+        assert_eq!(after, spans);
+        assert!(highlighted_ranges(&after).is_empty());
     }
 
     #[test]
     fn matches_get_background_runs_covering_exactly_the_match_bytes() {
-        let mut job = plain_job("foo bar foo");
         let matches = MatchHighlights {
             ranges: vec![0..3, 8..11],
             current: None,
         };
-        apply_match_highlights(&mut job, &matches);
+        let spans = overlay_matches(plain_spans("foo bar foo"), &matches);
 
-        // Every original byte is still covered (sections remain contiguous).
-        let total: usize = job
-            .sections
-            .iter()
-            .map(|s| s.byte_range.end.0 - s.byte_range.start.0)
-            .sum();
+        // Every original byte is still covered (spans remain contiguous).
+        let total: usize = spans.iter().map(|s| s.bytes.end - s.bytes.start).sum();
         assert_eq!(total, "foo bar foo".len());
 
         // The highlighted runs line up with the match byte ranges.
-        assert_eq!(highlighted_ranges(&job), vec![(0, 3), (8, 11)]);
-    }
-
-    const GOLDEN_SNIPPET: &str = concat!(
-        "/// Adds two numbers.\n",
-        "fn add(a: i32, b: i32) -> i32 {\n",
-        "    // sum them\n",
-        "    let label = \"total\";\n",
-        "    a + b + 42\n",
-        "}\n",
-    );
-
-    /// Characterisation test pinning the exact output of [`layout_job`] for a
-    /// small Rust snippet with two search matches -- `numbers` (13..20) and
-    /// the current match `total";` (87..94, excluding the opening quote) --
-    /// so any change to highlighting or match painting is caught
-    /// pixel-for-pixel.
-    #[test]
-    fn layout_job_matches_golden_sections() {
-        let matches = MatchHighlights {
-            // `numbers` inside the doc comment (13..20), and `total";`
-            // (87..94, current; the opening quote at 86 is outside the
-            // match), which spans several syntax sections.
-            ranges: vec![13..20, 87..94],
-            current: Some(1),
-        };
-        let job = layout_job(GOLDEN_SNIPPET, "rs", FontId::monospace(12.0), &matches);
-
-        assert_eq!(job.text, GOLDEN_SNIPPET);
-
-        let actual: Vec<(Range<usize>, Color32, bool, Stroke, Color32)> = job
-            .sections
-            .iter()
-            .map(|s| {
-                (
-                    s.byte_range.start.0..s.byte_range.end.0,
-                    s.format.color,
-                    s.format.italics,
-                    s.format.underline,
-                    s.format.background,
-                )
-            })
-            .collect();
-        let match_bg = Color32::from_rgba_premultiplied(88, 91, 112, 255);
-        let current_bg = Color32::from_rgba_premultiplied(75, 99, 138, 140);
-        let expected: Vec<(Range<usize>, Color32, bool, Stroke, Color32)> = vec![
-            (
-                0..3,
-                Color32::from_rgb(147, 153, 178),
-                true,
-                Stroke::NONE,
-                Color32::TRANSPARENT,
-            ), // "///"
-            (
-                3..13,
-                Color32::from_rgb(147, 153, 178),
-                true,
-                Stroke::NONE,
-                Color32::TRANSPARENT,
-            ), // " Adds two "
-            (
-                13..20,
-                Color32::from_rgb(147, 153, 178),
-                true,
-                Stroke::NONE,
-                match_bg,
-            ), // "numbers"
-            (
-                20..22,
-                Color32::from_rgb(147, 153, 178),
-                true,
-                Stroke::NONE,
-                Color32::TRANSPARENT,
-            ), // ".\n"
-            (
-                22..24,
-                Color32::from_rgb(203, 166, 247),
-                false,
-                Stroke::NONE,
-                Color32::TRANSPARENT,
-            ), // "fn"
-            (
-                24..25,
-                Color32::from_rgb(205, 214, 244),
-                false,
-                Stroke::NONE,
-                Color32::TRANSPARENT,
-            ), // " "
-            (
-                25..28,
-                Color32::from_rgb(137, 180, 250),
-                true,
-                Stroke::NONE,
-                Color32::TRANSPARENT,
-            ), // "add"
-            (
-                28..29,
-                Color32::from_rgb(147, 153, 178),
-                false,
-                Stroke::NONE,
-                Color32::TRANSPARENT,
-            ), // "("
-            (
-                29..30,
-                Color32::from_rgb(235, 160, 172),
-                true,
-                Stroke::NONE,
-                Color32::TRANSPARENT,
-            ), // "a"
-            (
-                30..31,
-                Color32::from_rgb(147, 153, 178),
-                false,
-                Stroke::NONE,
-                Color32::TRANSPARENT,
-            ), // ":"
-            (
-                31..32,
-                Color32::from_rgb(235, 160, 172),
-                true,
-                Stroke::NONE,
-                Color32::TRANSPARENT,
-            ), // " "
-            (
-                32..35,
-                Color32::from_rgb(203, 166, 247),
-                false,
-                Stroke::NONE,
-                Color32::TRANSPARENT,
-            ), // "i32"
-            (
-                35..37,
-                Color32::from_rgb(235, 160, 172),
-                true,
-                Stroke::NONE,
-                Color32::TRANSPARENT,
-            ), // ", "
-            (
-                37..38,
-                Color32::from_rgb(235, 160, 172),
-                true,
-                Stroke::NONE,
-                Color32::TRANSPARENT,
-            ), // "b"
-            (
-                38..39,
-                Color32::from_rgb(147, 153, 178),
-                false,
-                Stroke::NONE,
-                Color32::TRANSPARENT,
-            ), // ":"
-            (
-                39..40,
-                Color32::from_rgb(235, 160, 172),
-                true,
-                Stroke::NONE,
-                Color32::TRANSPARENT,
-            ), // " "
-            (
-                40..43,
-                Color32::from_rgb(203, 166, 247),
-                false,
-                Stroke::NONE,
-                Color32::TRANSPARENT,
-            ), // "i32"
-            (
-                43..44,
-                Color32::from_rgb(147, 153, 178),
-                false,
-                Stroke::NONE,
-                Color32::TRANSPARENT,
-            ), // ")"
-            (
-                44..45,
-                Color32::from_rgb(205, 214, 244),
-                false,
-                Stroke::NONE,
-                Color32::TRANSPARENT,
-            ), // " "
-            (
-                45..47,
-                Color32::from_rgb(147, 153, 178),
-                false,
-                Stroke::NONE,
-                Color32::TRANSPARENT,
-            ), // "->"
-            (
-                47..48,
-                Color32::from_rgb(205, 214, 244),
-                false,
-                Stroke::NONE,
-                Color32::TRANSPARENT,
-            ), // " "
-            (
-                48..51,
-                Color32::from_rgb(203, 166, 247),
-                false,
-                Stroke::NONE,
-                Color32::TRANSPARENT,
-            ), // "i32"
-            (
-                51..52,
-                Color32::from_rgb(205, 214, 244),
-                false,
-                Stroke::NONE,
-                Color32::TRANSPARENT,
-            ), // " "
-            (
-                52..53,
-                Color32::from_rgb(147, 153, 178),
-                false,
-                Stroke::NONE,
-                Color32::TRANSPARENT,
-            ), // "{"
-            (
-                53..54,
-                Color32::from_rgb(205, 214, 244),
-                false,
-                Stroke::NONE,
-                Color32::TRANSPARENT,
-            ), // "\n"
-            (
-                54..58,
-                Color32::from_rgb(205, 214, 244),
-                false,
-                Stroke::NONE,
-                Color32::TRANSPARENT,
-            ), // "    "
-            (
-                58..60,
-                Color32::from_rgb(147, 153, 178),
-                true,
-                Stroke::NONE,
-                Color32::TRANSPARENT,
-            ), // "//"
-            (
-                60..70,
-                Color32::from_rgb(147, 153, 178),
-                true,
-                Stroke::NONE,
-                Color32::TRANSPARENT,
-            ), // " sum them\n"
-            (
-                70..74,
-                Color32::from_rgb(205, 214, 244),
-                false,
-                Stroke::NONE,
-                Color32::TRANSPARENT,
-            ), // "    "
-            (
-                74..77,
-                Color32::from_rgb(203, 166, 247),
-                false,
-                Stroke::NONE,
-                Color32::TRANSPARENT,
-            ), // "let"
-            (
-                77..84,
-                Color32::from_rgb(205, 214, 244),
-                false,
-                Stroke::NONE,
-                Color32::TRANSPARENT,
-            ), // " label "
-            (
-                84..85,
-                Color32::from_rgb(148, 226, 213),
-                false,
-                Stroke::NONE,
-                Color32::TRANSPARENT,
-            ), // "="
-            (
-                85..86,
-                Color32::from_rgb(205, 214, 244),
-                false,
-                Stroke::NONE,
-                Color32::TRANSPARENT,
-            ), // " "
-            (
-                86..87,
-                Color32::from_rgb(166, 227, 161),
-                false,
-                Stroke::NONE,
-                Color32::TRANSPARENT,
-            ), // "\""
-            (
-                87..92,
-                Color32::from_rgb(166, 227, 161),
-                false,
-                Stroke::NONE,
-                current_bg,
-            ), // "total"
-            (
-                92..93,
-                Color32::from_rgb(166, 227, 161),
-                false,
-                Stroke::NONE,
-                current_bg,
-            ), // "\""
-            (
-                93..94,
-                Color32::from_rgb(147, 153, 178),
-                false,
-                Stroke::NONE,
-                current_bg,
-            ), // ";"
-            (
-                94..95,
-                Color32::from_rgb(205, 214, 244),
-                false,
-                Stroke::NONE,
-                Color32::TRANSPARENT,
-            ), // "\n"
-            (
-                95..101,
-                Color32::from_rgb(205, 214, 244),
-                false,
-                Stroke::NONE,
-                Color32::TRANSPARENT,
-            ), // "    a "
-            (
-                101..102,
-                Color32::from_rgb(148, 226, 213),
-                false,
-                Stroke::NONE,
-                Color32::TRANSPARENT,
-            ), // "+"
-            (
-                102..105,
-                Color32::from_rgb(205, 214, 244),
-                false,
-                Stroke::NONE,
-                Color32::TRANSPARENT,
-            ), // " b "
-            (
-                105..106,
-                Color32::from_rgb(148, 226, 213),
-                false,
-                Stroke::NONE,
-                Color32::TRANSPARENT,
-            ), // "+"
-            (
-                106..107,
-                Color32::from_rgb(205, 214, 244),
-                false,
-                Stroke::NONE,
-                Color32::TRANSPARENT,
-            ), // " "
-            (
-                107..109,
-                Color32::from_rgb(250, 179, 135),
-                false,
-                Stroke::NONE,
-                Color32::TRANSPARENT,
-            ), // "42"
-            (
-                109..110,
-                Color32::from_rgb(205, 214, 244),
-                false,
-                Stroke::NONE,
-                Color32::TRANSPARENT,
-            ), // "\n"
-            (
-                110..111,
-                Color32::from_rgb(147, 153, 178),
-                false,
-                Stroke::NONE,
-                Color32::TRANSPARENT,
-            ), // "}"
-            (
-                111..112,
-                Color32::from_rgb(205, 214, 244),
-                false,
-                Stroke::NONE,
-                Color32::TRANSPARENT,
-            ), // "\n"
-        ];
-        assert_eq!(actual, expected);
+        assert_eq!(highlighted_ranges(&spans), vec![(0, 3), (8, 11)]);
     }
 
     #[test]
     fn current_match_uses_a_distinct_background() {
-        let mut job = plain_job("foo foo");
         let matches = MatchHighlights {
             ranges: vec![0..3, 4..7],
             current: Some(1),
         };
-        apply_match_highlights(&mut job, &matches);
+        let spans = overlay_matches(plain_spans("foo foo"), &matches);
 
-        let current_bg = crate::theme::search_current_match();
-        let other_bg = crate::theme::search_match();
-
-        let current_section = job
-            .sections
+        let current_span = spans
             .iter()
-            .find(|s| s.byte_range.start.0 == 4)
-            .expect("a section starting at the current match");
-        let other_section = job
-            .sections
+            .find(|s| s.bytes.start == 4)
+            .expect("a span starting at the current match");
+        let other_span = spans
             .iter()
-            .find(|s| s.byte_range.start.0 == 0)
-            .expect("a section starting at the other match");
+            .find(|s| s.bytes.start == 0)
+            .expect("a span starting at the other match");
 
-        assert_eq!(current_section.format.background, current_bg);
-        assert_eq!(other_section.format.background, other_bg);
-        assert_ne!(current_bg, other_bg);
+        assert_eq!(current_span.background, Some(MatchBackground::Current));
+        assert_eq!(other_span.background, Some(MatchBackground::Other));
     }
 }

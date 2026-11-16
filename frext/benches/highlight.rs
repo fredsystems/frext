@@ -1,6 +1,6 @@
 //! Benchmarks for building the editor's highlighted [`LayoutJob`].
 //!
-//! Measures [`frext::highlight::layout_job`] -- syntect highlighting plus
+//! Measures [`frext::editor_layout::layout_job`] -- syntect highlighting plus
 //! search-match painting, without egui galley layout -- over a deterministic
 //! 5,000-line synthetic Rust source: highlighted as Rust, highlighted as Rust
 //! with 200 search matches painted on top, and as plain text.
@@ -11,7 +11,8 @@ use std::hint::black_box;
 
 use criterion::{Criterion, criterion_group, criterion_main};
 use eframe::egui::FontId;
-use frext::highlight::{MatchHighlights, layout_job};
+use frext::editor_layout::layout_job;
+use frext::highlight::MatchHighlights;
 use frext::search::SearchQuery;
 
 /// A fixed 50-line Rust template; repeated [`REPEATS`] times to build the

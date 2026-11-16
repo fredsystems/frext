@@ -7,6 +7,7 @@
 pub mod app;
 pub mod clipboard;
 pub mod edit_ops;
+pub mod editor_layout;
 pub mod error;
 pub mod file_icon;
 mod file_icon_bytes;
@@ -19,6 +20,7 @@ pub mod palette;
 pub mod persistence;
 pub mod proofread;
 pub mod search;
+pub mod syntax;
 pub mod tab;
 pub mod theme;
 pub mod workspace;
