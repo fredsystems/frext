@@ -65,9 +65,16 @@ view. Real editing arrives in plan 03, the sidebar in 05.
     existing sessions survive.
   - TUI: `$XDG_STATE_HOME/frext/term/{session.json,swap/}`.
   - Both: `$XDG_STATE_HOME/frext/dictionary.txt`. Adding a word becomes
-    "re-read, union, write atomically (temp file + rename)", so neither
-    process overwrites words the other added. This is a change to
-    `frext-core::persistence` and lands in this plan with tests.
+    "re-read, union, write atomically (temp file + rename)", with that
+    whole sequence run under an exclusive advisory lock on a sidecar
+    `dictionary.txt.lock` (`flock`-style, via `std::fs::File::lock`,
+    stable since Rust 1.89 and below the workspace MSRV of 1.95, so no
+    new dependency). Without the lock both processes could read before
+    either renames and one word would be lost. The lock is held only
+    for that sequence, and the rename stays atomic so readers never see
+    a partial file. This is a change to `frext-core::persistence` and
+    lands in this plan with tests, including two writers interleaving
+    (each adds a different word; both words survive).
   - Two instances of the **same** front end sharing one session is an
     existing limitation and stays out of scope.
 - **Non-modal, GUI-parity keybindings.** Ctrl+N / Ctrl+O / Ctrl+S /
