@@ -832,6 +832,31 @@ Stop: report and await review.
   into another application on Wayland.
 - **Scheduling:** before the PR is marked `pending merge`.
 
+### 01.15 -- Fix: clipboard features dropped from the build
+
+- **Surfaced:** manual re-check after 01.14 (`bc22435`), Hyprland
+  (Wayland, XWayland present): no copy worked, including Ctrl+C in the
+  editor buffer. 01.14 is necessary but not sufficient.
+- **Causes (both pre-existing on `main`):**
+  1. The egui 0.37 bump (`1895a1a`) made eframe's clipboard support an
+     opt-in `clipboard` feature. frext builds eframe with
+     `default-features = false` and never enabled it, so egui's own
+     clipboard (`smithay-clipboard`, used by `TextEdit` Ctrl+C/X/V) is
+     compiled out.
+  2. arboard is built with `default-features = false`, which omits its
+     `wayland-data-control` backend, so it uses X11 through XWayland.
+     wlroots-style compositors only sync an X11 selection to Wayland
+     while an X11 window has focus, and frext's window is native Wayland,
+     so arboard's writes never reach Wayland clients.
+- **Scope of fix:** root `Cargo.toml` feature lists (eframe:
+  `clipboard`; arboard: `wayland-data-control`) and `Cargo.lock`.
+- **Verification:** standard ritual, `nix build .#frext`,
+  `cargo deny check`, `cargo tree -p frext-core` still free of UI
+  toolkits; manual: Ctrl+C in the buffer, context-menu Copy/Cut/Paste,
+  Copy Path and Copy Relative Path, each pasted into another Wayland
+  application.
+- **Scheduling:** before the PR is marked `pending merge`.
+
 ## Manual smoke checklist (whole plan)
 
 The GUI is not covered by UI tests, so before the PR is marked
