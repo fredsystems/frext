@@ -28,13 +28,20 @@ pub enum BufferChange {
 pub enum Effect {
     /// Set the editor's selection (a char range; empty = caret).
     SetSelection {
+        /// The tab whose editor the effect applies to; a front end ignores
+        /// it for any other tab.
+        tab_id: u64,
         /// The selected char range; an empty range is a collapsed caret.
         chars: Range<usize>,
         /// Whether the editor should also take keyboard focus.
         focus: EditorFocus,
     },
     /// Scroll the editor so its selection is visible, centred.
-    RevealSelection,
+    RevealSelection {
+        /// The tab whose editor the effect applies to; a front end ignores
+        /// it for any other tab.
+        tab_id: u64,
+    },
     /// Give keyboard focus to the find field.
     FocusSearchField,
     /// Give keyboard focus to the active prompt's text field.

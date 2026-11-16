@@ -241,9 +241,9 @@ pub enum BufferChange { Unchanged, Edited }
 
 pub enum Effect {
     /// Set the editor's selection (a char range; empty = caret).
-    SetSelection { chars: Range<usize>, focus: EditorFocus },
+    SetSelection { tab_id: u64, chars: Range<usize>, focus: EditorFocus },
     /// Scroll the editor so its selection is visible, centred.
-    RevealSelection,
+    RevealSelection { tab_id: u64 },
     /// Give keyboard focus to the find field.
     FocusSearchField,
     /// Give keyboard focus to the active prompt's text field.
@@ -252,6 +252,10 @@ pub enum Effect {
 
 pub enum EditorFocus { Focus, Keep }
 ```
+
+Selection effects carry the id of the tab they target, so a tab switch
+between queueing and applying them can never move one tab's caret onto
+another (01.16 J).
 
 These replace every place the controller pokes view state today:
 `store_caret` and Select All become `SetSelection { focus: Focus }`;

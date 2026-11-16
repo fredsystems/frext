@@ -34,10 +34,12 @@ pub struct FrextApp {
 /// before anything renders.
 #[derive(Default)]
 struct FrameEffects {
-    /// The last `SetSelection` queued, applied to the editor before it renders.
-    selection: Option<(Range<usize>, EditorFocus)>,
-    /// Scroll the editor so its selection is visible (`RevealSelection`).
-    reveal: bool,
+    /// The last `SetSelection` queued (target tab id, chars, focus), applied
+    /// to that tab's editor before it renders.
+    selection: Option<(u64, Range<usize>, EditorFocus)>,
+    /// The tab whose editor should scroll its selection into view
+    /// (`RevealSelection`).
+    reveal: Option<u64>,
     /// Focus the find field (`FocusSearchField`).
     focus_search: bool,
     /// Focus the name prompt's field (`FocusPromptField`).
@@ -111,8 +113,12 @@ impl FrextApp {
         let mut frame = FrameEffects::default();
         for effect in self.effects.drain(..) {
             match effect {
-                Effect::SetSelection { chars, focus } => frame.selection = Some((chars, focus)),
-                Effect::RevealSelection => frame.reveal = true,
+                Effect::SetSelection {
+                    tab_id,
+                    chars,
+                    focus,
+                } => frame.selection = Some((tab_id, chars, focus)),
+                Effect::RevealSelection { tab_id } => frame.reveal = Some(tab_id),
                 Effect::FocusSearchField => frame.focus_search = true,
                 Effect::FocusPromptField => frame.focus_prompt = true,
             }
@@ -1016,8 +1022,11 @@ impl eframe::App for FrextApp {
                                 .inner_margin(egui::Margin::symmetric(4, 2));
                             let editor_id = egui::Id::unique(("frext_editor", tab.id));
                             // Apply a queued selection (and focus) before the
-                            // editor reads its state this frame.
-                            if let Some((chars, focus)) = &effects.selection {
+                            // editor reads its state this frame, only when it
+                            // targets the tab being rendered.
+                            if let Some((tab_id, chars, focus)) = &effects.selection
+                                && *tab_id == tab.id
+                            {
                                 let mut state =
                                     egui::text_edit::TextEditState::load(ui.ctx(), editor_id)
                                         .unwrap_or_default();
@@ -1080,9 +1089,9 @@ impl eframe::App for FrextApp {
                                     });
                             }
 
-                            // A queued `RevealSelection`: scroll the editor's
-                            // selection into view.
-                            if effects.reveal {
+                            // A queued `RevealSelection` for this tab: scroll
+                            // the editor's selection into view.
+                            if effects.reveal == Some(tab.id) {
                                 output.response.scroll_to_me(Some(egui::Align::Center));
                             }
 

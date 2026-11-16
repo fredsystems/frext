@@ -210,10 +210,11 @@ impl Editor {
             let chars =
                 offsets::char_of_byte(&tab.text, m.start)..offsets::char_of_byte(&tab.text, m.end);
             effects.push(Effect::SetSelection {
+                tab_id: tab.id,
                 chars,
                 focus: EditorFocus::Keep,
             });
-            effects.push(Effect::RevealSelection);
+            effects.push(Effect::RevealSelection { tab_id: tab.id });
         }
         Outcome {
             buffer: BufferChange::Unchanged,
@@ -605,14 +606,16 @@ mod tests {
         let outcome = editor.apply(Command::StepMatch(StepDirection::Forward));
 
         assert_eq!(editor.search().current(), Some(1));
+        let tab_id = editor.active_tab().unwrap().id;
         assert_eq!(
             outcome.effects,
             vec![
                 Effect::SetSelection {
+                    tab_id,
                     chars: 14..17,
                     focus: EditorFocus::Keep,
                 },
-                Effect::RevealSelection,
+                Effect::RevealSelection { tab_id },
             ]
         );
 
@@ -990,6 +993,58 @@ mod tests {
 
         assert_eq!(outcome.buffer, BufferChange::Edited);
         assert_eq!(editor.active_tab().unwrap().text, "dog dog");
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn selection_effects_name_the_tab_they_target() {
+        let dir = temp_dir("effects-name-tab");
+        let mut editor = editor_with_two_tabs(&dir, "foo foo", "other");
+        let first = editor.active_tab().unwrap().id;
+        find(&mut editor, "foo");
+
+        let stepped = editor.apply(Command::StepMatch(StepDirection::Forward));
+        editor.set_selection(Some(0..4));
+        let cut = editor.apply(Command::Cut);
+
+        assert_eq!(
+            stepped.effects,
+            vec![
+                Effect::SetSelection {
+                    tab_id: first,
+                    chars: 4..7,
+                    focus: EditorFocus::Keep,
+                },
+                Effect::RevealSelection { tab_id: first },
+            ]
+        );
+        assert_eq!(
+            cut.effects,
+            vec![Effect::SetSelection {
+                tab_id: first,
+                chars: 0..0,
+                focus: EditorFocus::Focus,
+            }]
+        );
+
+        // After a switch the queued effects still name the original tab, not
+        // the newly active one.
+        let other = editor
+            .tabs()
+            .iter()
+            .position(|t| t.text == "other")
+            .unwrap();
+        editor.apply(Command::SelectTab(other));
+        let now_active = editor.active_tab().unwrap().id;
+        assert_ne!(now_active, first);
+        for effect in stepped.effects.iter().chain(&cut.effects) {
+            let (Effect::SetSelection { tab_id, .. } | Effect::RevealSelection { tab_id }) = effect
+            else {
+                panic!("unexpected effect {effect:?}");
+            };
+            assert_eq!(*tab_id, first);
+        }
 
         fs::remove_dir_all(&dir).unwrap();
     }

@@ -69,6 +69,7 @@ impl Editor {
         if let Some(tab) = self.tabs.get(self.active) {
             let len = tab.text.chars().count();
             outcome.effects.push(Effect::SetSelection {
+                tab_id: tab.id,
                 chars: 0..len,
                 focus: EditorFocus::Focus,
             });
@@ -127,12 +128,19 @@ impl Editor {
     /// search, and move the (focused) caret to `caret`.
     fn edited_with_caret(&mut self, caret: usize) -> Outcome {
         self.commit_edit();
-        Outcome {
-            buffer: BufferChange::Edited,
-            effects: vec![Effect::SetSelection {
+        let effects = self
+            .tabs
+            .get(self.active)
+            .map(|tab| Effect::SetSelection {
+                tab_id: tab.id,
                 chars: caret..caret,
                 focus: EditorFocus::Focus,
-            }],
+            })
+            .into_iter()
+            .collect();
+        Outcome {
+            buffer: BufferChange::Edited,
+            effects,
         }
     }
 }
@@ -186,8 +194,10 @@ mod tests {
         }
     }
 
-    fn caret(chars: usize) -> Vec<Effect> {
+    /// The effect placing a focused caret at `chars` in the active tab.
+    fn caret(editor: &Editor, chars: usize) -> Vec<Effect> {
         vec![Effect::SetSelection {
+            tab_id: editor.active_tab().unwrap().id,
             chars: chars..chars,
             focus: EditorFocus::Focus,
         }]
@@ -219,7 +229,7 @@ mod tests {
         let outcome = editor.apply(Command::Cut);
 
         assert_eq!(editor.active_tab().unwrap().text, "hellorld");
-        assert_eq!(outcome.effects, caret(4));
+        assert_eq!(outcome.effects, caret(&editor, 4));
 
         fs::remove_dir_all(&dir).unwrap();
     }
@@ -298,7 +308,7 @@ mod tests {
 
         assert_eq!(outcome.buffer, BufferChange::Edited);
         assert_eq!(editor.active_tab().unwrap().text, "café naïve ");
-        assert_eq!(outcome.effects, caret(11));
+        assert_eq!(outcome.effects, caret(&editor, 11));
 
         fs::remove_dir_all(&dir).unwrap();
     }
@@ -343,6 +353,7 @@ mod tests {
         assert_eq!(
             outcome.effects,
             vec![Effect::SetSelection {
+                tab_id: editor.active_tab().unwrap().id,
                 chars: 0..10,
                 focus: EditorFocus::Focus,
             }]
