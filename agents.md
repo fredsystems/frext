@@ -26,6 +26,10 @@ frext (binary + library)
     persistence.rs  -- swap-file autosave + session index (Store)
     workspace.rs    -- file-tree sidebar model (root + expanded folders)
     highlight.rs    -- syntect highlighting + extension language detection
+    proofread/      -- Harper spelling/grammar: checker (mod.rs), comment/
+                       string extraction (regions), background thread
+                       (worker), per-tab results (state), wavy underlines
+                       (squiggle)
     theme.rs        -- Catppuccin Mocha applied to egui::Visuals
     error.rs        -- typed error enums
 
