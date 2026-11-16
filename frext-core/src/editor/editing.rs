@@ -108,7 +108,7 @@ impl Editor {
         }
         match self.dictionary_file {
             DictionaryFile::Loaded => {
-                if let Err(err) = self.store.save_dictionary(self.proofread.user_words()) {
+                if let Err(err) = self.store.merge_dictionary(self.proofread.user_words()) {
                     log::error!("failed to save the personal dictionary: {err}");
                 }
             }

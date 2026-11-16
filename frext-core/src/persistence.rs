@@ -2,20 +2,26 @@
 //! survive closing and reopening frext (and crashes).
 //!
 //! Layout under the platform state directory (`$XDG_STATE_HOME/frext` on
-//! Linux):
+//! Linux). Each [`Profile`] has its own session and swap files; both share
+//! one personal dictionary:
 //!
 //! ```text
 //! frext/
-//!   session.json     # index: tab order, ids, paths, active tab
-//!   dictionary.txt   # personal proofreading dictionary, one word per line
+//!   session.json     # Gui profile: tab order, ids, paths, active tab
+//!   dictionary.txt   # shared personal proofreading dictionary, one word per line
 //!   swap/
-//!     <id>.swp       # full text of each tab's buffer
+//!     <id>.swp       # Gui profile: full text of each tab's buffer
+//!   term/
+//!     session.json   # Term profile session index
+//!     swap/
+//!       <id>.swp     # Term profile swap files
 //! ```
 //!
 //! On launch the swap file is the source of truth for a tab's content, so
 //! unsaved edits always win over what is currently on disk.
 
 use std::{
+    collections::BTreeSet,
     fs,
     path::{Path, PathBuf},
 };
@@ -73,42 +79,95 @@ pub struct RestoredSession {
     pub search: SearchQuery,
 }
 
+/// Which front end a [`Store`] persists for. Each profile keeps its own
+/// session and swap files; all profiles share one personal dictionary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Profile {
+    /// The egui GUI front end: state lives directly in the base directory.
+    Gui,
+    /// The terminal front end: state lives in `term/` under the base
+    /// directory.
+    Term,
+}
+
 /// Owns the on-disk paths used for persistence.
 #[derive(Debug, Clone)]
 pub struct Store {
     root: PathBuf,
+    dictionary_dir: PathBuf,
 }
 
 impl Store {
-    /// Resolve the platform state directory and create the layout.
+    /// Resolve the platform state directory and create the layout for
+    /// `profile`.
     ///
     /// # Errors
     ///
     /// Returns [`PersistenceError`] if the state directory cannot be
     /// resolved or created.
-    pub fn new() -> Result<Self, PersistenceError> {
+    pub fn new(profile: Profile) -> Result<Self, PersistenceError> {
         let dirs = directories::ProjectDirs::from("io.github", "fredsystems", "frext")
             .ok_or(PersistenceError::NoStateDir)?;
 
         // Prefer a dedicated state dir; fall back to data dir on platforms
         // (macOS / Windows) where `directories` does not expose one.
-        let root = dirs
+        let base = dirs
             .state_dir()
             .map_or_else(|| dirs.data_dir().to_owned(), Path::to_owned);
 
-        Self::at(root)
+        Self::for_profile(base, profile)
     }
 
-    /// Create a store rooted at `root`, creating the `swap/` layout.
+    /// Lay out `profile`'s store under `base`: the GUI uses `base` itself,
+    /// the terminal front end uses `base/term`, and both keep the
+    /// dictionary in `base`.
+    fn for_profile(base: PathBuf, profile: Profile) -> Result<Self, PersistenceError> {
+        let root = match profile {
+            Profile::Gui => base.clone(),
+            Profile::Term => base.join("term"),
+        };
+        Self::at_with_dictionary_dir(root, base)
+    }
+
+    /// Create a store rooted at `root`, creating the `swap/` layout. The
+    /// dictionary also lives in `root`.
     ///
     /// # Errors
     ///
     /// Returns [`PersistenceError`] if the directory layout cannot be created.
     pub fn at(root: PathBuf) -> Result<Self, PersistenceError> {
+        let dictionary_dir = root.clone();
+        Self::at_with_dictionary_dir(root, dictionary_dir)
+    }
+
+    /// Create a store rooted at `root` whose dictionary lives in
+    /// `dictionary_dir`, creating `root/swap` and `dictionary_dir`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PersistenceError`] if the directory layout cannot be created.
+    pub fn at_with_dictionary_dir(
+        root: PathBuf,
+        dictionary_dir: PathBuf,
+    ) -> Result<Self, PersistenceError> {
         let swap = root.join("swap");
         fs::create_dir_all(&swap).map_err(|source| PersistenceError::Io { path: swap, source })?;
+        fs::create_dir_all(&dictionary_dir).map_err(|source| PersistenceError::Io {
+            path: dictionary_dir.clone(),
+            source,
+        })?;
 
-        Ok(Self { root })
+        Ok(Self {
+            root,
+            dictionary_dir,
+        })
+    }
+
+    /// The state root: the directory holding this store's session index and
+    /// swap files.
+    #[must_use]
+    pub fn root(&self) -> &Path {
+        &self.root
     }
 
     fn session_path(&self) -> PathBuf {
@@ -120,7 +179,7 @@ impl Store {
     }
 
     fn dictionary_path(&self) -> PathBuf {
-        self.root.join("dictionary.txt")
+        self.dictionary_dir.join("dictionary.txt")
     }
 
     /// Load the personal proofreading dictionary: one word per line, blank
@@ -143,26 +202,56 @@ impl Store {
         }
     }
 
-    /// Write the personal proofreading dictionary, one word per line.
+    /// Merge `words` into the personal proofreading dictionary, one word per
+    /// line, keeping every word already in the file.
     ///
-    /// The words are written to a temporary file that is then renamed over
-    /// `dictionary.txt`, so a failed write (e.g. a full disk) leaves the
+    /// The whole read-merge-write runs under an exclusive lock on
+    /// `dictionary.txt.lock`, so concurrent merges from other stores or
+    /// processes never lose each other's words. If the existing file cannot
+    /// be read for any reason other than "not found", nothing is written.
+    ///
+    /// The merged words are written to a temporary file that is then renamed
+    /// over `dictionary.txt`, so a failed write (e.g. a full disk) leaves the
     /// previous dictionary intact instead of truncated.
     ///
     /// # Errors
     ///
     /// Returns [`PersistenceError`] on I/O failure.
-    pub fn save_dictionary<'a>(
+    pub fn merge_dictionary<'a>(
         &self,
         words: impl IntoIterator<Item = &'a str>,
     ) -> Result<(), PersistenceError> {
+        let lock_path = self.dictionary_dir.join("dictionary.txt.lock");
+        let lock = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&lock_path)
+            .map_err(|source| PersistenceError::Io {
+                path: lock_path.clone(),
+                source,
+            })?;
+        lock.lock().map_err(|source| PersistenceError::Io {
+            path: lock_path,
+            source,
+        })?;
+
+        let mut merged: BTreeSet<String> = self.load_dictionary()?.into_iter().collect();
+        merged.extend(
+            words
+                .into_iter()
+                .map(str::trim)
+                .filter(|w| !w.is_empty())
+                .map(str::to_owned),
+        );
+
         let mut raw = String::new();
-        for word in words {
+        for word in &merged {
             raw.push_str(word);
             raw.push('\n');
         }
         let path = self.dictionary_path();
-        let temp = self.root.join("dictionary.txt.tmp");
+        let temp = self.dictionary_dir.join("dictionary.txt.tmp");
         if let Err(source) = fs::write(&temp, raw) {
             // Best effort: a partial temp file is harmless but untidy.
             let _ = fs::remove_file(&temp);
@@ -322,6 +411,64 @@ mod tests {
     }
 
     #[test]
+    fn term_profile_layout_is_under_term() {
+        let base = temp_dir("profile-term");
+        let store = Store::for_profile(base.clone(), Profile::Term).unwrap();
+        assert_eq!(store.root(), base.join("term"));
+        assert!(base.join("term").join("swap").is_dir());
+        assert_eq!(store.dictionary_path(), base.join("dictionary.txt"));
+        assert_eq!(store.session_path(), base.join("term").join("session.json"));
+        assert_eq!(
+            store.swap_path(5),
+            base.join("term").join("swap").join("5.swp")
+        );
+        fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn gui_profile_layout_is_unchanged() {
+        let base = temp_dir("profile-gui");
+        let store = Store::for_profile(base.clone(), Profile::Gui).unwrap();
+        assert_eq!(store.root(), base);
+        assert!(base.join("swap").is_dir());
+        assert!(!base.join("term").exists());
+        assert_eq!(store.dictionary_path(), base.join("dictionary.txt"));
+        assert_eq!(store.session_path(), base.join("session.json"));
+        assert_eq!(store.swap_path(5), base.join("swap").join("5.swp"));
+        fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn profiles_share_one_dictionary() {
+        let base = temp_dir("profile-dict");
+        let gui = Store::for_profile(base.clone(), Profile::Gui).unwrap();
+        let term = Store::for_profile(base.clone(), Profile::Term).unwrap();
+
+        gui.merge_dictionary(["frext"]).unwrap();
+        assert_eq!(term.load_dictionary().unwrap(), vec!["frext"]);
+
+        term.merge_dictionary(["ratatui"]).unwrap();
+        assert_eq!(gui.load_dictionary().unwrap(), vec!["frext", "ratatui"]);
+
+        fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn root_reports_the_state_root() {
+        let dir = temp_dir("root");
+        let store = store_at(&dir);
+        assert_eq!(store.root(), dir.as_path());
+
+        let dict_dir = dir.join("dict");
+        let split = Store::at_with_dictionary_dir(dir.join("state"), dict_dir.clone()).unwrap();
+        assert_eq!(split.root(), dir.join("state"));
+        assert!(dict_dir.is_dir());
+        assert_eq!(split.dictionary_path(), dict_dir.join("dictionary.txt"));
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn load_missing_session_is_empty() {
         let dir = temp_dir("empty");
         let store = store_at(&dir);
@@ -422,16 +569,22 @@ mod tests {
     fn dictionary_round_trips_and_skips_blank_lines() {
         let dir = temp_dir("dict-roundtrip");
         let store = store_at(&dir);
-        store.save_dictionary(["frext", "syntect"]).unwrap();
+        store.merge_dictionary(["frext", "syntect"]).unwrap();
         assert_eq!(store.load_dictionary().unwrap(), vec!["frext", "syntect"]);
 
         // A hand-edited file with stray blank lines and padding still loads.
         fs::write(dir.join("dictionary.txt"), "\n  nixos \n\nharper\n").unwrap();
         assert_eq!(store.load_dictionary().unwrap(), vec!["nixos", "harper"]);
 
-        // Saving replaces the file and leaves no temporary behind.
-        store.save_dictionary(["replaced"]).unwrap();
-        assert_eq!(store.load_dictionary().unwrap(), vec!["replaced"]);
+        // Merging keeps the existing words, skips blank or duplicate input,
+        // writes them sorted, and leaves no temporary behind.
+        store
+            .merge_dictionary(["added", " ", "nixos", "  padded "])
+            .unwrap();
+        assert_eq!(
+            store.load_dictionary().unwrap(),
+            vec!["added", "harper", "nixos", "padded"]
+        );
         assert!(!dir.join("dictionary.txt.tmp").exists());
 
         fs::remove_dir_all(&dir).unwrap();
@@ -441,12 +594,69 @@ mod tests {
     fn a_failed_dictionary_save_keeps_the_old_file() {
         let dir = temp_dir("dict-failed-save");
         let store = store_at(&dir);
-        store.save_dictionary(["original"]).unwrap();
+        store.merge_dictionary(["original"]).unwrap();
 
         // A directory squatting on the temp path makes the write fail.
         fs::create_dir(dir.join("dictionary.txt.tmp")).unwrap();
-        assert!(store.save_dictionary(["new"]).is_err());
+        assert!(store.merge_dictionary(["new"]).is_err());
         assert_eq!(store.load_dictionary().unwrap(), vec!["original"]);
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn merge_keeps_words_written_by_another_store() {
+        let base = temp_dir("dict-two-stores");
+        let a = Store::at_with_dictionary_dir(base.join("a"), base.clone()).unwrap();
+        let b = Store::at_with_dictionary_dir(base.join("b"), base.clone()).unwrap();
+        assert!(a.load_dictionary().unwrap().is_empty());
+        assert!(b.load_dictionary().unwrap().is_empty());
+
+        a.merge_dictionary(["alpha"]).unwrap();
+        b.merge_dictionary(["beta"]).unwrap();
+        assert_eq!(a.load_dictionary().unwrap(), vec!["alpha", "beta"]);
+
+        fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn concurrent_merges_lose_no_words() {
+        const THREADS: usize = 8;
+        let base = temp_dir("dict-concurrent");
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(THREADS));
+
+        let handles: Vec<_> = (0..THREADS)
+            .map(|i| {
+                let store = Store::at_with_dictionary_dir(base.join(format!("s{i}")), base.clone())
+                    .unwrap();
+                let barrier = std::sync::Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    let word = format!("word{i}");
+                    barrier.wait();
+                    store.merge_dictionary([word.as_str()]).unwrap();
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        let expected: Vec<String> = (0..THREADS).map(|i| format!("word{i}")).collect();
+        assert_eq!(store_at(&base).load_dictionary().unwrap(), expected);
+
+        fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn merge_does_not_write_when_the_file_is_unreadable() {
+        let dir = temp_dir("dict-unreadable");
+        let store = store_at(&dir);
+        // A directory squatting on the dictionary path makes the re-read fail.
+        fs::create_dir(dir.join("dictionary.txt")).unwrap();
+
+        assert!(store.merge_dictionary(["frext"]).is_err());
+        assert!(dir.join("dictionary.txt").is_dir());
+        assert!(!dir.join("dictionary.txt.tmp").exists());
 
         fs::remove_dir_all(&dir).unwrap();
     }

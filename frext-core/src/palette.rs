@@ -36,6 +36,33 @@ pub struct Tint {
     pub opacity: f32,
 }
 
+impl Tint {
+    /// Blend this tint over an opaque `base`, yielding an opaque colour.
+    ///
+    /// Each sRGB channel is `round(base * (1 - a) + color * a)`, where `a` is
+    /// `opacity` clamped to `0.0..=1.0`. A NaN opacity is treated as `0.0`, so
+    /// the result is `base`.
+    #[must_use]
+    pub fn over(self, base: Rgb) -> Rgb {
+        let opacity = f64::from(self.opacity);
+        let a = if opacity.is_nan() {
+            0.0
+        } else {
+            opacity.clamp(0.0, 1.0)
+        };
+        let blend = |base: u8, color: u8| -> u8 {
+            let mixed = f64::from(base) * (1.0 - a) + f64::from(color) * a;
+            // Rounded and clamped to the u8 range, so the cast cannot truncate.
+            mixed.round().clamp(0.0, 255.0) as u8
+        };
+        Rgb::new(
+            blend(base.r, self.color.r),
+            blend(base.g, self.color.g),
+            blend(base.b, self.color.b),
+        )
+    }
+}
+
 /// Mocha Rosewater.
 pub const ROSEWATER: Rgb = Rgb::new(0xf5, 0xe0, 0xdc);
 /// Mocha Blue.
@@ -167,5 +194,58 @@ mod tests {
         let tint = selection();
         assert_eq!(tint.color, BLUE);
         assert_eq!(tint.opacity.to_bits(), 0.35_f32.to_bits());
+    }
+
+    #[test]
+    fn over_at_zero_opacity_is_base() {
+        let tint = Tint {
+            color: BLUE,
+            opacity: 0.0,
+        };
+        assert_eq!(tint.over(BASE), BASE);
+    }
+
+    #[test]
+    fn over_at_full_opacity_is_the_tint() {
+        let tint = Tint {
+            color: BLUE,
+            opacity: 1.0,
+        };
+        assert_eq!(tint.over(BASE), BLUE);
+    }
+
+    #[test]
+    fn over_blends_and_rounds() {
+        // BLUE = (137, 180, 250), BASE = (30, 30, 46), a = 0.35:
+        //   r: 30 * 0.65 + 137 * 0.35 = 67.45 -> 67
+        //   g: 30 * 0.65 + 180 * 0.35 = 82.5 nominally, but 0.35_f32 is just
+        //      below 0.35, giving 82.49999... -> 82
+        //   b: 46 * 0.65 + 250 * 0.35 = 117.4 -> 117
+        assert_eq!(selection().over(BASE), Rgb::new(67, 82, 117));
+        // BLUE over BASE at a = 0.55:
+        //   r: 30 * 0.45 + 137 * 0.55 = 88.85 -> 89
+        //   g: 30 * 0.45 + 180 * 0.55 = 112.5 nominally; 0.55_f32 is just
+        //      above 0.55, giving 112.50000... -> 113
+        //   b: 46 * 0.45 + 250 * 0.55 = 158.2 -> 158
+        assert_eq!(search_current_match().over(BASE), Rgb::new(89, 113, 158));
+    }
+
+    #[test]
+    fn over_clamps_opacity() {
+        let above = Tint {
+            color: BLUE,
+            opacity: 1.5,
+        };
+        let below = Tint {
+            color: BLUE,
+            opacity: -0.5,
+        };
+        let nan = Tint {
+            color: BLUE,
+            opacity: f32::NAN,
+        };
+        assert_eq!(above.over(BASE), BLUE);
+        assert_eq!(below.over(BASE), BASE);
+        assert_eq!(nan.over(BASE), BASE);
     }
 }
