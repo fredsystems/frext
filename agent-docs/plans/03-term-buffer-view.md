@@ -72,7 +72,11 @@ are rendered by later plans through the same per-cell styling pass.
   ported): Unicode word bounds, a word char is alphanumeric or `_`,
   `.` is always a stop, whitespace runs are skipped. Double-click
   selects the word clipped to its line; triple-click selects the line
-  without its line break.
+  without its line break. The **line** rule intentionally differs from
+  egui's `select_line_at`, which over-selects on empty and one-char
+  lines (an empty line selects the whole text): `line_at` is exactly
+  the logical line's content, excluding its `'\n'` and a `'\r'` before
+  it (decided during 03.4).
 - **The wrap layout is cached** per tab, keyed on a hash of the text
   and the wrap width.
 - **The editor context menu lands here**, with a reusable
