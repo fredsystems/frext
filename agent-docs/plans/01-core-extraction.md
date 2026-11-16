@@ -351,7 +351,7 @@ pub fn overlay_matches(spans: Vec<StyledSpan>, matches: &MatchHighlights) -> Vec
   fill) are exposed as `Tint` so egui can keep `linear_multiply` (pixel
   identical) while the terminal blends to an opaque colour.
 - The plain-text fallback keeps today's foreground (`Color32::LIGHT_GRAY`
-  = `Rgb { r: 160, g: 160, b: 160 }`). Switching it to palette `TEXT`
+  = `Rgb { r: 220, g: 220, b: 220 }`). Switching it to palette `TEXT`
   would be a visible change and is out of scope.
 
 ### Deliberate behaviour changes
@@ -470,7 +470,7 @@ What:
 - Rewrite `highlight.rs` to be egui-free: `StyledSpan`,
   `MatchBackground`, `MatchHighlights` (unchanged fields),
   `pub fn highlight(text, language) -> Vec<StyledSpan>` (plain
-  fallback: one span, fg `Rgb { r: 160, g: 160, b: 160 }`), and
+  fallback: one span, fg `Rgb { r: 220, g: 220, b: 220 }`), and
   `pub fn overlay_matches(...)` (a port of `apply_match_highlights` /
   `split_section_by_background` operating on spans).
 - `editor_layout.rs` holds the egui side: `layout_job` (moved from
