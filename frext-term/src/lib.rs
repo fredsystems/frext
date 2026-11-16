@@ -4,6 +4,7 @@
 //! modules. The frontend-independent editor logic lives in the
 //! [`frext_core`] crate.
 
+pub mod app;
 pub mod cli;
 pub mod clipboard;
 pub mod complete;

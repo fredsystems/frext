@@ -179,8 +179,9 @@ view. Real editing arrives in plan 03, the sidebar in 05.
   while `search().is_open()`) and the status line says
   `Find bar is not available yet`. Plan 04 renders the row.
 - **Effects before plan 03.** `RevealSelection` scrolls the read-only
-  view to centre the selection's line. `SetSelection` is ignored (no
-  caret yet). `FocusPromptField` moves the prompt cursor to the end.
+  view to centre the line of the latest `SetSelection` for the same
+  tab in the same drain (core always emits the pair together). On its
+  own, `SetSelection` does nothing yet, because there is no caret. `FocusPromptField` moves the prompt cursor to the end.
   `FocusSearchField` is a no-op until plan 04.
 - **Not in this plan:** a context-menu widget (it lands with its first
   user, plan 03's editor menu or plan 05's tree menu), save-failure
