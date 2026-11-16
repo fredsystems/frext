@@ -6,6 +6,7 @@
 
 pub mod cli;
 pub mod clipboard;
+pub mod complete;
 pub mod events;
 pub mod hit;
 pub mod layout;
