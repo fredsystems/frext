@@ -12,7 +12,8 @@ use crate::edit_ops;
 
 impl Editor {
     /// Copy the selection to the clipboard, then delete it from the buffer,
-    /// leaving the caret at the selection's start.
+    /// leaving the caret at the selection's start. A failed clipboard write
+    /// leaves the buffer untouched, so the text is never lost.
     pub(super) fn cut(&mut self) -> Outcome {
         let selection = self.current_selection();
         let Some(tab) = self.tabs.get(self.active) else {
@@ -22,7 +23,9 @@ impl Editor {
         if text.is_empty() {
             return Outcome::default();
         }
-        self.clipboard.write_text(text);
+        if !self.clipboard.write_text(text) {
+            return Outcome::default();
+        }
         let Some(tab) = self.tabs.get_mut(self.active) else {
             return Outcome::default();
         };
@@ -144,7 +147,7 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     use super::*;
-    use crate::clipboard::MemoryClipboard;
+    use crate::clipboard::{Clipboard, MemoryClipboard};
     use crate::editor::{Command, SearchBar};
     use crate::persistence::Store;
 
@@ -217,6 +220,36 @@ mod tests {
 
         assert_eq!(editor.active_tab().unwrap().text, "hellorld");
         assert_eq!(outcome.effects, caret(4));
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A clipboard that is never available: every write fails.
+    struct FailingClipboard;
+
+    impl Clipboard for FailingClipboard {
+        fn read_text(&mut self) -> Option<String> {
+            None
+        }
+
+        fn write_text(&mut self, _text: String) -> bool {
+            false
+        }
+    }
+
+    #[test]
+    fn cut_keeps_the_selection_when_the_clipboard_write_fails() {
+        let dir = temp_dir("cut-clipboard-fails");
+        let mut editor = editor_with_text(&dir, "hello world");
+        editor.clipboard = Box::new(FailingClipboard);
+        let dirty_before = editor.active_tab().unwrap().is_dirty();
+
+        editor.set_selection(Some(0..6));
+        let outcome = editor.apply(Command::Cut);
+
+        assert_eq!(outcome, Outcome::default());
+        assert_eq!(editor.active_tab().unwrap().text, "hello world");
+        assert_eq!(editor.active_tab().unwrap().is_dirty(), dirty_before);
 
         fs::remove_dir_all(&dir).unwrap();
     }
