@@ -22,6 +22,7 @@ pub mod palette;
 pub mod persistence;
 pub mod proofread;
 pub mod search;
+pub mod squiggle;
 pub mod syntax;
 pub mod tab;
 pub mod theme;

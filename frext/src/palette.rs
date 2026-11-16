@@ -2,7 +2,7 @@
 //!
 //! The palette is taken from the official Catppuccin Mocha specification
 //! (<https://github.com/catppuccin/catppuccin>). Colours are stored as plain
-//! [`Rgb`] triples so any frontend (egui, a terminal, ...) can convert them
+//! [`Rgb`] triples so any frontend (a GUI, a terminal, ...) can convert them
 //! into its own colour type.
 
 /// An opaque 24-bit RGB colour.
@@ -26,7 +26,7 @@ impl Rgb {
 
 /// A translucent colour.
 ///
-/// `opacity` is in `0.0..=1.0`. egui applies it with `linear_multiply`; a
+/// `opacity` is in `0.0..=1.0`. A GUI frontend can apply it as an alpha multiply; a
 /// terminal frontend blends it over the background to an opaque colour.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Tint {

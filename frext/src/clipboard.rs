@@ -1,9 +1,9 @@
 //! A thin wrapper over the OS clipboard for the editor's cut/copy/paste menu.
 //!
-//! egui can *write* the clipboard (via `Context::copy_text`) but exposes no
+//! The GUI toolkit can *write* the clipboard but exposes no
 //! imperative *read*, which a menu-driven "Paste" needs. This module uses
 //! [`arboard`] for both directions so the editor clipboard actions are
-//! deterministic and testable, rather than depending on egui's event timing.
+//! deterministic and testable, rather than depending on the toolkit's event timing.
 //!
 //! Every operation is fallible and non-panicking: a clipboard that cannot be
 //! opened (headless CI, no display server) yields `None`/`false` and logs,

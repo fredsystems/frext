@@ -1,8 +1,8 @@
 //! Pure text-buffer edits backing the editor's cut/paste menu actions.
 //!
-//! egui text cursors are measured in characters, so these operate on a
+//! GUI text cursors are measured in characters, so these operate on a
 //! character range `[start, end)` over `text` and return the new caret
-//! position (also a character index). Keeping them free of egui and clipboard
+//! position (also a character index). Keeping them free of UI and clipboard
 //! I/O makes the splice logic straightforward to unit-test; the app layer
 //! wires them to the live `TextEdit` state and the OS clipboard.
 

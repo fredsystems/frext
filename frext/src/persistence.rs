@@ -422,8 +422,8 @@ mod tests {
     fn dictionary_round_trips_and_skips_blank_lines() {
         let dir = temp_dir("dict-roundtrip");
         let store = store_at(&dir);
-        store.save_dictionary(["frext", "egui"]).unwrap();
-        assert_eq!(store.load_dictionary().unwrap(), vec!["frext", "egui"]);
+        store.save_dictionary(["frext", "syntect"]).unwrap();
+        assert_eq!(store.load_dictionary().unwrap(), vec!["frext", "syntect"]);
 
         // A hand-edited file with stray blank lines and padding still loads.
         fs::write(dir.join("dictionary.txt"), "\n  nixos \n\nharper\n").unwrap();

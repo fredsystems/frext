@@ -11,7 +11,7 @@ use super::{Diagnostic, DiagnosticKind, IgnoreKey};
 
 /// The lifecycle of the background worker.
 enum WorkerSlot {
-    /// Not spawned yet; spawned on the first frame (it needs the egui
+    /// Not spawned yet; spawned on the first frame (it needs the UI
     /// context to request repaints).
     NotStarted,
     Running(Worker),

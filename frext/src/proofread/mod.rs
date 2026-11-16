@@ -3,17 +3,16 @@
 //! Harper runs entirely in-process (no server, no network) and checks both
 //! spelling and grammar in one pass. This module turns its [`Lint`]s into
 //! frext [`Diagnostic`]s carrying *byte* ranges (what the buffer model
-//! speaks) and *char* ranges (what egui's galley speaks).
+//! speaks) and *char* ranges (what the editor's text layout speaks).
 //!
 //! Which parts of a buffer are checked is decided by [`regions`]: prose
 //! buffers in full, code buffers only in their comments and strings.
 //!
 //! Checking a large buffer takes longer than a frame, so the app never calls
 //! [`Proofreader`] directly: [`worker`] runs it on a background thread and
-//! [`state`] tracks results per tab. [`squiggle`] paints the results.
+//! [`state`] tracks results per tab.
 
 pub mod regions;
-pub mod squiggle;
 pub mod state;
 pub mod worker;
 
@@ -57,7 +56,7 @@ pub struct Diagnostic {
     pub kind: DiagnosticKind,
     /// Byte range of the flagged text in the buffer it was computed for.
     pub bytes: Range<usize>,
-    /// The same range in characters, for egui galley/cursor positions.
+    /// The same range in characters, for text-layout/cursor positions.
     pub chars: Range<usize>,
     /// The flagged text itself. Used to detect that a result has gone stale
     /// because the buffer changed underneath it.

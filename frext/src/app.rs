@@ -651,7 +651,7 @@ impl FrextApp {
             TreeAction::CopyRelativePath(path) => {
                 ctx.copy_text(self.relative_to_root(&path));
             }
-            TreeAction::Reveal(path) => reveal_in_file_manager(&path),
+            TreeAction::Reveal(path) => crate::fs_ops::reveal(&path),
             TreeAction::Rename(path) => {
                 self.pending_fs = Some(FsPrompt {
                     kind: FsPromptKind::Rename,
@@ -1522,7 +1522,7 @@ impl FrextApp {
     /// row icon-less rather than failing.
     fn file_icon(ui: &mut egui::Ui, stem: &'static str) {
         let size = ui.text_style_height(&egui::TextStyle::Body);
-        if let Some(source) = crate::file_icon::image_source(stem) {
+        if let Some(source) = image_source(stem) {
             ui.add(
                 egui::Image::new(source)
                     .fit_to_exact_size(egui::vec2(size, size))
@@ -1830,7 +1830,7 @@ impl eframe::App for FrextApp {
                                     };
                                     (&d.chars, color)
                                 });
-                            crate::proofread::squiggle::paint(
+                            crate::squiggle::paint(
                                 ui.painter(),
                                 &output.galley,
                                 output.galley_pos,
@@ -1986,34 +1986,28 @@ impl eframe::App for FrextApp {
     }
 }
 
-/// Open `path` in the platform file manager, selecting it where the manager
-/// supports it. On Linux this opens the containing directory via `xdg-open`
-/// (there is no portable "reveal and select" call); failures are logged, not
-/// propagated, so a missing opener never crashes the editor.
-fn reveal_in_file_manager(path: &Path) {
-    // Reveal the containing directory so the manager opens somewhere useful
-    // even for a file (which most managers would otherwise try to *run*).
-    let target = if path.is_dir() {
-        path.to_path_buf()
-    } else {
-        path.parent()
-            .map_or_else(|| path.to_path_buf(), Path::to_path_buf)
-    };
+/// An [`egui::ImageSource`] for the icon `stem`, ready to hand to
+/// [`egui::Image::new`].
+///
+/// The `uri` is stable per stem so egui's image cache reuses a single rendered
+/// texture across frames and rows. Returns `None` when the stem is not bundled.
+#[must_use]
+fn image_source(stem: &'static str) -> Option<egui::ImageSource<'static>> {
+    let bytes = crate::file_icon::icon_bytes(stem)?;
+    Some(egui::ImageSource::Bytes {
+        // The `.svg` extension routes the bytes to egui_extras' SVG loader,
+        // and the `frext-file-icon://` scheme keeps these URIs from colliding
+        // with any other image source in the app.
+        uri: stem_uri(stem).into(),
+        bytes: egui::load::Bytes::Static(bytes),
+    })
+}
 
-    #[cfg(target_os = "linux")]
-    let program = "xdg-open";
-    #[cfg(target_os = "macos")]
-    let program = "open";
-    #[cfg(target_os = "windows")]
-    let program = "explorer";
-
-    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
-    if let Err(err) = std::process::Command::new(program).arg(&target).spawn() {
-        log::error!(
-            "failed to reveal {} in file manager: {err}",
-            target.display()
-        );
-    }
+/// The cache URI for an icon `stem`. Pure and deterministic so it can be tested
+/// without an egui context.
+#[must_use]
+fn stem_uri(stem: &str) -> String {
+    format!("frext-file-icon://{stem}.svg")
 }
 
 /// A deferred action chosen from the menu/tab bar, applied after the borrow
@@ -2816,5 +2810,10 @@ mod tests {
         assert!(app.search.replace_open);
 
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn stem_uri_is_stable_and_svg_suffixed() {
+        assert_eq!(stem_uri("rust"), "frext-file-icon://rust.svg");
     }
 }

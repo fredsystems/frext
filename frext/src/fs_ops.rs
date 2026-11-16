@@ -2,7 +2,7 @@
 //! create directory, and move-to-trash.
 //!
 //! These are factored out of the UI loop so the validation and the disk
-//! effects can be unit-tested without an egui context. Every operation returns
+//! effects can be unit-tested without a GUI context. Every operation returns
 //! a typed [`FsError`]; the UI layer logs failures (and surfaces them to the
 //! user) rather than panicking.
 
@@ -103,6 +103,44 @@ pub fn move_to_trash(path: &Path) -> Result<(), FsError> {
         path: path.to_path_buf(),
         message: err.to_string(),
     })
+}
+
+/// The directory to open when revealing `path` in a file manager: a
+/// directory maps to itself, anything else to its containing directory
+/// (falling back to `path` itself when it has no parent).
+#[must_use]
+pub fn reveal_target(path: &Path) -> PathBuf {
+    // Reveal the containing directory so the manager opens somewhere useful
+    // even for a file (which most managers would otherwise try to *run*).
+    if path.is_dir() {
+        path.to_path_buf()
+    } else {
+        path.parent()
+            .map_or_else(|| path.to_path_buf(), Path::to_path_buf)
+    }
+}
+
+/// Open `path` in the platform file manager, selecting it where the manager
+/// supports it. On Linux this opens the containing directory via `xdg-open`
+/// (there is no portable "reveal and select" call); failures are logged, not
+/// propagated, so a missing opener never crashes the editor.
+pub fn reveal(path: &Path) {
+    let target = reveal_target(path);
+
+    #[cfg(target_os = "linux")]
+    let program = "xdg-open";
+    #[cfg(target_os = "macos")]
+    let program = "open";
+    #[cfg(target_os = "windows")]
+    let program = "explorer";
+
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+    if let Err(err) = std::process::Command::new(program).arg(&target).spawn() {
+        log::error!(
+            "failed to reveal {} in file manager: {err}",
+            target.display()
+        );
+    }
 }
 
 #[cfg(test)]
@@ -240,6 +278,22 @@ mod tests {
         let err = create_dir(&dir, "sub").unwrap_err();
         assert!(matches!(err, FsError::AlreadyExists(_)));
 
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn reveal_target_maps_a_directory_to_itself() {
+        let dir = temp_dir("reveal-dir");
+        assert_eq!(reveal_target(&dir), dir);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn reveal_target_maps_a_file_to_its_parent_directory() {
+        let dir = temp_dir("reveal-file");
+        let file = dir.join("notes.txt");
+        std::fs::write(&file, "x").unwrap();
+        assert_eq!(reveal_target(&file), dir);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }
