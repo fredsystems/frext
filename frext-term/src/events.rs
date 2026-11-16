@@ -120,6 +120,12 @@ impl EventLoop {
         batch.extend(self.rx.try_iter());
         Some(batch)
     }
+
+    /// A sender into this loop, for queueing events in tests.
+    #[cfg(test)]
+    pub(crate) fn sender(&self) -> Sender<AppEvent> {
+        self.tx.clone()
+    }
 }
 
 #[cfg(test)]

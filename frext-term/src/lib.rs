@@ -16,6 +16,7 @@ pub mod layout;
 pub mod logging;
 pub mod popup;
 pub mod prompt;
+pub mod run;
 pub mod status;
 pub mod tab_bar;
 pub mod terminal;
