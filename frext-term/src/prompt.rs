@@ -123,6 +123,12 @@ fn tab_name(editor: &Editor, tab_id: u64) -> Option<String> {
         .map(Tab::display_name)
 }
 
+/// The error for a path that exists but is not a regular file (a FIFO,
+/// socket, or device), which saving or opening could block on.
+fn not_a_regular_file(path: &Path) -> String {
+    format!("\u{201c}{}\u{201d} is not a regular file", path.display())
+}
+
 /// Whether `key` types a printable char.
 fn is_printable(key: KeyEvent) -> bool {
     matches!(key.code, KeyCode::Char(c) if !c.is_control())
@@ -432,6 +438,10 @@ impl PromptUi {
             self.path_error = Some(format!("\u{201c}{}\u{201d} is a directory", path.display()));
             return PromptReply::Handled;
         }
+        if path.exists() && !path.is_file() {
+            self.path_error = Some(not_a_regular_file(&path));
+            return PromptReply::Handled;
+        }
         if let Some(parent) = path.parent()
             && !parent.as_os_str().is_empty()
             && !parent.is_dir()
@@ -463,6 +473,10 @@ impl PromptUi {
         }
         if !path.exists() {
             self.path_error = Some(format!("No such file: {}", path.display()));
+            return PromptReply::Handled;
+        }
+        if !path.is_file() {
+            self.path_error = Some(not_a_regular_file(&path));
             return PromptReply::Handled;
         }
         self.open = OpenState::Closed;
@@ -1483,6 +1497,67 @@ mod tests {
         ui.handle_key(&mut editor, press(KeyCode::Enter));
         let expected = format!("No such file: {}", files.join("sub/x.txt").display());
         assert_eq!(ui.path_error.as_deref(), Some(expected.as_str()));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_path_to_a_non_regular_file_is_rejected() {
+        let (dir, files, mut editor, mut ui) = save_fixture("save-sock");
+        let target = files.join("s");
+        let _listener = std::os::unix::net::UnixListener::bind(&target).unwrap();
+        assert!(target.exists() && !target.is_file());
+        type_text(&mut ui, &mut editor, "s");
+        for _ in 0..2 {
+            assert_eq!(
+                ui.handle_key(&mut editor, press(KeyCode::Enter)),
+                PromptReply::Handled
+            );
+            let expected = format!("\u{201c}{}\u{201d} is not a regular file", target.display());
+            assert_eq!(ui.path_error.as_deref(), Some(expected.as_str()));
+            assert_eq!(ui.overwrite_armed, None);
+        }
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn open_of_a_non_regular_file_is_rejected() {
+        let (dir, files, mut editor, mut ui) = open_fixture("open-sock");
+        let target = files.join("s");
+        let _listener = std::os::unix::net::UnixListener::bind(&target).unwrap();
+        type_text(&mut ui, &mut editor, "s");
+        assert_eq!(
+            ui.handle_key(&mut editor, press(KeyCode::Enter)),
+            PromptReply::Handled
+        );
+        let expected = format!("\u{201c}{}\u{201d} is not a regular file", target.display());
+        assert_eq!(ui.path_error.as_deref(), Some(expected.as_str()));
+        assert!(ui.is_open(&editor));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_through_a_symlink_to_a_regular_file_is_allowed() {
+        let (dir, files, mut editor, mut ui) = save_fixture("save-link");
+        fs::write(files.join("real.txt"), "old").unwrap();
+        let link = files.join("link.txt");
+        std::os::unix::fs::symlink(files.join("real.txt"), &link).unwrap();
+        type_text(&mut ui, &mut editor, "link.txt");
+        assert_eq!(
+            ui.handle_key(&mut editor, press(KeyCode::Enter)),
+            PromptReply::Handled
+        );
+        assert_eq!(
+            ui.path_error.as_deref(),
+            Some("\u{201c}link.txt\u{201d} exists. Press Enter again to replace it")
+        );
+        assert_eq!(ui.overwrite_armed.as_ref(), Some(&link));
+        assert_eq!(
+            ui.handle_key(&mut editor, press(KeyCode::Enter)),
+            send(Command::SubmitSavePath(link))
+        );
         fs::remove_dir_all(&dir).unwrap();
     }
 
