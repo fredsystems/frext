@@ -11,7 +11,6 @@ use frext_core::lines::line_count;
 use frext_core::tab::Tab;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
-use unicode_width::UnicodeWidthChar;
 
 use crate::hit::{HitMap, Target};
 use crate::keymap::ScrollBy;
@@ -147,33 +146,38 @@ fn fill(buf: &mut Buffer, area: Rect) {
 }
 
 /// Draws `line` at (`x`, `y`), cut at `width` display columns.
+///
+/// Clipping is left to `Buffer::set_stringn`, which walks grapheme
+/// clusters with their cell width and stops at the first one that does
+/// not fit, so a wide char or a ZWJ sequence is never split.
 fn draw_line(buf: &mut Buffer, x: u16, y: u16, width: u16, line: &str) {
     let line = line.strip_suffix('\r').unwrap_or(line);
-    let width = usize::from(width);
+    let columns = usize::from(width);
+    // Stop building once this many chars are pushed: no realistic text
+    // needs more to fill `columns` cells. A line dense with zero-width
+    // marks could be cut short of the edge; that is accepted to keep a
+    // huge line from being copied in full every frame.
+    let max_chars = columns.saturating_mul(8).saturating_add(64);
     let mut visible = String::new();
-    let mut used = 0;
-    'chars: for c in line.chars() {
+    let mut pushed = 0_usize;
+    for c in line.chars() {
+        if pushed >= max_chars {
+            break;
+        }
         if c == '\t' {
             for _ in 0..TAB_WIDTH {
-                if used + 1 > width {
-                    break 'chars;
-                }
                 visible.push(' ');
-                used += 1;
             }
+            pushed += TAB_WIDTH;
             continue;
         }
         if c.is_control() {
             continue;
         }
-        let char_width = c.width().unwrap_or(0);
-        if used + char_width > width {
-            break;
-        }
         visible.push(c);
-        used += char_width;
+        pushed += 1;
     }
-    buf.set_string(x, y, &visible, theme::base());
+    buf.set_stringn(x, y, &visible, columns, theme::base());
 }
 
 #[cfg(test)]
@@ -463,6 +467,24 @@ mod tests {
         let (buf, _) = render(&EditorView::default(), Some(&tab), 8, 1);
         assert_eq!(buf[(5, 0)].symbol(), "世");
         assert_eq!(buf[(7, 0)].symbol(), " ");
+    }
+
+    #[test]
+    fn render_keeps_zwj_sequence_whole() {
+        let tab = tab(1, "👩‍💻x");
+        // Editor is 2 columns: the emoji fills both, "x" does not fit.
+        let (buf, _) = render(&EditorView::default(), Some(&tab), 6, 1);
+        assert_eq!(buf[(4, 0)].symbol(), "👩‍💻");
+        assert_ne!(buf[(5, 0)].symbol(), "x");
+        assert!(!row_text(&buf, 0).contains('x'));
+    }
+
+    #[test]
+    fn render_zwj_sequence_does_not_truncate_following_text() {
+        let tab = tab(1, "👩‍💻x");
+        let (buf, _) = render(&EditorView::default(), Some(&tab), 7, 1);
+        assert_eq!(buf[(4, 0)].symbol(), "👩‍💻");
+        assert_eq!(buf[(6, 0)].symbol(), "x");
     }
 
     #[test]
