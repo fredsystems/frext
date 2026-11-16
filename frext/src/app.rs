@@ -81,7 +81,12 @@ impl FrextApp {
     /// unchanged).
     #[must_use]
     pub fn with_args(store: Store, files: &[PathBuf], dir: Option<&Path>) -> Self {
-        Self::from_editor(Editor::open(store, Box::new(SystemClipboard), files, dir))
+        Self::from_editor(Editor::open(
+            store,
+            Box::new(SystemClipboard::new()),
+            files,
+            dir,
+        ))
     }
 
     /// Wrap `editor` with fresh view state.
