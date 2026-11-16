@@ -21,6 +21,7 @@
 //! unsaved edits always win over what is currently on disk.
 
 use std::{
+    collections::BTreeSet,
     fs,
     path::{Path, PathBuf},
 };
@@ -201,21 +202,51 @@ impl Store {
         }
     }
 
-    /// Write the personal proofreading dictionary, one word per line.
+    /// Merge `words` into the personal proofreading dictionary, one word per
+    /// line, keeping every word already in the file.
     ///
-    /// The words are written to a temporary file that is then renamed over
-    /// `dictionary.txt`, so a failed write (e.g. a full disk) leaves the
+    /// The whole read-merge-write runs under an exclusive lock on
+    /// `dictionary.txt.lock`, so concurrent merges from other stores or
+    /// processes never lose each other's words. If the existing file cannot
+    /// be read for any reason other than "not found", nothing is written.
+    ///
+    /// The merged words are written to a temporary file that is then renamed
+    /// over `dictionary.txt`, so a failed write (e.g. a full disk) leaves the
     /// previous dictionary intact instead of truncated.
     ///
     /// # Errors
     ///
     /// Returns [`PersistenceError`] on I/O failure.
-    pub fn save_dictionary<'a>(
+    pub fn merge_dictionary<'a>(
         &self,
         words: impl IntoIterator<Item = &'a str>,
     ) -> Result<(), PersistenceError> {
+        let lock_path = self.dictionary_dir.join("dictionary.txt.lock");
+        let lock = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&lock_path)
+            .map_err(|source| PersistenceError::Io {
+                path: lock_path.clone(),
+                source,
+            })?;
+        lock.lock().map_err(|source| PersistenceError::Io {
+            path: lock_path,
+            source,
+        })?;
+
+        let mut merged: BTreeSet<String> = self.load_dictionary()?.into_iter().collect();
+        merged.extend(
+            words
+                .into_iter()
+                .map(str::trim)
+                .filter(|w| !w.is_empty())
+                .map(str::to_owned),
+        );
+
         let mut raw = String::new();
-        for word in words {
+        for word in &merged {
             raw.push_str(word);
             raw.push('\n');
         }
@@ -413,10 +444,10 @@ mod tests {
         let gui = Store::for_profile(base.clone(), Profile::Gui).unwrap();
         let term = Store::for_profile(base.clone(), Profile::Term).unwrap();
 
-        gui.save_dictionary(["frext"]).unwrap();
+        gui.merge_dictionary(["frext"]).unwrap();
         assert_eq!(term.load_dictionary().unwrap(), vec!["frext"]);
 
-        term.save_dictionary(["frext", "ratatui"]).unwrap();
+        term.merge_dictionary(["ratatui"]).unwrap();
         assert_eq!(gui.load_dictionary().unwrap(), vec!["frext", "ratatui"]);
 
         fs::remove_dir_all(&base).unwrap();
@@ -538,16 +569,22 @@ mod tests {
     fn dictionary_round_trips_and_skips_blank_lines() {
         let dir = temp_dir("dict-roundtrip");
         let store = store_at(&dir);
-        store.save_dictionary(["frext", "syntect"]).unwrap();
+        store.merge_dictionary(["frext", "syntect"]).unwrap();
         assert_eq!(store.load_dictionary().unwrap(), vec!["frext", "syntect"]);
 
         // A hand-edited file with stray blank lines and padding still loads.
         fs::write(dir.join("dictionary.txt"), "\n  nixos \n\nharper\n").unwrap();
         assert_eq!(store.load_dictionary().unwrap(), vec!["nixos", "harper"]);
 
-        // Saving replaces the file and leaves no temporary behind.
-        store.save_dictionary(["replaced"]).unwrap();
-        assert_eq!(store.load_dictionary().unwrap(), vec!["replaced"]);
+        // Merging keeps the existing words, skips blank or duplicate input,
+        // writes them sorted, and leaves no temporary behind.
+        store
+            .merge_dictionary(["added", " ", "nixos", "  padded "])
+            .unwrap();
+        assert_eq!(
+            store.load_dictionary().unwrap(),
+            vec!["added", "harper", "nixos", "padded"]
+        );
         assert!(!dir.join("dictionary.txt.tmp").exists());
 
         fs::remove_dir_all(&dir).unwrap();
@@ -557,12 +594,69 @@ mod tests {
     fn a_failed_dictionary_save_keeps_the_old_file() {
         let dir = temp_dir("dict-failed-save");
         let store = store_at(&dir);
-        store.save_dictionary(["original"]).unwrap();
+        store.merge_dictionary(["original"]).unwrap();
 
         // A directory squatting on the temp path makes the write fail.
         fs::create_dir(dir.join("dictionary.txt.tmp")).unwrap();
-        assert!(store.save_dictionary(["new"]).is_err());
+        assert!(store.merge_dictionary(["new"]).is_err());
         assert_eq!(store.load_dictionary().unwrap(), vec!["original"]);
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn merge_keeps_words_written_by_another_store() {
+        let base = temp_dir("dict-two-stores");
+        let a = Store::at_with_dictionary_dir(base.join("a"), base.clone()).unwrap();
+        let b = Store::at_with_dictionary_dir(base.join("b"), base.clone()).unwrap();
+        assert!(a.load_dictionary().unwrap().is_empty());
+        assert!(b.load_dictionary().unwrap().is_empty());
+
+        a.merge_dictionary(["alpha"]).unwrap();
+        b.merge_dictionary(["beta"]).unwrap();
+        assert_eq!(a.load_dictionary().unwrap(), vec!["alpha", "beta"]);
+
+        fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn concurrent_merges_lose_no_words() {
+        const THREADS: usize = 8;
+        let base = temp_dir("dict-concurrent");
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(THREADS));
+
+        let handles: Vec<_> = (0..THREADS)
+            .map(|i| {
+                let store = Store::at_with_dictionary_dir(base.join(format!("s{i}")), base.clone())
+                    .unwrap();
+                let barrier = std::sync::Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    let word = format!("word{i}");
+                    barrier.wait();
+                    store.merge_dictionary([word.as_str()]).unwrap();
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        let expected: Vec<String> = (0..THREADS).map(|i| format!("word{i}")).collect();
+        assert_eq!(store_at(&base).load_dictionary().unwrap(), expected);
+
+        fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn merge_does_not_write_when_the_file_is_unreadable() {
+        let dir = temp_dir("dict-unreadable");
+        let store = store_at(&dir);
+        // A directory squatting on the dictionary path makes the re-read fail.
+        fs::create_dir(dir.join("dictionary.txt")).unwrap();
+
+        assert!(store.merge_dictionary(["frext"]).is_err());
+        assert!(dir.join("dictionary.txt").is_dir());
+        assert!(!dir.join("dictionary.txt.tmp").exists());
 
         fs::remove_dir_all(&dir).unwrap();
     }
