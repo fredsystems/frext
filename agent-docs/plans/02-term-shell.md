@@ -1,6 +1,6 @@
 # 02 -- `frext-term` shell
 
-- **Status:** active
+- **Status:** pending merge
 - **Depends on:** 01
 - **Branch:** `feat/frext-term-shell` (one branch, one commit per
   subtask, one PR)
@@ -1194,7 +1194,10 @@ as `xterm`, or `TERM=xterm-256color` in tmux):
   the standard ritual.
 - **Scheduling:** before the PR is marked `pending merge`.
 
-### 02.20 -- Cleanup: first-launch fallback tab beside CLI files
+### 02.20 -- Cleanup: first-launch fallback tab beside CLI files (withdrawn)
+
+- **Decision:** withdrawn by the user on 2026-11-16. The current
+  behaviour stays, for both front ends.
 
 - **Surfaced:** manual smoke test after 02.18 (`44c03f0`). With no
   saved session, `frext-term a.txt b.rs` opens three tabs: an untitled
