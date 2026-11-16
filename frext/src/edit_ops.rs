@@ -6,14 +6,6 @@
 //! I/O makes the splice logic straightforward to unit-test; the app layer
 //! wires them to the live `TextEdit` state and the OS clipboard.
 
-/// The byte offset of character index `char_idx` within `text`, clamped to the
-/// end of the string. Mirrors the cursor model egui uses (character indices).
-fn byte_offset(text: &str, char_idx: usize) -> usize {
-    text.char_indices()
-        .nth(char_idx)
-        .map_or(text.len(), |(byte, _)| byte)
-}
-
 /// Normalise a possibly-reversed selection to `(lo, hi)` character indices,
 /// clamped to the buffer's character length.
 fn normalize(text: &str, start: usize, end: usize) -> (usize, usize) {
@@ -27,8 +19,8 @@ fn normalize(text: &str, start: usize, end: usize) -> (usize, usize) {
 #[must_use]
 pub fn selected_text(text: &str, start: usize, end: usize) -> String {
     let (lo, hi) = normalize(text, start, end);
-    let lo_byte = byte_offset(text, lo);
-    let hi_byte = byte_offset(text, hi);
+    let lo_byte = crate::offsets::byte_of_char(text, lo);
+    let hi_byte = crate::offsets::byte_of_char(text, hi);
     text.get(lo_byte..hi_byte).unwrap_or_default().to_owned()
 }
 
@@ -41,8 +33,8 @@ pub fn delete_range(text: &mut String, start: usize, end: usize) -> usize {
     if lo == hi {
         return lo;
     }
-    let lo_byte = byte_offset(text, lo);
-    let hi_byte = byte_offset(text, hi);
+    let lo_byte = crate::offsets::byte_of_char(text, lo);
+    let hi_byte = crate::offsets::byte_of_char(text, hi);
     text.replace_range(lo_byte..hi_byte, "");
     lo
 }
@@ -53,8 +45,8 @@ pub fn delete_range(text: &mut String, start: usize, end: usize) -> usize {
 /// With an empty selection this inserts `insert` at the caret.
 pub fn replace_range(text: &mut String, start: usize, end: usize, insert: &str) -> usize {
     let (lo, hi) = normalize(text, start, end);
-    let lo_byte = byte_offset(text, lo);
-    let hi_byte = byte_offset(text, hi);
+    let lo_byte = crate::offsets::byte_of_char(text, lo);
+    let hi_byte = crate::offsets::byte_of_char(text, hi);
     text.replace_range(lo_byte..hi_byte, insert);
     lo + insert.chars().count()
 }

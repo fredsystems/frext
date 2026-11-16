@@ -287,7 +287,7 @@ impl FrextApp {
     /// [`Self::paint_line_numbers`], aligned to the editor's real rows so
     /// soft-wrapped continuation rows are left blank.
     fn reserve_line_number_gutter(ui: &mut egui::Ui, text: &str) -> Gutter {
-        let line_count = line_count(text);
+        let line_count = crate::lines::line_count(text);
         let font_id = egui::TextStyle::Monospace.resolve(ui.style());
         let digits = line_count.to_string().len();
 
@@ -335,7 +335,7 @@ impl FrextApp {
         let galley = &output.galley;
 
         let ends_with_newline = galley.rows.iter().map(|r| r.ends_with_newline);
-        for (row_index, number) in line_numbers_for_rows(ends_with_newline) {
+        for (row_index, number) in crate::lines::line_numbers_for_rows(ends_with_newline) {
             let Some(placed) = galley.rows.get(row_index) else {
                 continue;
             };
@@ -1854,8 +1854,8 @@ impl eframe::App for FrextApp {
                             // (byte range -> char range) so egui scrolls it
                             // into view on this frame.
                             if let Some(range) = &scroll_to {
-                                let start = char_index(&tab.text, range.start);
-                                let end = char_index(&tab.text, range.end);
+                                let start = crate::offsets::char_of_byte(&tab.text, range.start);
+                                let end = crate::offsets::char_of_byte(&tab.text, range.end);
                                 let ccursor_range = egui::text::CCursorRange::two(
                                     egui::text::CCursor::new(start),
                                     egui::text::CCursor::new(end),
@@ -1874,8 +1874,10 @@ impl eframe::App for FrextApp {
                                 let lo = range.primary.index.0.min(range.secondary.index.0);
                                 let hi = range.primary.index.0.max(range.secondary.index.0);
                                 editor_char_selection = Some(lo..hi);
-                                new_selection =
-                                    Some(byte_index(&tab.text, lo)..byte_index(&tab.text, hi));
+                                new_selection = Some(
+                                    crate::offsets::byte_of_char(&tab.text, lo)
+                                        ..crate::offsets::byte_of_char(&tab.text, hi),
+                                );
                             } else {
                                 editor_char_selection = None;
                                 new_selection = None;
@@ -2014,41 +2016,6 @@ fn reveal_in_file_manager(path: &Path) {
     }
 }
 
-/// Number of editor lines in `text`.
-///
-/// At least one row, even for an empty buffer. A trailing newline opens a new
-/// (empty) final line in the editor, so this is `newlines + 1`.
-fn line_count(text: &str) -> usize {
-    text.bytes().filter(|&b| b == b'\n').count() + 1
-}
-
-/// Decide which visual rows of a laid-out editor galley carry a line number.
-///
-/// `ends_with_newline` yields, in row order, each row's
-/// [`egui::epaint::text::PlacedRow::ends_with_newline`] flag. A row begins a
-/// new logical line — and therefore gets the next line number — when it is the
-/// first row or the previous row ended with a real `\n`. Rows produced by soft
-/// wrapping (whose predecessor did *not* end with a newline) are skipped, so
-/// continuation rows stay blank.
-///
-/// Returns `(row_index, line_number)` pairs, with `line_number` starting at 1.
-/// Splitting this out from the painting keeps the wrap-vs-newline logic — the
-/// part that previously mis-numbered a continuation row right after Enter —
-/// unit-testable without a live `egui::Ui`.
-fn line_numbers_for_rows(ends_with_newline: impl IntoIterator<Item = bool>) -> Vec<(usize, usize)> {
-    let mut out = Vec::new();
-    let mut starts_logical_line = true;
-    let mut number = 0usize;
-    for (row_index, row_ends_with_newline) in ends_with_newline.into_iter().enumerate() {
-        if starts_logical_line {
-            number += 1;
-            out.push((row_index, number));
-        }
-        starts_logical_line = row_ends_with_newline;
-    }
-    out
-}
-
 /// A deferred action chosen from the menu/tab bar, applied after the borrow
 /// of `self.tabs` ends.
 enum MenuAction {
@@ -2147,23 +2114,6 @@ enum SearchAction {
     ReplaceAll,
 }
 
-/// The byte offset of char index `char_idx` within `text` (clamped to the
-/// end). Used to convert egui char-cursor positions to the byte ranges the
-/// search model speaks.
-fn byte_index(text: &str, char_idx: usize) -> usize {
-    text.char_indices()
-        .nth(char_idx)
-        .map_or_else(|| text.len(), |(b, _)| b)
-}
-
-/// The char index of byte offset `byte` within `text` (clamped). The inverse
-/// of [`byte_index`], for handing byte ranges back to egui's char cursors.
-fn char_index(text: &str, byte: usize) -> usize {
-    text.char_indices()
-        .position(|(b, _)| b >= byte)
-        .unwrap_or_else(|| text.chars().count())
-}
-
 /// Show a native "open file" picker. Returns `None` if cancelled or if no
 /// picker backend is available.
 fn rfd_pick_file() -> Option<std::path::PathBuf> {
@@ -2184,61 +2134,6 @@ mod tests {
     use std::{fs, path::PathBuf};
 
     use super::*;
-
-    #[test]
-    fn line_count_handles_empty_and_trailing_newlines() {
-        assert_eq!(line_count(""), 1);
-        assert_eq!(line_count("one line"), 1);
-        assert_eq!(line_count("a\nb\nc"), 3);
-        // A trailing newline opens a new empty final line.
-        assert_eq!(line_count("a\nb\n"), 3);
-    }
-
-    #[test]
-    fn line_numbers_unwrapped_rows_number_consecutively() {
-        // Three logical lines, none wrapped: every row ends with a newline
-        // except the last, and each row carries the next number.
-        let rows = [true, true, false];
-        assert_eq!(line_numbers_for_rows(rows), vec![(0, 1), (1, 2), (2, 3)],);
-    }
-
-    #[test]
-    fn line_numbers_skip_soft_wrap_continuation_rows() {
-        // Row 0 is a logical line that soft-wraps into row 1 (row 0 does NOT
-        // end with a newline). Row 1 ends the logical line with a newline, so
-        // row 2 starts the next logical line. The wrap-continuation row 1 must
-        // be left blank.
-        let rows = [false, true, false];
-        assert_eq!(line_numbers_for_rows(rows), vec![(0, 1), (2, 2)]);
-    }
-
-    #[test]
-    fn line_numbers_after_newline_do_not_mark_a_wrapped_row() {
-        // Regression for the reported bug: a wrapped first logical line
-        // (rows 0+1) followed by a freshly typed newline (row 1 ends with a
-        // newline) and then a new empty line (row 2). The wrap-continuation
-        // row 1 must stay blank; only rows 0 and 2 get numbers.
-        let rows = [false, true, false];
-        let numbered: Vec<usize> = line_numbers_for_rows(rows)
-            .into_iter()
-            .map(|(row, _)| row)
-            .collect();
-        assert!(
-            !numbered.contains(&1),
-            "the soft-wrap continuation row must not be numbered"
-        );
-        assert_eq!(numbered, vec![0, 2]);
-    }
-
-    #[test]
-    fn line_numbers_empty_galley_yields_nothing() {
-        assert_eq!(line_numbers_for_rows(std::iter::empty()), vec![]);
-    }
-
-    #[test]
-    fn line_numbers_single_row() {
-        assert_eq!(line_numbers_for_rows([false]), vec![(0, 1)]);
-    }
 
     #[test]
     fn requesting_close_of_a_clean_tab_closes_immediately() {
