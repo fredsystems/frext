@@ -188,8 +188,12 @@ impl Editor {
             }
         }
 
-        // Migrate expanded-folder entries under the old path to the new one.
+        // Migrate expanded-folder entries under the old path to the new one,
+        // and follow the root itself when it was the renamed path.
         if let Some(ws) = self.workspace.as_mut() {
+            if ws.root == from {
+                ws.root = to.clone();
+            }
             let migrated: Vec<(PathBuf, PathBuf)> = ws
                 .expanded
                 .iter()
@@ -686,6 +690,54 @@ mod tests {
         assert_eq!(name_prompt(&editor).kind, NameKind::NewFolder);
         // The dirty tab was not closed by the replaced prompt.
         assert!(editor.tabs()[index].is_dirty());
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Rename `from` to `name` through the sidebar's name prompt.
+    fn rename_via_prompt(editor: &mut Editor, from: &Path, name: &str) {
+        editor.apply(Command::BeginRename(from.to_path_buf()));
+        *editor.prompt_name_mut().unwrap() = name.to_owned();
+        editor.apply(Command::SubmitName);
+    }
+
+    #[test]
+    fn renaming_the_workspace_root_repoints_it() {
+        let dir = temp_dir("rename-root");
+        let project = dir.join("project");
+        fs::create_dir_all(project.join("src")).unwrap();
+        let mut editor = editor_in(&dir, &[], Some(project.as_path()));
+        editor.apply(Command::SetExpanded {
+            dir: project.join("src"),
+            state: FolderState::Expanded,
+        });
+
+        rename_via_prompt(&mut editor, &project, "renamed");
+
+        let renamed = dir.join("renamed");
+        let ws = editor.workspace().unwrap();
+        assert_eq!(ws.root, renamed);
+        assert!(ws.is_expanded(&renamed.join("src")));
+        assert!(!ws.is_expanded(&project.join("src")));
+        drop(editor);
+
+        let restored = Store::at(dir.join("state")).unwrap().load().unwrap();
+        assert_eq!(restored.workspace.unwrap().root, renamed);
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn renaming_a_child_leaves_the_root_alone() {
+        let dir = temp_dir("rename-child");
+        let project = dir.join("project");
+        fs::create_dir_all(project.join("src")).unwrap();
+        let mut editor = editor_in(&dir, &[], Some(project.as_path()));
+
+        rename_via_prompt(&mut editor, &project.join("src"), "lib");
+
+        assert!(project.join("lib").is_dir());
+        assert_eq!(editor.workspace().unwrap().root, project);
 
         fs::remove_dir_all(&dir).unwrap();
     }
