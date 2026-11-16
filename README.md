@@ -4,8 +4,7 @@
 
 frext is a small GUI text editor built on [egui]/[eframe]. It aims to be
 minimal and fast while still offering the conveniences that make a daily
-driver pleasant: tabs, session persistence, and (as a stretch goal)
-syntax highlighting.
+driver pleasant: tabs, session persistence, and syntax highlighting.
 
 ## Features
 
@@ -14,9 +13,9 @@ syntax highlighting.
   Every keystroke is written to a per-tab swap file under the platform
   state directory, so an unsaved buffer is exactly as you left it on the
   next launch — even after a crash.
-- **Catppuccin Mocha theme.** The palette is applied directly to egui's
-  visuals, so there is no theme-crate dependency to drift behind egui
-  releases.
+- **Catppuccin Mocha theme.** The palette is defined in `frext-core` and
+  applied directly to egui's visuals, so there is no theme-crate
+  dependency to drift behind egui releases.
 - **Bundled coding font with ligatures.** frext embeds the CaskaydiaCove
   Nerd Font (Cascadia Code) and installs it as the editor's monospace
   face, so coding ligatures (`->`, `=>`, `!=`, …) and a broad glyph set
@@ -30,8 +29,9 @@ syntax highlighting.
 - **Open from the command line.** `frext file.txt` opens the file on
   launch (alongside any restored session). A file that is already open is
   focused rather than opened twice.
-- **Syntax highlighting.** Powered by syntect (via `egui_extras`), with
-  the language auto-detected from the file extension. Untitled or
+- **Syntax highlighting.** Powered by syntect with the `bat` syntax
+  collection (via `two-face`), driven directly by frext, with the
+  language auto-detected from the file extension. Untitled or
   extension-less buffers render as plain text.
 - **Spelling and grammar checking.** Powered by
   [Harper](https://github.com/Automattic/harper), entirely offline.
@@ -114,7 +114,21 @@ The package is also exposed as an overlay (`frext.overlays.default`,
 adding `pkgs.frext`) and directly as
 `frext.packages.${system}.frext`.
 
+## Workspace
+
+frext is a Cargo workspace of two crates:
+
+- **`frext-core`** — the frontend-independent core: the `Editor`
+  controller (driven by `Command`s, returning `Effect`s), buffers,
+  session persistence, the workspace tree, search, proofreading,
+  syntax highlighting into styled spans, and the colour palette. It
+  never depends on a UI toolkit.
+- **`frext`** — the egui/eframe GUI front end and the `frext` binary.
+
 ## Development
+
+Run the checks from the repository root, inside the dev shell
+(`nix develop`); they cover both crates:
 
 ```sh
 cargo fmt --all -- --check
