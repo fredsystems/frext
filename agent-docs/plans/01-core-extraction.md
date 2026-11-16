@@ -806,6 +806,32 @@ Stop: report and await review.
 - **Scheduling:** independent of every other subtask; may land at any
   point before the PR is marked `pending merge`.
 
+### 01.14 -- Fix: keep the system clipboard handle alive
+
+- **Surfaced:** manual check of deliberate behaviour change 1 on the
+  final branch (`49f01af`), on Wayland: Copy Path / Copy Relative Path
+  put nothing on the clipboard, logging
+  `arboard::platform::linux::x11: Could not hand the clipboard contents
+  over to the clipboard manager. The request timed out.`
+- **Cause:** 01.6 kept `SystemClipboard`'s create-per-call behaviour
+  (this plan's instruction was wrong). On Linux, arboard serves the
+  selection from the owning process; dropping the last
+  `arboard::Clipboard` hands the contents to a clipboard manager (100 ms
+  timeout) and then destroys its window, so without a manager the
+  contents are lost immediately. The editor context menu's Cut / Copy
+  had the same pre-existing bug on `main`; Ctrl+C worked only because
+  egui handles it natively.
+- **Scope of fix:** `frext-core/src/clipboard.rs` and the
+  `SystemClipboard` construction site in `frext/src/app.rs`.
+- **Approach:** `SystemClipboard` holds one lazily created arboard
+  handle for the editor's lifetime, dropping it (and reconnecting on
+  the next call) only after a failed operation. A private backend seam
+  makes the retention logic testable without the OS clipboard.
+- **Verification:** regression tests for handle reuse and reconnect;
+  the standard ritual; manual: Copy Path and context-menu Copy paste
+  into another application on Wayland.
+- **Scheduling:** before the PR is marked `pending merge`.
+
 ## Manual smoke checklist (whole plan)
 
 The GUI is not covered by UI tests, so before the PR is marked
