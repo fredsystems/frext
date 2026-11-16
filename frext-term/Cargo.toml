@@ -24,6 +24,10 @@ unicode-width = { workspace = true }
 criterion = { workspace = true }
 
 [[bench]]
+name = "buffer"
+harness = false
+
+[[bench]]
 name = "wrap"
 harness = false
 
