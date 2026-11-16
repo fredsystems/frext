@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use eframe::egui;
 
 use crate::{
+    clipboard::{Clipboard, SystemClipboard},
     highlight::MatchHighlights,
     persistence::Store,
     proofread::{Diagnostic, DiagnosticKind, IgnoreKey, state::Proofreading},
@@ -71,6 +72,9 @@ pub struct FrextApp {
     /// The diagnostic under the pointer when the editor was last
     /// right-clicked; drives the suggestion entries of the context menu.
     menu_diagnostic: Option<Diagnostic>,
+    /// The clipboard used by cut/copy/paste and the sidebar's copy-path
+    /// actions.
+    clipboard: Box<dyn Clipboard>,
 }
 
 /// A pending filesystem name-entry prompt driven by a modal dialog.
@@ -128,6 +132,15 @@ impl FrextApp {
     #[must_use]
     pub fn new(store: Store) -> Self {
         Self::with_args(store, &[], None)
+    }
+
+    /// Build the app like [`FrextApp::new`], but backed by `clipboard`
+    /// instead of the system clipboard.
+    #[cfg(test)]
+    fn with_clipboard(store: Store, clipboard: Box<dyn Clipboard>) -> Self {
+        let mut app = Self::new(store);
+        app.clipboard = clipboard;
+        app
     }
 
     /// Build the app, restoring the previous session and then opening any
@@ -200,6 +213,7 @@ impl FrextApp {
             proofread: Proofreading::new(user_words),
             dictionary_file,
             menu_diagnostic: None,
+            clipboard: Box::new(SystemClipboard),
         };
 
         for file in files {
@@ -507,7 +521,7 @@ impl FrextApp {
                     let text =
                         crate::edit_ops::selected_text(&tab.text, selection.start, selection.end);
                     if !text.is_empty() {
-                        crate::clipboard::write_text(text);
+                        self.clipboard.write_text(text);
                     }
                 }
                 false
@@ -521,14 +535,14 @@ impl FrextApp {
                 if text.is_empty() {
                     return false;
                 }
-                crate::clipboard::write_text(text);
+                self.clipboard.write_text(text);
                 let caret =
                     crate::edit_ops::delete_range(&mut tab.text, selection.start, selection.end);
                 Self::store_caret(ctx, editor_id, caret);
                 true
             }
             EditorAction::Paste => {
-                let Some(clip) = crate::clipboard::read_text() else {
+                let Some(clip) = self.clipboard.read_text() else {
                     return false;
                 };
                 if clip.is_empty() {
@@ -638,7 +652,7 @@ impl FrextApp {
     /// Apply a deferred sidebar context-menu action after the tree borrow has
     /// ended. The mutating actions (rename, create, trash) open a modal or
     /// touch the filesystem and reconcile any affected open tabs.
-    fn apply_tree_action(&mut self, ctx: &egui::Context, action: TreeAction) {
+    fn apply_tree_action(&mut self, action: TreeAction) {
         match action {
             TreeAction::Open(path) => {
                 if self.open_path(&path) {
@@ -646,10 +660,11 @@ impl FrextApp {
                 }
             }
             TreeAction::CopyPath(path) => {
-                ctx.copy_text(path.display().to_string());
+                self.clipboard.write_text(path.display().to_string());
             }
             TreeAction::CopyRelativePath(path) => {
-                ctx.copy_text(self.relative_to_root(&path));
+                let relative = self.relative_to_root(&path);
+                self.clipboard.write_text(relative);
             }
             TreeAction::Reveal(path) => crate::fs_ops::reveal(&path),
             TreeAction::Rename(path) => {
@@ -1748,7 +1763,7 @@ impl eframe::App for FrextApp {
                     self.persist_session();
                 }
                 if let Some(action) = tree_action {
-                    self.apply_tree_action(&ctx, action);
+                    self.apply_tree_action(action);
                 }
             }
         }
@@ -2128,6 +2143,7 @@ mod tests {
     use std::{fs, path::PathBuf};
 
     use super::*;
+    use crate::clipboard::MemoryClipboard;
 
     #[test]
     fn requesting_close_of_a_clean_tab_closes_immediately() {
@@ -2219,7 +2235,7 @@ mod tests {
     /// A fresh app backed by a store rooted in `dir/state`.
     fn app_in(dir: &std::path::Path) -> FrextApp {
         let store = Store::at(dir.join("state")).unwrap();
-        FrextApp::new(store)
+        FrextApp::with_clipboard(store, Box::new(MemoryClipboard::default()))
     }
 
     #[test]
@@ -2641,14 +2657,83 @@ mod tests {
         let mut app = app_in(&dir);
         app.tabs[app.active].text = "hello world".to_owned();
 
-        // Cut "hello " (chars 0..6). The clipboard write may be unavailable in
-        // a headless test environment, but the buffer deletion is independent
-        // of that and must happen.
+        // Cut "hello " (chars 0..6).
         let ctx = egui::Context::default();
         let changed = app.apply_editor_action(&ctx, EditorAction::Cut, None, Some(0..6));
 
         assert!(changed);
         assert_eq!(app.tabs[app.active].text, "world");
+        assert_eq!(app.clipboard.read_text().as_deref(), Some("hello "));
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn paste_replaces_the_selection_with_clipboard_text() {
+        let dir = temp_dir("editor-paste");
+        let mut app = app_in(&dir);
+        app.tabs[app.active].text = "hello world".to_owned();
+        assert!(app.clipboard.write_text("there".to_owned()));
+
+        // Paste over "world" (chars 6..11).
+        let ctx = egui::Context::default();
+        let changed = app.apply_editor_action(&ctx, EditorAction::Paste, None, Some(6..11));
+
+        assert!(changed);
+        assert_eq!(app.tabs[app.active].text, "hello there");
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn paste_with_an_empty_clipboard_is_a_noop() {
+        let dir = temp_dir("editor-paste-empty");
+        let mut app = app_in(&dir);
+        app.tabs[app.active].text = "unchanged".to_owned();
+
+        let ctx = egui::Context::default();
+        let changed = app.apply_editor_action(&ctx, EditorAction::Paste, None, Some(0..2));
+
+        assert!(!changed);
+        assert_eq!(app.tabs[app.active].text, "unchanged");
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn copy_path_writes_the_absolute_path_to_the_clipboard() {
+        let dir = temp_dir("copy-path");
+        let nested = dir.join("a").join("b.txt");
+
+        let store = Store::at(dir.join("state")).unwrap();
+        let mut app = FrextApp::with_args(store, &[], Some(dir.as_path()));
+        app.clipboard = Box::new(MemoryClipboard::default());
+
+        app.apply_tree_action(TreeAction::CopyPath(nested.clone()));
+
+        assert_eq!(
+            app.clipboard.read_text(),
+            Some(nested.display().to_string())
+        );
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn copy_relative_path_writes_the_root_relative_path() {
+        let dir = temp_dir("copy-relpath");
+        let nested = dir.join("a").join("b.txt");
+
+        let store = Store::at(dir.join("state")).unwrap();
+        let mut app = FrextApp::with_args(store, &[], Some(dir.as_path()));
+        app.clipboard = Box::new(MemoryClipboard::default());
+
+        app.apply_tree_action(TreeAction::CopyRelativePath(nested));
+
+        assert_eq!(
+            app.clipboard.read_text(),
+            Some(PathBuf::from("a/b.txt").display().to_string())
+        );
 
         fs::remove_dir_all(&dir).unwrap();
     }
@@ -2664,6 +2749,7 @@ mod tests {
 
         assert!(!changed);
         assert_eq!(app.tabs[app.active].text, "keep me");
+        assert_eq!(app.clipboard.read_text().as_deref(), Some("keep"));
 
         fs::remove_dir_all(&dir).unwrap();
     }
