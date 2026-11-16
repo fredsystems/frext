@@ -15,6 +15,7 @@ pub mod font;
 pub mod fs_ops;
 pub mod highlight;
 pub mod icon;
+pub mod palette;
 pub mod persistence;
 pub mod proofread;
 pub mod search;
