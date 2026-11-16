@@ -2800,6 +2800,7 @@ dependencies = [
 name = "frext-term"
 version = "0.1.0"
 dependencies = [
+ "criterion",
  "crossterm",
  "frext-core",
  "log",

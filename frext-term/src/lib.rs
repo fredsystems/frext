@@ -5,6 +5,7 @@
 //! [`frext_core`] crate.
 
 pub mod app;
+pub mod buffer;
 pub mod cli;
 pub mod clipboard;
 pub mod complete;
