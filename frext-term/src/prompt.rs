@@ -105,6 +105,15 @@ enum OpenState {
     Open,
 }
 
+/// Whether the save-as prompt is editing its path or asking to replace
+/// an existing file. Replacing needs focus moved onto "Replace" first,
+/// so a held (auto-repeating) Enter can never confirm it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PathStage {
+    Editing,
+    ConfirmOverwrite(PathBuf),
+}
+
 /// The title, field label and action label of a name prompt.
 const fn name_labels(kind: NameKind) -> (&'static str, &'static str, &'static str) {
     match kind {
@@ -160,7 +169,7 @@ pub struct PromptUi {
     path_error: Option<String>,
     completion: Completion,
     candidates: CompletionView,
-    overwrite_armed: Option<PathBuf>,
+    stage: PathStage,
 }
 
 impl PromptUi {
@@ -180,7 +189,7 @@ impl PromptUi {
             path_error: None,
             completion: Completion::default(),
             candidates: CompletionView::default(),
-            overwrite_armed: None,
+            stage: PathStage::Editing,
         }
     }
 
@@ -224,13 +233,14 @@ impl PromptUi {
         true
     }
 
-    /// Clears the path prompts' text, error, completion and arming.
+    /// Clears the path prompts' text, error and completion, and returns
+    /// to editing.
     fn reset_path(&mut self) {
         self.path_text.clear();
         self.path_error = None;
         self.completion.reset();
         self.candidates = CompletionView::default();
-        self.overwrite_armed = None;
+        self.stage = PathStage::Editing;
     }
 
     /// Resets the view state when the editor's prompt differs from the
@@ -272,7 +282,9 @@ impl PromptUi {
                 self.focus = PromptFocus::Input;
                 self.input.move_to_end(&prompt.name);
             }
-            (Some(PromptKey::SavePath(_) | PromptKey::Open), _) => {
+            (Some(PromptKey::SavePath(_) | PromptKey::Open), _)
+                if self.stage == PathStage::Editing =>
+            {
                 self.focus = PromptFocus::Input;
                 self.input.move_to_end(&self.path_text);
             }
@@ -375,6 +387,10 @@ impl PromptUi {
         if key.kind == KeyEventKind::Release {
             return PromptReply::Handled;
         }
+        if let PathStage::ConfirmOverwrite(path) = &self.stage {
+            let path = path.clone();
+            return self.overwrite_key(path, key);
+        }
         self.focus = PromptFocus::Input;
         match key.code {
             KeyCode::Tab => {
@@ -406,15 +422,54 @@ impl PromptUi {
                 .tab(&mut self.path_text, &base, self.home.as_deref(), direction);
         self.input.move_to_end(&self.path_text);
         self.path_error = None;
-        self.overwrite_armed = None;
     }
 
-    /// Drops the completion, error and overwrite arming after an edit.
+    /// Drops the completion and error after an edit.
     fn path_edited(&mut self) {
         self.completion.reset();
         self.candidates = CompletionView::default();
-        self.overwrite_armed = None;
         self.path_error = None;
+    }
+
+    /// Handles a key while asking whether to replace `path`: the field is
+    /// locked, arrows and Tab move between Replace and Back, and Esc goes
+    /// back like Back does.
+    fn overwrite_key(&mut self, path: PathBuf, key: KeyEvent) -> PromptReply {
+        match key.code {
+            KeyCode::Left | KeyCode::Right | KeyCode::Tab | KeyCode::BackTab => {
+                self.focus = match self.focus {
+                    PromptFocus::Button(0) => PromptFocus::Button(1),
+                    _ => PromptFocus::Button(0),
+                };
+                PromptReply::Handled
+            }
+            KeyCode::Enter => match self.focus {
+                PromptFocus::Button(0) => PromptReply::Send(Command::SubmitSavePath(path)),
+                _ => self.overwrite_back(),
+            },
+            KeyCode::Esc => self.overwrite_back(),
+            _ => PromptReply::Handled,
+        }
+    }
+
+    /// Leaves the replace question and returns to editing the path.
+    fn overwrite_back(&mut self) -> PromptReply {
+        self.stage = PathStage::Editing;
+        self.focus = PromptFocus::Input;
+        self.input.move_to_end(&self.path_text);
+        PromptReply::Handled
+    }
+
+    /// Handles a click while asking whether to replace `path`. A click
+    /// outside the popup goes back to editing rather than cancelling.
+    fn overwrite_click(&mut self, path: PathBuf, target: Option<Target>) -> PromptReply {
+        match target {
+            Some(Target::PromptButton(0)) => PromptReply::Send(Command::SubmitSavePath(path)),
+            Some(Target::PromptPopup | Target::PromptInput | Target::PromptCandidate(_)) => {
+                PromptReply::Handled
+            }
+            _ => self.overwrite_back(),
+        }
     }
 
     /// Submits the path field of the current path prompt.
@@ -432,7 +487,7 @@ impl PromptUi {
         }
     }
 
-    /// Validates a save-as target; an existing file needs a second Enter.
+    /// Validates a save-as target; an existing file asks to be replaced.
     fn submit_save(&mut self, path: PathBuf) -> PromptReply {
         if path.is_dir() {
             self.path_error = Some(format!("\u{201c}{}\u{201d} is a directory", path.display()));
@@ -452,14 +507,12 @@ impl PromptUi {
             ));
             return PromptReply::Handled;
         }
-        if path.exists() && self.overwrite_armed.as_ref() != Some(&path) {
-            let name = path
-                .file_name()
-                .map_or_else(String::new, |name| name.to_string_lossy().into_owned());
-            self.path_error = Some(format!(
-                "\u{201c}{name}\u{201d} exists. Press Enter again to replace it"
-            ));
-            self.overwrite_armed = Some(path);
+        if path.exists() {
+            self.path_error = None;
+            self.completion.reset();
+            self.candidates = CompletionView::default();
+            self.stage = PathStage::ConfirmOverwrite(path);
+            self.focus = PromptFocus::Button(1);
             return PromptReply::Handled;
         }
         PromptReply::Send(Command::SubmitSavePath(path))
@@ -498,6 +551,10 @@ impl PromptUi {
 
     /// Handles a click on `target` in a path prompt.
     fn path_click(&mut self, editor: &Editor, target: Option<Target>, column: u16) -> PromptReply {
+        if let PathStage::ConfirmOverwrite(path) = &self.stage {
+            let path = path.clone();
+            return self.overwrite_click(path, target);
+        }
         match target {
             Some(Target::PromptButton(0)) => self.path_submit(editor),
             Some(Target::PromptButton(1)) => self.path_cancel(),
@@ -578,12 +635,12 @@ impl PromptUi {
                     self.input.insert_str(name, text);
                 }
             }
-            Some(PromptKey::SavePath(_) | PromptKey::Open) => {
+            Some(PromptKey::SavePath(_) | PromptKey::Open) if self.stage == PathStage::Editing => {
                 self.focus = PromptFocus::Input;
                 self.input.insert_str(&mut self.path_text, text);
                 self.path_edited();
             }
-            Some(PromptKey::ConfirmClose(_)) | None => {}
+            Some(PromptKey::SavePath(_) | PromptKey::Open | PromptKey::ConfirmClose(_)) | None => {}
         }
     }
 
@@ -679,10 +736,27 @@ impl PromptUi {
             hits.push(input_rect, Target::PromptInput);
             self.input_rect = Some(input_rect);
             let position = self.input.render(&self.path_text, input_rect, buf);
-            if self.focus == PromptFocus::Input {
+            if self.focus == PromptFocus::Input && self.stage == PathStage::Editing {
                 cursor = position;
             }
             y += 1;
+        }
+        let error_style = theme::status_error().bg(theme::popup().bg.unwrap_or_default());
+        if let PathStage::ConfirmOverwrite(path) = &self.stage {
+            if y < limit {
+                let name = path
+                    .file_name()
+                    .map_or_else(String::new, |name| name.to_string_lossy().into_owned());
+                let message = format!("\u{201c}{name}\u{201d} exists.");
+                buf.set_stringn(inner.x, y, message, width, error_style);
+            }
+            let focused = match self.focus {
+                PromptFocus::Button(index) => index,
+                PromptFocus::Input => 1,
+            };
+            let row = Rect::new(inner.x, limit, inner.width, 1);
+            popup::render_buttons(&["Replace", "Back"], focused, row, buf, hits);
+            return None;
         }
         if y < limit {
             let hint = format!("relative to {}", self.effective_base(editor).display());
@@ -692,8 +766,7 @@ impl PromptUi {
         if let Some(error) = &self.path_error
             && y < limit
         {
-            let style = theme::status_error().bg(theme::popup().bg.unwrap_or_default());
-            buf.set_stringn(inner.x, y, error, width, style);
+            buf.set_stringn(inner.x, y, error, width, error_style);
             y += 1;
         }
         let start = self
@@ -1316,9 +1389,10 @@ mod tests {
         fs::remove_dir_all(&dir).unwrap();
     }
 
-    #[test]
-    fn save_path_to_an_existing_file_needs_two_enters() {
-        let (dir, files, mut editor, mut ui) = save_fixture("save-existing");
+    /// A save-as prompt whose field names the existing `old.txt`, with
+    /// the replace question showing.
+    fn overwrite_fixture(tag: &str) -> (PathBuf, PathBuf, Editor, PromptUi) {
+        let (dir, files, mut editor, mut ui) = save_fixture(tag);
         let target = files.join("old.txt");
         fs::write(&target, "old").unwrap();
         type_text(&mut ui, &mut editor, "old.txt");
@@ -1326,11 +1400,60 @@ mod tests {
             ui.handle_key(&mut editor, press(KeyCode::Enter)),
             PromptReply::Handled
         );
+        assert_eq!(ui.stage, PathStage::ConfirmOverwrite(target.clone()));
+        (dir, target, editor, ui)
+    }
+
+    #[test]
+    fn save_path_to_an_existing_file_asks_to_replace() {
+        let (dir, target, mut editor, mut ui) = overwrite_fixture("save-existing");
+        assert_eq!(ui.focus, PromptFocus::Button(1));
+        assert_eq!(ui.path_error, None);
+        // The field is locked while the question shows.
+        type_text(&mut ui, &mut editor, "x");
+        ui.handle_key(&mut editor, press(KeyCode::Backspace));
+        ui.handle_paste(&mut editor, "y");
+        assert_eq!(ui.path_text, "old.txt");
+        assert_eq!(ui.stage, PathStage::ConfirmOverwrite(target.clone()));
         assert_eq!(
-            ui.path_error.as_deref(),
-            Some("\u{201c}old.txt\u{201d} exists. Press Enter again to replace it")
+            ui.handle_click(&mut editor, Some(Target::PromptInput), 0),
+            PromptReply::Handled
         );
-        assert_eq!(ui.overwrite_armed.as_ref(), Some(&target));
+        assert_eq!(
+            ui.handle_click(&mut editor, Some(Target::PromptPopup), 0),
+            PromptReply::Handled
+        );
+        assert_eq!(ui.stage, PathStage::ConfirmOverwrite(target));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn held_enter_never_overwrites() {
+        let (dir, files, mut editor, mut ui) = save_fixture("save-held");
+        let target = files.join("old.txt");
+        fs::write(&target, "old").unwrap();
+        type_text(&mut ui, &mut editor, "old.txt");
+        for _ in 0..20 {
+            let reply = ui.handle_key(&mut editor, press(KeyCode::Enter));
+            assert_eq!(reply, PromptReply::Handled);
+        }
+        assert!(matches!(
+            ui.stage,
+            PathStage::Editing | PathStage::ConfirmOverwrite(_)
+        ));
+        assert!(matches!(editor.prompt(), Some(Prompt::SavePath { .. })));
+        assert_eq!(fs::read_to_string(&target).unwrap(), "old");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn replace_needs_focus_then_enter() {
+        let (dir, target, mut editor, mut ui) = overwrite_fixture("save-replace");
+        assert_eq!(
+            ui.handle_key(&mut editor, press(KeyCode::Left)),
+            PromptReply::Handled
+        );
+        assert_eq!(ui.focus, PromptFocus::Button(0));
         assert_eq!(
             ui.handle_key(&mut editor, press(KeyCode::Enter)),
             send(Command::SubmitSavePath(target))
@@ -1339,21 +1462,102 @@ mod tests {
     }
 
     #[test]
-    fn editing_disarms_the_overwrite() {
-        let (dir, files, mut editor, mut ui) = save_fixture("save-disarm");
-        fs::write(files.join("old.txt"), "old").unwrap();
-        type_text(&mut ui, &mut editor, "old.txt");
-        ui.handle_key(&mut editor, press(KeyCode::Enter));
-        assert!(ui.overwrite_armed.is_some());
+    fn confirm_focus_toggles_with_arrows_and_tab() {
+        let (dir, _, mut editor, mut ui) = overwrite_fixture("save-toggle");
+        for (code, expected) in [
+            (KeyCode::Right, 0),
+            (KeyCode::Tab, 1),
+            (KeyCode::BackTab, 0),
+            (KeyCode::Left, 1),
+        ] {
+            ui.handle_key(&mut editor, press(code));
+            assert_eq!(ui.focus, PromptFocus::Button(expected));
+        }
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn back_and_esc_return_to_editing() {
+        // Enter on the default Back, Esc, a click on Back, a click outside.
+        for way in 0..4 {
+            let (dir, _, mut editor, mut ui) = overwrite_fixture(&format!("save-back-{way}"));
+            let reply = match way {
+                0 => ui.handle_key(&mut editor, press(KeyCode::Enter)),
+                1 => ui.handle_key(&mut editor, press(KeyCode::Esc)),
+                2 => ui.handle_click(&mut editor, Some(Target::PromptButton(1)), 0),
+                _ => ui.handle_click(&mut editor, None, 0),
+            };
+            assert_eq!(reply, PromptReply::Handled);
+            assert_eq!(ui.stage, PathStage::Editing);
+            assert_eq!(ui.focus, PromptFocus::Input);
+            assert!(matches!(editor.prompt(), Some(Prompt::SavePath { .. })));
+            assert_eq!(ui.input.cursor(), "old.txt".len());
+            let (_, _, cursor) = render(&mut ui, &editor);
+            assert!(cursor.is_some());
+            type_text(&mut ui, &mut editor, "2");
+            assert_eq!(ui.path_text, "old.txt2");
+            fs::remove_dir_all(&dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn confirm_row_renders_replace_and_back() {
+        let (dir, _, editor, mut ui) = overwrite_fixture("save-render");
+        let (buf, hits, cursor) = render(&mut ui, &editor);
+        assert_eq!(cursor, None);
+        let row = find_row(&buf, "\u{201c}old.txt\u{201d} exists.").unwrap();
+        let col = column_of(&row_text(&buf, row), "exists");
+        assert_eq!(buf[(col, row)].style().fg, theme::status_error().fg);
+        assert!(find_row(&buf, "relative to").is_none());
+        assert!(find_row(&buf, "[ Save ]").is_none());
+        let buttons = find_row(&buf, "[ Replace ] [ Back ]").unwrap();
+        let text = row_text(&buf, buttons);
+        let back = column_of(&text, "[ Back");
+        let replace = column_of(&text, "[ Replace");
+        assert_eq!(buf[(back, buttons)].style().bg, theme::button_focused().bg);
+        assert_eq!(buf[(replace, buttons)].style().bg, theme::popup().bg);
+        assert_eq!(hits.hit(back, buttons), Some(Target::PromptButton(1)));
+        assert_eq!(hits.hit(replace, buttons), Some(Target::PromptButton(0)));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn clicking_replace_submits() {
+        let (dir, target, mut editor, mut ui) = overwrite_fixture("save-click-replace");
+        let (buf, hits, _) = render(&mut ui, &editor);
+        let row = find_row(&buf, "[ Replace ]").unwrap();
+        let col = column_of(&row_text(&buf, row), "[ Replace");
+        let hit = hits.hit(col, row);
+        assert_eq!(hit, Some(Target::PromptButton(0)));
+        assert_eq!(
+            ui.handle_click(&mut editor, hit, col),
+            send(Command::SubmitSavePath(target))
+        );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_new_save_prompt_starts_editing() {
+        let (dir, _, mut editor, mut ui) = overwrite_fixture("save-new-prompt");
+        editor.apply(Command::CancelPrompt);
+        ui.sync(&editor);
+        editor.apply(Command::Save);
+        ui.sync(&editor);
+        assert_eq!(ui.stage, PathStage::Editing);
+        assert_eq!(ui.focus, PromptFocus::Input);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn editing_after_back_re_asks_for_the_new_path() {
+        let (dir, target, mut editor, mut ui) = overwrite_fixture("save-disarm");
+        ui.handle_key(&mut editor, press(KeyCode::Esc));
         ui.handle_key(&mut editor, press(KeyCode::Backspace));
-        type_text(&mut ui, &mut editor, "t");
-        assert_eq!(ui.overwrite_armed, None);
-        assert_eq!(ui.path_error, None);
+        type_text(&mut ui, &mut editor, "x");
         assert_eq!(
             ui.handle_key(&mut editor, press(KeyCode::Enter)),
-            PromptReply::Handled
+            send(Command::SubmitSavePath(target.with_file_name("old.txx")))
         );
-        assert!(ui.overwrite_armed.is_some());
         fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -1515,7 +1719,7 @@ mod tests {
             );
             let expected = format!("\u{201c}{}\u{201d} is not a regular file", target.display());
             assert_eq!(ui.path_error.as_deref(), Some(expected.as_str()));
-            assert_eq!(ui.overwrite_armed, None);
+            assert_eq!(ui.stage, PathStage::Editing);
         }
         fs::remove_dir_all(&dir).unwrap();
     }
@@ -1549,11 +1753,9 @@ mod tests {
             ui.handle_key(&mut editor, press(KeyCode::Enter)),
             PromptReply::Handled
         );
-        assert_eq!(
-            ui.path_error.as_deref(),
-            Some("\u{201c}link.txt\u{201d} exists. Press Enter again to replace it")
-        );
-        assert_eq!(ui.overwrite_armed.as_ref(), Some(&link));
+        assert_eq!(ui.path_error, None);
+        assert_eq!(ui.stage, PathStage::ConfirmOverwrite(link.clone()));
+        ui.handle_key(&mut editor, press(KeyCode::Left));
         assert_eq!(
             ui.handle_key(&mut editor, press(KeyCode::Enter)),
             send(Command::SubmitSavePath(link))
