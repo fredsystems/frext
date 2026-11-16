@@ -3,11 +3,14 @@
 //!
 //! [`TerminalGuard::enter`] sets everything up and [`restore`] undoes
 //! it. Restoring runs on drop and from a panic hook, so the user's
-//! terminal is left usable however the editor exits.
+//! terminal is left usable however the editor exits. The hook only
+//! restores for a panic on the UI thread; a panic on a worker thread
+//! (which may be caught and recovered from) is just logged.
 
 use std::io::{self, Stdout, Write};
-use std::sync::Once;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Once, OnceLock};
+use std::thread::ThreadId;
 
 use crossterm::event::{
     DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
@@ -27,6 +30,8 @@ static ACTIVE: AtomicBool = AtomicBool::new(false);
 static ENHANCED: AtomicBool = AtomicBool::new(false);
 /// Guards the one-time panic hook installation.
 static PANIC_HOOK: Once = Once::new();
+/// The thread that entered the terminal: the UI thread.
+static UI_THREAD: OnceLock<ThreadId> = OnceLock::new();
 
 /// How key events are reported by the terminal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -94,8 +99,9 @@ impl TerminalGuard {
     /// [`Terminal`].
     ///
     /// Enables raw mode, detects keyboard enhancement support, writes the
-    /// setup sequences, and installs a panic hook that restores the
-    /// terminal. If any step fails, what was done is undone.
+    /// setup sequences, records the calling thread as the UI thread, and
+    /// installs a panic hook that restores the terminal when the UI
+    /// thread panics. If any step fails, what was done is undone.
     ///
     /// # Errors
     ///
@@ -121,6 +127,8 @@ impl TerminalGuard {
         }
         ENHANCED.store(mode == KeyboardMode::Enhanced, Ordering::SeqCst);
         ACTIVE.store(true, Ordering::SeqCst);
+        // Already set when entered before: the UI thread does not change.
+        let _ = UI_THREAD.set(std::thread::current().id());
         install_panic_hook();
         // From here on, an early return drops the guard, which restores.
         let guard = Self { mode };
@@ -172,15 +180,45 @@ fn restore_to(out: &mut impl Write) -> bool {
     true
 }
 
-/// Install, once, a panic hook that restores the terminal before the
-/// previous hook prints the panic message.
+/// What the panic hook does for a panic on a given thread.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PanicResponse {
+    /// Restore the terminal, log, and run the previous hook.
+    RestoreAndReport,
+    /// Only log: the panic may be caught, and restoring or printing
+    /// would break the still-running UI.
+    LogOnly,
+}
+
+/// Decide the panic response for a panic on thread `current`, given the
+/// UI thread `ui` (`None` before the terminal was ever entered).
+fn panic_response(current: ThreadId, ui: Option<ThreadId>) -> PanicResponse {
+    match ui {
+        Some(ui) if ui != current => PanicResponse::LogOnly,
+        _ => PanicResponse::RestoreAndReport,
+    }
+}
+
+/// Install, once, a panic hook. A panic on the UI thread restores the
+/// terminal before the previous hook prints the panic message; a panic
+/// on any other thread is only logged, leaving the terminal and the
+/// screen untouched.
 fn install_panic_hook() {
     PANIC_HOOK.call_once(|| {
         let previous = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |info| {
-            restore();
-            log::error!("panic: {info}");
-            previous(info);
+            let current = std::thread::current();
+            match panic_response(current.id(), UI_THREAD.get().copied()) {
+                PanicResponse::RestoreAndReport => {
+                    restore();
+                    log::error!("panic: {info}");
+                    previous(info);
+                }
+                PanicResponse::LogOnly => {
+                    let name = current.name().unwrap_or("<unnamed>");
+                    log::error!("panic on thread {name}: {info}");
+                }
+            }
         }));
     });
 }
@@ -253,5 +291,41 @@ mod tests {
             mode: KeyboardMode::Legacy,
         };
         assert_eq!(guard.mode(), KeyboardMode::Legacy);
+    }
+
+    fn other_thread_id() -> ThreadId {
+        std::thread::spawn(|| std::thread::current().id())
+            .join()
+            .unwrap()
+    }
+
+    #[test]
+    fn panic_response_on_the_ui_thread_restores() {
+        let ui = std::thread::current().id();
+        assert_eq!(
+            panic_response(ui, Some(ui)),
+            PanicResponse::RestoreAndReport
+        );
+    }
+
+    #[test]
+    fn panic_response_on_another_thread_only_logs() {
+        let ui = std::thread::current().id();
+        let worker = other_thread_id();
+        assert_ne!(worker, ui);
+        assert_eq!(panic_response(worker, Some(ui)), PanicResponse::LogOnly);
+    }
+
+    #[test]
+    fn panic_response_before_enter_restores() {
+        let current = std::thread::current().id();
+        assert_eq!(
+            panic_response(current, None),
+            PanicResponse::RestoreAndReport
+        );
+        assert_eq!(
+            panic_response(other_thread_id(), None),
+            PanicResponse::RestoreAndReport
+        );
     }
 }
