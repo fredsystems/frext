@@ -5,6 +5,7 @@
 //! with them. The terminal's lifecycle (raw mode, alternate screen,
 //! restore) stays in [`crate::terminal`].
 
+pub mod backend;
 pub mod caps;
 pub mod probe;
 pub mod tmux;
