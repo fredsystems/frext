@@ -53,6 +53,18 @@ enum SidebarVisibility {
     Hidden,
 }
 
+/// How the open menu was placed. A `Caret` menu is re-anchored to the
+/// caret on every render, so a layout change between opening it and the
+/// next draw (the find bar closing, say) cannot leave it stale; a
+/// `Pointer` menu stays where it opened.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MenuOrigin {
+    /// At a fixed cell: a right-click, or the tree's own keyboard menu.
+    Pointer,
+    /// From the keyboard at the editor's caret.
+    Caret,
+}
+
 /// Whether the user asked to quit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Quit {
@@ -68,6 +80,7 @@ pub struct TermApp {
     sidebar: SidebarVisibility,
     prompt: PromptUi,
     menu: Option<ContextMenu<Command>>,
+    menu_origin: MenuOrigin,
     find: FindBar,
     tree: FileTree,
     buffer: BufferView,
@@ -102,6 +115,7 @@ impl TermApp {
             sidebar: SidebarVisibility::Shown,
             prompt: PromptUi::new(base, home),
             menu: None,
+            menu_origin: MenuOrigin::Pointer,
             find: FindBar::new(),
             tree: FileTree::new(),
             buffer: BufferView::default(),
@@ -332,7 +346,9 @@ impl TermApp {
 
     /// Opens the editor menu from the keyboard: with the diagnostic at
     /// the caret, below the caret's cell, or at the editor's top-left
-    /// cell when the caret is not on screen.
+    /// cell when the caret is not on screen. That placement comes from
+    /// the last render's layout; the next render re-anchors the menu to
+    /// the caret as drawn then ([`MenuOrigin::Caret`]).
     fn open_editor_menu_at_caret(&mut self) {
         let Some(tab) = self.editor.active_tab() else {
             return;
@@ -348,7 +364,7 @@ impl TermApp {
             },
             MenuAnchor::Below,
         );
-        self.open_editor_menu(diagnostic, anchor);
+        self.open_editor_menu(diagnostic, anchor, MenuOrigin::Caret);
     }
 
     /// Routes a key the keymap left unbound to the file tree, over rows
@@ -361,7 +377,11 @@ impl TermApp {
         match self.tree.handle_key(key) {
             TreeReply::Send(command) => self.send(command, now),
             TreeReply::OpenMenu { path, kind, anchor } => {
-                self.menu = Some(ContextMenu::new(tree_menu::entries(&path, kind), anchor));
+                // The tree places its menu from its own rows: it stays put.
+                self.open_menu(
+                    ContextMenu::new(tree_menu::entries(&path, kind), anchor),
+                    MenuOrigin::Pointer,
+                );
             }
             TreeReply::Resized => self.forget_layout(),
             TreeReply::Handled | TreeReply::Ignored => {}
@@ -556,24 +576,24 @@ impl TermApp {
                                 self.editor.proofread().diagnostics(tab.id, &tab.text);
                             diagnostic_in(&diagnostics, chars).cloned()
                         });
-                        self.open_editor_menu(diagnostic, MenuAnchor::At(at));
+                        self.open_editor_menu(diagnostic, MenuAnchor::At(at), MenuOrigin::Pointer);
                     }
                     Some(Target::TreeRow(index)) => {
                         if let Some(row) = self.tree.row(index).cloned() {
                             self.tree.select(index);
-                            self.menu = Some(ContextMenu::new(
-                                tree_menu::entries(&row.path, row.kind),
-                                at,
-                            ));
+                            self.open_menu(
+                                ContextMenu::new(tree_menu::entries(&row.path, row.kind), at),
+                                MenuOrigin::Pointer,
+                            );
                             self.set_focus(Focus::Sidebar);
                         }
                     }
                     Some(Target::TreeEmpty) => {
                         if let Some(workspace) = self.editor.workspace() {
-                            self.menu = Some(ContextMenu::new(
-                                tree_menu::dir_entries(&workspace.root),
-                                at,
-                            ));
+                            self.open_menu(
+                                ContextMenu::new(tree_menu::dir_entries(&workspace.root), at),
+                                MenuOrigin::Pointer,
+                            );
                             self.set_focus(Focus::Sidebar);
                         }
                     }
@@ -620,10 +640,21 @@ impl TermApp {
         }
     }
 
-    /// Opens the editor menu placed by `anchor`, leading with
-    /// `diagnostic`'s items when there is one, its cut and copy enabled
-    /// only over a selection.
-    fn open_editor_menu(&mut self, diagnostic: Option<Diagnostic>, anchor: MenuAnchor) {
+    /// Opens `menu`, recording how it was placed.
+    fn open_menu(&mut self, menu: ContextMenu<Command>, origin: MenuOrigin) {
+        self.menu = Some(menu);
+        self.menu_origin = origin;
+    }
+
+    /// Opens the editor menu placed by `anchor` from `origin`, leading
+    /// with `diagnostic`'s items when there is one, its cut and copy
+    /// enabled only over a selection.
+    fn open_editor_menu(
+        &mut self,
+        diagnostic: Option<Diagnostic>,
+        anchor: MenuAnchor,
+        origin: MenuOrigin,
+    ) {
         if let Some(tab) = self.editor.active_tab() {
             let selection = if self
                 .buffer
@@ -635,7 +666,7 @@ impl TermApp {
                 Enablement::Disabled
             };
             let entries = editor_menu::entries(selection, diagnostic.as_ref());
-            self.menu = Some(ContextMenu::anchored(entries, anchor));
+            self.open_menu(ContextMenu::anchored(entries, anchor), origin);
             // The chosen command acts on the editor's selection.
             self.set_focus(Focus::Editor);
         }
@@ -842,6 +873,16 @@ impl TermApp {
             buf,
             &mut self.hits,
         );
+        // A keyboard menu follows the caret as this frame drew it: the
+        // layout may have moved since the menu was opened.
+        if self.menu_origin == MenuOrigin::Caret
+            && let Some(menu) = self.menu.as_mut()
+        {
+            menu.set_anchor(caret.map_or(
+                MenuAnchor::At(Position::new(areas.editor.x, areas.editor.y)),
+                MenuAnchor::Below,
+            ));
+        }
 
         let (left, right) = tab.map_or_else(
             || (String::new(), String::new()),
@@ -4217,6 +4258,64 @@ mod tests {
                     Position::new(rect.x, rect.y)
                 ))
             );
+            fs::remove_dir_all(&dir).unwrap();
+        }
+
+        /// Closing the find bar moves the editor up; the menu key pressed
+        /// in the same batch places the menu from the old layout, and the
+        /// next draw re-anchors it under the caret as drawn then.
+        #[test]
+        fn the_menu_key_menu_follows_the_caret_drawn_after_the_find_bar_closes() {
+            let dir = temp_dir("menu-key-follows-caret");
+            let mut app = app_with_text(&dir, "hello\nworld", KeyboardMode::Enhanced);
+            app.handle(ctrl('f'), Instant::now());
+            draw(&mut app);
+            let open_rect = app.buffer.rect();
+            assert!(open_rect.y > 1, "{open_rect:?}");
+            // No draw from here to the menu key.
+            app.handle(key(KeyCode::Esc, KeyModifiers::NONE), Instant::now());
+            assert!(!app.editor().search().is_open());
+            assert_eq!(app.focus, Focus::Editor);
+            app.handle(key(KeyCode::F(10), KeyModifiers::SHIFT), Instant::now());
+            // The initial placement is from the last draw, under the bar.
+            let stale = Position::new(open_rect.x, open_rect.y);
+            assert_eq!(
+                app.menu,
+                Some(ContextMenu::below(menu_entries(None), stale))
+            );
+
+            let buf = draw(&mut app);
+            let cell = app
+                .buffer
+                .caret_cell(app.editor().active_tab().unwrap())
+                .unwrap();
+            assert_eq!(cell.y, 1, "the caret is drawn on the first text row");
+            let area = buf.area;
+            let rect = app.menu.as_ref().unwrap().rect(area);
+            assert_eq!((rect.x, rect.y), (cell.x, cell.y + 1));
+            assert_eq!(
+                row_text(&buf, rect.y).chars().nth(usize::from(rect.x)),
+                Some('┌')
+            );
+            fs::remove_dir_all(&dir).unwrap();
+        }
+
+        #[test]
+        fn a_right_click_menu_stays_where_it_opened_across_draws() {
+            let dir = temp_dir("right-click-menu-stays");
+            let mut app = app_with_text(&dir, "hello\nworld", KeyboardMode::Enhanced);
+            app.handle(ctrl('f'), Instant::now());
+            draw(&mut app);
+            // Past the text of the editor's second row, away from the caret.
+            let y = app.buffer.rect().y + 1;
+            right_click(&mut app, 20, y);
+            let expected = ContextMenu::new(menu_entries(None), Position::new(20, y));
+            assert_eq!(app.menu.as_ref(), Some(&expected));
+            for _ in 0..2 {
+                let buf = draw(&mut app);
+                assert_eq!(app.menu.as_ref(), Some(&expected));
+                assert_eq!(row_text(&buf, y).chars().nth(20), Some('┌'));
+            }
             fs::remove_dir_all(&dir).unwrap();
         }
 

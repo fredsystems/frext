@@ -120,6 +120,12 @@ impl<T: Clone> ContextMenu<T> {
         Self::anchored(entries, MenuAnchor::Below(cell))
     }
 
+    /// Re-places the menu by `anchor`. The entries and the highlight are
+    /// kept, so a menu re-anchored while open keeps its keyboard state.
+    pub const fn set_anchor(&mut self, anchor: MenuAnchor) {
+        self.anchor = anchor;
+    }
+
     /// The entry index of the highlighted item, if any.
     #[must_use]
     pub const fn highlighted(&self) -> Option<usize> {
@@ -918,6 +924,27 @@ mod tests {
             ContextMenu::anchored(entries.clone(), MenuAnchor::Below(p)),
             ContextMenu::below(entries, p)
         );
+    }
+
+    #[test]
+    fn set_anchor_moves_the_rect_and_keeps_the_highlight() {
+        let area = Rect::new(0, 0, 80, 24);
+        let mut menu = sample_below(Position::new(5, 3));
+        menu.handle_key(press(KeyCode::Down));
+        menu.handle_key(press(KeyCode::Down));
+        assert_eq!(menu.highlighted(), Some(3));
+
+        menu.set_anchor(MenuAnchor::Below(Position::new(10, 7)));
+        assert_eq!(menu.rect(area), Rect::new(10, 8, 14, 8));
+        assert_eq!(menu.highlighted(), Some(3));
+
+        menu.set_anchor(MenuAnchor::At(Position::new(2, 1)));
+        assert_eq!(menu.rect(area), Rect::new(2, 1, 14, 8));
+        assert_eq!(menu.highlighted(), Some(3));
+
+        let before = menu.clone();
+        menu.set_anchor(MenuAnchor::At(Position::new(2, 1)));
+        assert_eq!(menu, before);
     }
 
     #[test]
