@@ -495,6 +495,33 @@ on right-click; do NOT proceed further.
 
 Stop: report files changed and verification; await review.
 
+### 07.7 -- Cleanup (deferred): keyboard menu after an unrendered edit
+
+Surface point: 07.6 (`8090026`), reported by its implementer.
+
+Impact: `BufferView::caret_cell` returns `None` when the tab's stored
+layout is stale (its text changed since the last render). If an edit
+and Shift+F10 / Menu arrive in the same input batch, there has been no
+render in between, so the keyboard menu opens at the editor's top-left
+instead of below the caret. The diagnostic is still found correctly
+(`diagnostic_at` reads the live text). A render follows every batch,
+so this needs typing and the menu key within one read.
+
+Scope of fix: `frext-term/src/buffer/mod.rs` (and a test in
+`frext-term/src/app.rs`).
+
+Suggested approach: give `BufferView` a `&mut self` variant that runs
+`prepare` (re-layout and keep the caret visible, as `render` does)
+before computing the cell, and call it from
+`TermApp::open_editor_menu_at_caret`.
+
+Verification: an app test that types a char and presses Shift+F10 in
+one batch, with no draw in between, gets `ContextMenu::below` at the
+caret's cell; the standard ritual.
+
+Scheduling: independent of everything else in this plan; may land
+after 07 merges, under a later plan's cleanup.
+
 ## Manual smoke checklist
 
 Run in a real terminal (kitty or freminal, then a terminal without
