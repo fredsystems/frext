@@ -35,7 +35,10 @@ pub enum IconCell {
 }
 
 /// Chooses the icon for a tree row.
-pub trait IconProvider {
+///
+/// `Debug` is a supertrait so a type that owns a provider (as
+/// `FileTree` does) can still derive `Debug`.
+pub trait IconProvider: std::fmt::Debug {
     /// The icon for the entry called `name` (its file name, not its
     /// path) of the given `kind`.
     fn icon(&self, name: &str, kind: IconKind) -> IconCell;

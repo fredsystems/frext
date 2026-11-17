@@ -408,10 +408,17 @@ Stop: report and await review.
 
 ### 05.5 -- `FileTree`: state, refresh, width and rendering
 
-Scope: `frext-term/src/tree.rs` (new), `frext-term/src/lib.rs`.
+Scope: `frext-term/src/tree.rs` (new), `frext-term/src/lib.rs`,
+`frext-term/src/icons.rs` (the `Debug` supertrait only, added during
+05.5).
 
 What:
 
+- `icons.rs`: `pub trait IconProvider: std::fmt::Debug`, so `FileTree`
+  can own a provider and still derive `Debug`. Found during 05.5: with
+  the provider as a `render` parameter, `render` had 8 arguments and
+  failed `clippy::too_many_arguments`; owning it keeps the provider
+  choice in one place for plan 08.
 - `lib.rs`: `pub mod tree;`. The module doc describes the sidebar and
   the split of ownership (core owns the workspace, the tree owns the
   selection, scroll, width and drag).
@@ -437,9 +444,11 @@ What:
   - `total: u16` (the terminal width at the last render)
   - `area: Rect` (the sidebar at the last render)
   - `resize: Resize`
+  - `icons: Box<dyn IconProvider>`
 - Methods (with `Default` delegating to `new`):
   - `#[must_use] pub fn new() -> Self`: no rows, nothing selected,
-    `width: DEFAULT_WIDTH`, `total: 0`, `Rect::default()`, `Idle`.
+    `width: DEFAULT_WIDTH`, `total: 0`, `Rect::default()`, `Idle`,
+    `Box::new(AsciiIcons)`. Plan 08 adds a way to choose the provider.
   - `#[must_use] pub const fn width(&self) -> u16`
   - `#[must_use] pub fn effective_width(&self, total: u16) -> u16`
     returns `clamp_width(self.width, total)`.
@@ -455,9 +464,9 @@ What:
     Otherwise it stores them, repairs the selection (the rule under
     "Further decisions", Selection), clamps `top` to
     `rows.len().saturating_sub(1)`, and returns `Changed`.
-  - `pub fn render(&mut self, editor: &Editor, icons: &dyn
-    IconProvider, focus: TreeFocus, hovered: Option<Target>, area:
-    Rect, buf: &mut Buffer, hits: &mut HitMap)`:
+  - `pub fn render(&mut self, editor: &Editor, focus: TreeFocus,
+    hovered: Option<Target>, area: Rect, buf: &mut Buffer, hits: &mut
+    HitMap)`, using `self.icons`:
     - Stores `area` and `total = buf.area.width`, then calls
       `refresh(editor.workspace())`.
     - Without a workspace, or with an empty `area`, draws nothing.
@@ -581,14 +590,13 @@ Scope: `frext-term/src/app.rs`.
 
 What:
 
-- `TermApp` gains `tree: FileTree` and `icons: Box<dyn IconProvider>`
-  (initialised to `Box::new(AsciiIcons)`; plan 08 chooses the provider
-  there). `SIDEBAR_WIDTH` is removed.
+- `TermApp` gains `tree: FileTree` (which owns the icon provider; see
+  05.5). `SIDEBAR_WIDTH` is removed.
 - `render`: `sidebar_width` is
   `self.sidebar_shown().then(|| self.tree.effective_width(area.width))`.
   The `paint::fill` of the sidebar is replaced, while the sidebar is
-  shown, by `self.tree.render(&self.editor, self.icons.as_ref(), focus,
-  self.hovered, areas.sidebar, buf, &mut self.hits)` with
+  shown, by `self.tree.render(&self.editor, focus, self.hovered,
+  areas.sidebar, buf, &mut self.hits)` with
   `TreeFocus::Focused` iff `self.focus == Focus::Sidebar`.
 - `handle_key`: when `action_for` returns `None` and focus is
   `Focus::Sidebar`:
