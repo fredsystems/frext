@@ -13,6 +13,7 @@ pub mod editor_menu;
 pub mod events;
 pub mod find_bar;
 pub mod hit;
+pub mod icons;
 pub mod keymap;
 pub mod layout;
 pub mod logging;
