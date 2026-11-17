@@ -24,6 +24,7 @@ use ratatui::style::{Modifier, Style};
 use crate::hit::{HitMap, Target};
 use crate::icons::{AsciiIcons, ICON_WIDTH, IconCell, IconKind, IconProvider};
 use crate::paint;
+use crate::term::kitty::PLACEHOLDER_CELLS;
 use crate::theme;
 
 /// The sidebar width at launch, border included.
@@ -168,6 +169,23 @@ impl FileTree {
             resize: Resize::Idle,
             icons: Box::new(AsciiIcons),
         }
+    }
+
+    /// Replaces the provider of the icon in front of each row.
+    pub fn set_icons(&mut self, icons: Box<dyn IconProvider>) {
+        self.icons = icons;
+    }
+
+    /// The bytes the icon provider queued since the last call, to be
+    /// written to the terminal before the frame that shows them.
+    pub fn take_uploads(&mut self) -> Vec<u8> {
+        self.icons.take_uploads()
+    }
+
+    /// The bytes that delete every image the icon provider uploaded;
+    /// afterwards it has nothing uploaded.
+    pub fn release_icons(&mut self) -> Vec<u8> {
+        self.icons.release()
     }
 
     /// The stored width, border included, as clamped at the last
@@ -600,7 +618,7 @@ impl FileTree {
             } else {
                 theme::chrome()
             };
-            draw_row(buf, line, row, self.icons.as_ref(), base.bg(bg));
+            draw_row(buf, line, row, self.icons.as_mut(), base.bg(bg));
             hits.push(line, Target::TreeRow(index));
             drawn = drawn.saturating_add(1);
         }
@@ -622,7 +640,13 @@ impl FileTree {
 
 /// Draws one tree row into `line` (which excludes the border) in
 /// `style`; the icon keeps its own foreground.
-fn draw_row(buf: &mut Buffer, line: Rect, row: &TreeRow, icons: &dyn IconProvider, style: Style) {
+fn draw_row(
+    buf: &mut Buffer,
+    line: Rect,
+    row: &TreeRow,
+    icons: &mut dyn IconProvider,
+    style: Style,
+) {
     paint::fill(buf, line, style);
 
     let end = line.right();
@@ -645,9 +669,20 @@ fn draw_row(buf: &mut Buffer, line: Rect, row: &TreeRow, icons: &dyn IconProvide
         RowKind::Dir(state) => IconKind::Dir(state),
         RowKind::File => IconKind::File,
     };
-    let IconCell::Text { text, color } = icons.icon(&name, kind);
     let icon_room = room(x).min(usize::from(ICON_WIDTH));
-    buf.set_stringn(x, line.y, text, icon_room, style.fg(theme::color(color)));
+    match icons.icon(&name, kind) {
+        IconCell::Text { text, color } => {
+            buf.set_stringn(x, line.y, text, icon_room, style.fg(theme::color(color)));
+        }
+        IconCell::Image { id } => {
+            let icon_style = style.fg(id.color());
+            for (offset, symbol) in (0u16..).zip(PLACEHOLDER_CELLS.iter().take(icon_room)) {
+                if let Some(cell) = buf.cell_mut(Position::new(x.saturating_add(offset), line.y)) {
+                    cell.set_symbol(symbol).set_style(icon_style);
+                }
+            }
+        }
+    }
 
     let name_x = x.saturating_add(ICON_WIDTH);
     if name_x < end {
@@ -1140,6 +1175,110 @@ mod tests {
         for (x, y) in [(0, 0), (2, 0), (0, 1), (29, 3), (10, 7)] {
             assert_eq!(hits.hit(x, y), None);
         }
+    }
+
+    /// A provider that shows image `0x010203` for every row and hands
+    /// back fixed upload and release bytes.
+    #[derive(Debug)]
+    struct FakeIcons {
+        uploads: Vec<u8>,
+        release: Vec<u8>,
+    }
+
+    impl IconProvider for FakeIcons {
+        fn icon(&mut self, _name: &str, _kind: IconKind) -> IconCell {
+            IconCell::Image {
+                id: crate::term::kitty::ImageId::new(0x01_0203).unwrap(),
+            }
+        }
+
+        fn take_uploads(&mut self) -> Vec<u8> {
+            std::mem::take(&mut self.uploads)
+        }
+
+        fn release(&mut self) -> Vec<u8> {
+            std::mem::take(&mut self.release)
+        }
+    }
+
+    fn fake_icons() -> Box<FakeIcons> {
+        Box::new(FakeIcons {
+            uploads: b"up".to_vec(),
+            release: b"del".to_vec(),
+        })
+    }
+
+    #[test]
+    fn image_icons_draw_both_placeholder_cells() {
+        let (_dir, _, editor) = fixture("image", &[]);
+        let mut tree = FileTree::new();
+        tree.set_icons(fake_icons());
+        let (buf, _) = render(&mut tree, &editor, TreeFocus::Unfocused, None, SIDEBAR);
+        for y in 1..5 {
+            assert_eq!(buf[(3, y)].symbol(), PLACEHOLDER_CELLS[0], "{y}");
+            assert_eq!(buf[(4, y)].symbol(), PLACEHOLDER_CELLS[1], "{y}");
+            assert_eq!(buf[(3, y)].fg, Color::Rgb(1, 2, 3), "{y}");
+            assert_eq!(buf[(4, y)].fg, Color::Rgb(1, 2, 3), "{y}");
+            assert_eq!(Some(buf[(3, y)].bg), mantle(), "{y}");
+        }
+        assert_eq!(
+            row_text(&buf, 3),
+            format!(
+                "   {}{}Cargo.toml",
+                PLACEHOLDER_CELLS[0], PLACEHOLDER_CELLS[1]
+            )
+        );
+    }
+
+    #[test]
+    fn image_icons_keep_the_selected_rows_background() {
+        let (_dir, _, editor) = fixture("image-selected", &[]);
+        let mut tree = FileTree::new();
+        tree.set_icons(fake_icons());
+        render(&mut tree, &editor, TreeFocus::Focused, None, SIDEBAR);
+        tree.select(2);
+        let (buf, _) = render(&mut tree, &editor, TreeFocus::Focused, None, SIDEBAR);
+        for x in [3, 4] {
+            assert_eq!(buf[(x, 3)].bg, theme::tree_cursor_bg(), "{x}");
+            assert_eq!(buf[(x, 3)].fg, Color::Rgb(1, 2, 3), "{x}");
+        }
+        assert_eq!(buf[(3, 3)].symbol(), PLACEHOLDER_CELLS[0]);
+        assert_eq!(buf[(4, 3)].symbol(), PLACEHOLDER_CELLS[1]);
+    }
+
+    #[test]
+    fn image_icon_in_a_one_cell_slot_draws_only_the_first_placeholder() {
+        let (_dir, _, editor) = fixture("image-narrow", &[]);
+        let mut tree = FileTree::new();
+        tree.set_icons(fake_icons());
+        // Four cells left of the border: the prefix takes three, so one
+        // slot cell fits.
+        let (buf, _) = render(
+            &mut tree,
+            &editor,
+            TreeFocus::Unfocused,
+            None,
+            Rect::new(0, 0, 5, 8),
+        );
+        for y in 1..5 {
+            assert_eq!(buf[(3, y)].symbol(), PLACEHOLDER_CELLS[0], "{y}");
+            assert_eq!(buf[(3, y)].fg, Color::Rgb(1, 2, 3), "{y}");
+            assert_eq!(buf[(4, y)].symbol(), " ", "{y}");
+            assert_eq!(Some(buf[(4, y)].bg), theme::tree_border().bg, "{y}");
+            assert_eq!(buf[(5, y)], Buffer::empty(SCREEN)[(5, y)], "{y}");
+        }
+    }
+
+    #[test]
+    fn uploads_and_release_pass_through_the_provider() {
+        let mut tree = FileTree::new();
+        assert!(tree.take_uploads().is_empty());
+        assert!(tree.release_icons().is_empty());
+        tree.set_icons(fake_icons());
+        assert_eq!(tree.take_uploads(), b"up");
+        assert_eq!(tree.take_uploads(), b"");
+        assert_eq!(tree.release_icons(), b"del");
+        assert_eq!(tree.release_icons(), b"");
     }
 
     fn key(code: KeyCode) -> KeyEvent {
