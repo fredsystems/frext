@@ -8,7 +8,8 @@ use ratatui::layout::Rect;
 pub struct Areas {
     /// The tab bar, one row at the top.
     pub tab_bar: Rect,
-    /// The find bar under the tab bar, one row when open.
+    /// The find bar under the tab bar, `find_rows` rows tall (0 when
+    /// closed).
     pub find_bar: Rect,
     /// The file-tree sidebar on the left of the body.
     pub sidebar: Rect,
@@ -22,13 +23,13 @@ pub struct Areas {
 
 /// Splits `area` into the editor screen regions.
 ///
-/// Rows, top to bottom: tab bar (1), find bar (1 when `find_open`, else
-/// 0), body (the rest), status line (1). The body splits left to right
+/// Rows, top to bottom: tab bar (1), find bar (`find_rows`, 0 when
+/// closed), body (the rest), status line (1). The body splits left to right
 /// into the sidebar (`sidebar_width`, or 0), the gutter (`gutter_width`)
 /// and the editor (the rest). Widths and heights are clamped so every
 /// region lies inside `area`.
 #[must_use]
-pub fn areas(area: Rect, find_open: bool, sidebar_width: Option<u16>, gutter_width: u16) -> Areas {
+pub fn areas(area: Rect, find_rows: u16, sidebar_width: Option<u16>, gutter_width: u16) -> Areas {
     let mut rows_left = area.height;
     let mut take = |wanted: u16| {
         let got = wanted.min(rows_left);
@@ -37,7 +38,7 @@ pub fn areas(area: Rect, find_open: bool, sidebar_width: Option<u16>, gutter_wid
     };
     let tab_height = take(1);
     let status_height = take(1);
-    let find_height = take(u16::from(find_open));
+    let find_height = take(find_rows);
     let body_height = rows_left;
 
     let tab_bar = Rect::new(area.x, area.y, area.width, tab_height);
@@ -96,7 +97,7 @@ mod tests {
 
     #[test]
     fn find_bar_closed() {
-        let a = areas(Rect::new(0, 0, 80, 24), false, None, 4);
+        let a = areas(Rect::new(0, 0, 80, 24), 0, None, 4);
         assert_eq!(a.tab_bar, Rect::new(0, 0, 80, 1));
         assert_eq!(a.find_bar.height, 0);
         assert_eq!(a.sidebar, Rect::new(0, 1, 0, 22));
@@ -107,15 +108,36 @@ mod tests {
 
     #[test]
     fn find_bar_open() {
-        let a = areas(Rect::new(0, 0, 80, 24), true, None, 4);
+        let a = areas(Rect::new(0, 0, 80, 24), 1, None, 4);
         assert_eq!(a.find_bar, Rect::new(0, 1, 80, 1));
         assert_eq!(a.editor, Rect::new(4, 2, 76, 21));
         assert_eq!(a.status, Rect::new(0, 23, 80, 1));
     }
 
     #[test]
+    fn three_row_find_bar_pushes_editor_down() {
+        let a = areas(Rect::new(0, 0, 80, 24), 3, None, 4);
+        assert_eq!(a.find_bar, Rect::new(0, 1, 80, 3));
+        assert_eq!(a.editor, Rect::new(4, 4, 76, 19));
+        assert_eq!(a.status, Rect::new(0, 23, 80, 1));
+    }
+
+    #[test]
+    fn find_bar_taller_than_space_left() {
+        let area = Rect::new(0, 0, 80, 5);
+        let a = areas(area, 6, None, 4);
+        assert_eq!(a.tab_bar, Rect::new(0, 0, 80, 1));
+        assert_eq!(a.find_bar, Rect::new(0, 1, 80, 3));
+        assert_eq!(a.editor.height, 0);
+        assert_eq!(a.status, Rect::new(0, 4, 80, 1));
+        for r in all(&a) {
+            assert!(inside(area, r), "{r:?}");
+        }
+    }
+
+    #[test]
     fn sidebar_open() {
-        let a = areas(Rect::new(0, 0, 80, 24), false, Some(20), 3);
+        let a = areas(Rect::new(0, 0, 80, 24), 0, Some(20), 3);
         assert_eq!(a.sidebar, Rect::new(0, 1, 20, 22));
         assert_eq!(a.gutter, Rect::new(20, 1, 3, 22));
         assert_eq!(a.editor, Rect::new(23, 1, 57, 22));
@@ -124,7 +146,7 @@ mod tests {
     #[test]
     fn offset_area() {
         let area = Rect::new(5, 3, 40, 10);
-        let a = areas(area, true, Some(10), 3);
+        let a = areas(area, 1, Some(10), 3);
         for r in all(&a) {
             assert!(inside(area, r), "{r:?}");
         }
@@ -136,11 +158,11 @@ mod tests {
     #[test]
     fn widths_wider_than_body_are_clamped() {
         let area = Rect::new(0, 0, 10, 5);
-        let a = areas(area, false, Some(8), 5);
+        let a = areas(area, 0, Some(8), 5);
         assert_eq!(a.sidebar.width, 8);
         assert_eq!(a.gutter.width, 2);
         assert_eq!(a.editor.width, 0);
-        let a = areas(area, false, Some(50), 5);
+        let a = areas(area, 0, Some(50), 5);
         assert_eq!(a.sidebar.width, 10);
         assert_eq!(a.gutter.width, 0);
         assert_eq!(a.editor.width, 0);
@@ -149,7 +171,7 @@ mod tests {
     #[test]
     fn one_by_one() {
         let area = Rect::new(0, 0, 1, 1);
-        let a = areas(area, true, Some(20), 4);
+        let a = areas(area, 1, Some(20), 4);
         assert_eq!(a.tab_bar, Rect::new(0, 0, 1, 1));
         assert_eq!(a.status.height, 0);
         assert_eq!(a.find_bar.height, 0);
@@ -162,7 +184,7 @@ mod tests {
     #[test]
     fn zero_by_zero() {
         let area = Rect::new(0, 0, 0, 0);
-        let a = areas(area, true, Some(20), 4);
+        let a = areas(area, 1, Some(20), 4);
         for r in all(&a) {
             assert_eq!(r.area(), 0);
             assert!(inside(area, r), "{r:?}");
@@ -174,10 +196,10 @@ mod tests {
         for width in 0..12 {
             for height in 0..6 {
                 let area = Rect::new(2, 1, width, height);
-                for find_open in [false, true] {
+                for find_rows in 0..=6 {
                     for sidebar in [None, Some(0), Some(3), Some(100)] {
                         for gutter in [0, 3, 100] {
-                            let a = areas(area, find_open, sidebar, gutter);
+                            let a = areas(area, find_rows, sidebar, gutter);
                             for r in all(&a) {
                                 assert!(inside(area, r), "{area:?} {r:?}");
                             }

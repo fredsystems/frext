@@ -511,7 +511,7 @@ impl TermApp {
         let sidebar_width = self.sidebar_shown().then_some(SIDEBAR_WIDTH);
         let areas = layout::areas(
             area,
-            self.editor.search().is_open(),
+            u16::from(self.editor.search().is_open()),
             sidebar_width,
             gutter_width,
         );
