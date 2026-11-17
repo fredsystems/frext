@@ -5,7 +5,9 @@
 //! the interface.
 
 use frext_core::highlight::{MatchBackground, StyledSpan};
-use frext_core::palette::{self, BASE, MANTLE, OVERLAY1, Rgb, SUBTEXT0, SURFACE0, SURFACE1, TEXT};
+use frext_core::palette::{
+    self, BASE, MANTLE, OVERLAY0, OVERLAY1, Rgb, SUBTEXT0, SURFACE0, SURFACE1, TEXT,
+};
 use ratatui::style::{Color, Modifier, Style};
 
 /// Converts a palette colour into a 24-bit terminal colour.
@@ -70,6 +72,12 @@ pub const fn popup_border() -> Style {
     Style::new()
         .fg(color(palette::accent()))
         .bg(color(SURFACE0))
+}
+
+/// A disabled entry inside a popup.
+#[must_use]
+pub const fn disabled() -> Style {
+    Style::new().fg(color(OVERLAY0)).bg(color(SURFACE0))
 }
 
 /// A text input field inside a popup.
@@ -202,6 +210,14 @@ mod tests {
         assert_eq!(
             colours(popup_border()),
             (Some(color(palette::accent())), Some(color(SURFACE0)))
+        );
+    }
+
+    #[test]
+    fn disabled_is_overlay0_on_surface0() {
+        assert_eq!(
+            colours(disabled()),
+            (Some(color(OVERLAY0)), Some(color(SURFACE0)))
         );
     }
 

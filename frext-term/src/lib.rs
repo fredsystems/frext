@@ -14,6 +14,7 @@ pub mod hit;
 pub mod keymap;
 pub mod layout;
 pub mod logging;
+pub mod menu;
 pub mod popup;
 pub mod prompt;
 pub mod run;

@@ -286,7 +286,9 @@ impl TermApp {
                         Target::PromptPopup
                         | Target::PromptInput
                         | Target::PromptButton(_)
-                        | Target::PromptCandidate(_),
+                        | Target::PromptCandidate(_)
+                        | Target::MenuPopup
+                        | Target::MenuItem(_),
                     )
                     | None => {}
                 }
