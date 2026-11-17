@@ -26,7 +26,7 @@ use ratatui::layout::Position;
 
 use crate::buffer::cursor::Selecting;
 use crate::buffer::edit::{Applied, EditAction};
-use crate::buffer::{BufferView, WHEEL_ROWS};
+use crate::buffer::{BufferView, Overlays, WHEEL_ROWS};
 use crate::editor_menu;
 use crate::events::AppEvent;
 use crate::find_bar::{self, FindBar, FindField, FindReply};
@@ -796,7 +796,10 @@ impl TermApp {
             tab,
             areas.gutter,
             areas.editor,
-            self.editor.match_highlights_ref(),
+            Overlays {
+                matches: self.editor.match_highlights_ref(),
+                diagnostics: &[],
+            },
             buf,
             &mut self.hits,
         );

@@ -3,17 +3,21 @@
 //! [`render`] fills the gutter and the editor, numbers the first visual
 //! row of each logical line, draws every visible grapheme with its syntax
 //! colour and background (selection over search match over base), paints
-//! one selection cell after a selected line break, and returns the
-//! caret's screen position. It takes the layout and the highlighting as
-//! input and keeps no state.
+//! one selection cell after a selected line break, underlines every
+//! grapheme inside a proofreading diagnostic in its kind's squiggle colour
+//! (spelling over grammar where they overlap, on top of whichever
+//! background wins), and returns the caret's screen position. It takes
+//! the layout, the highlighting and the diagnostics as input and keeps no
+//! state.
 
 use std::ops::Range;
 
 use frext_core::highlight::StyledSpan;
 use frext_core::palette::BASE;
+use frext_core::proofread::{Diagnostic, DiagnosticKind};
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Position, Rect};
-use ratatui::style::Style;
+use ratatui::style::{Color, Modifier, Style};
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::buffer::cells::{self, Glyph};
@@ -38,6 +42,9 @@ pub struct RowsView<'a> {
     pub selection: Range<usize>,
     /// The caret's char index.
     pub caret: usize,
+    /// The proofreading diagnostics of `text`, sorted by start; they may
+    /// overlap.
+    pub diagnostics: &'a [&'a Diagnostic],
 }
 
 /// Draws `view` into `editor` and its line numbers into `gutter`, and
@@ -62,6 +69,8 @@ pub fn render(
         clip: editor_clip,
         spans: view.spans,
         span_index: 0,
+        diagnostics: visible_diagnostics(view, editor.height),
+        diagnostic_index: 0,
     };
     for offset in 0..editor.height {
         let Some(index) = view.top_row.checked_add(usize::from(offset)) else {
@@ -86,6 +95,28 @@ pub fn render(
     }
 
     caret_position(view, editor)
+}
+
+/// The diagnostics of `view` whose chars intersect the chars of the
+/// `height` rows drawn from `view.top_row`, in their original order.
+fn visible_diagnostics<'d>(view: &RowsView<'d>, height: u16) -> Vec<&'d Diagnostic> {
+    let rows = view.layout.rows();
+    let end = view
+        .top_row
+        .saturating_add(usize::from(height))
+        .min(rows.len());
+    let (Some(first), Some(last)) = (
+        rows.get(view.top_row),
+        end.checked_sub(1).and_then(|i| rows.get(i)),
+    ) else {
+        return Vec::new();
+    };
+    let visible = first.chars.start..last.chars.end;
+    view.diagnostics
+        .iter()
+        .copied()
+        .filter(|d| d.chars.start < visible.end && d.chars.end > visible.start)
+        .collect()
 }
 
 /// The caret's screen position, if it is on screen.
@@ -127,6 +158,10 @@ struct Painter<'b, 's> {
     clip: Rect,
     spans: &'s [StyledSpan],
     span_index: usize,
+    /// The diagnostics intersecting the visible rows, sorted by start.
+    diagnostics: Vec<&'s Diagnostic>,
+    /// Every diagnostic before this one ended before the current char.
+    diagnostic_index: usize,
 }
 
 impl Painter<'_, '_> {
@@ -142,6 +177,35 @@ impl Painter<'_, '_> {
         self.spans
             .get(self.span_index)
             .filter(|span| span.bytes.start <= byte)
+    }
+
+    /// The squiggle colour under char `char_idx`, if any diagnostic
+    /// contains it: spelling when any containing one is spelling.
+    ///
+    /// Calls must come in non-decreasing `char_idx` order.
+    fn squiggle_at(&mut self, char_idx: usize) -> Option<Color> {
+        while self
+            .diagnostics
+            .get(self.diagnostic_index)
+            .is_some_and(|d| d.chars.end <= char_idx)
+        {
+            self.diagnostic_index += 1;
+        }
+        let mut kind = None;
+        for d in self
+            .diagnostics
+            .get(self.diagnostic_index..)
+            .unwrap_or_default()
+            .iter()
+            .take_while(|d| d.chars.start <= char_idx)
+            .filter(|d| d.chars.contains(&char_idx))
+        {
+            kind = Some(d.kind);
+            if d.kind == DiagnosticKind::Spelling {
+                break;
+            }
+        }
+        kind.map(theme::squiggle)
     }
 
     /// Draws `row` starting at (`x`, `y`).
@@ -184,6 +248,12 @@ impl Painter<'_, '_> {
                     self.write(x, y, cells::REPLACEMENT, style);
                     style
                 }
+            };
+            let style = match self.squiggle_at(char_idx) {
+                Some(colour) => style
+                    .add_modifier(Modifier::UNDERLINED)
+                    .underline_color(colour),
+                None => style,
             };
             self.style_cells(x, y, width, style);
             x = x.saturating_add(width);
@@ -253,18 +323,86 @@ mod tests {
             spans,
             selection,
             caret,
+            diagnostics: &[],
         };
+        draw_view(&view, editor_width, height)
+    }
+
+    /// Renders `view` into a terminal `GUTTER + editor_width` wide and
+    /// `height` tall.
+    fn draw_view(
+        view: &RowsView<'_>,
+        editor_width: u16,
+        height: u16,
+    ) -> (Buffer, Option<Position>) {
         let mut terminal = Terminal::new(TestBackend::new(GUTTER + editor_width, height)).unwrap();
         let mut caret_at = None;
         terminal
             .draw(|frame| {
                 let gutter = Rect::new(0, 0, GUTTER, height);
                 let editor = Rect::new(GUTTER, 0, editor_width, height);
-                caret_at = render(&view, gutter, editor, frame.buffer_mut());
+                caret_at = render(view, gutter, editor, frame.buffer_mut());
             })
             .unwrap();
         (terminal.backend().buffer().clone(), caret_at)
     }
+
+    /// Renders `text` like [`draw`] with the caret at 0 and
+    /// `diagnostics` underlined.
+    fn draw_squiggled(
+        text: &str,
+        spans: &[StyledSpan],
+        top_row: usize,
+        selection: Range<usize>,
+        diagnostics: &[&Diagnostic],
+        editor_width: u16,
+        height: u16,
+    ) -> Buffer {
+        let layout = WrapLayout::new(text, editor_width.saturating_sub(1));
+        let view = RowsView {
+            text,
+            layout: &layout,
+            top_row,
+            spans,
+            selection,
+            caret: 0,
+            diagnostics,
+        };
+        draw_view(&view, editor_width, height).0
+    }
+
+    /// A diagnostic of `kind` over chars `chars` of `text`.
+    fn diagnostic(text: &str, kind: DiagnosticKind, chars: Range<usize>) -> Diagnostic {
+        let byte = |c: usize| text.char_indices().nth(c).map_or(text.len(), |(b, _)| b);
+        let bytes = byte(chars.start)..byte(chars.end);
+        Diagnostic {
+            kind,
+            flagged: text[bytes.clone()].to_owned(),
+            bytes,
+            chars,
+            message: "message".to_owned(),
+            suggestions: Vec::new(),
+        }
+    }
+
+    /// The squiggle colour under (`x`, `y`), or `None` when the cell is
+    /// not underlined. Panics when the cell is underlined without a
+    /// colour or coloured without an underline. A cell's default
+    /// underline colour is `Reset`, which counts as none.
+    fn squiggle(buf: &Buffer, x: u16, y: u16) -> Option<Color> {
+        let style = buf[(x, y)].style();
+        let underlined = style.add_modifier.contains(Modifier::UNDERLINED);
+        let colour = style.underline_color.filter(|c| *c != Color::Reset);
+        assert_eq!(
+            underlined,
+            colour.is_some(),
+            "cell ({x}, {y}): underline and colour disagree"
+        );
+        colour
+    }
+
+    const SPELLING: Option<Color> = Some(theme::squiggle(DiagnosticKind::Spelling));
+    const GRAMMAR: Option<Color> = Some(theme::squiggle(DiagnosticKind::Grammar));
 
     fn plain(text: &str) -> Vec<StyledSpan> {
         highlight(text, "")
@@ -439,6 +577,7 @@ mod tests {
             spans: &spans,
             selection: 0..2,
             caret: 0,
+            diagnostics: &[],
         };
         let mut buf = Buffer::empty(Rect::new(0, 0, 10, 1));
         render(
@@ -521,6 +660,7 @@ mod tests {
             spans: &spans,
             selection: 0..11,
             caret: 3,
+            diagnostics: &[],
         };
         let mut buf = Buffer::empty(Rect::new(0, 0, 4, 2));
         let caret = render(
@@ -558,6 +698,7 @@ mod tests {
             spans: &spans,
             selection: 0..20,
             caret: 0,
+            diagnostics: &[],
         };
         let mut buf = Buffer::empty(Rect::new(0, 0, 12, 3));
         let marker = Style::new().bg(Color::Red);
@@ -575,5 +716,176 @@ mod tests {
             assert_eq!(bg(&buf, x, 1), Some(Color::Red), "x {x}");
         }
         assert_eq!(row_text(&buf, 0), " 1 abcde    ");
+    }
+
+    #[test]
+    fn spelling_diagnostic_underlines_exactly_its_cells() {
+        let text = "a wrrod here";
+        let d = diagnostic(text, DiagnosticKind::Spelling, 2..7);
+        let buf = draw_squiggled(text, &plain(text), 0, 0..0, &[&d], 20, 1);
+        assert_eq!(squiggle(&buf, GUTTER + 1, 0), None);
+        for dx in 2..7 {
+            assert_eq!(squiggle(&buf, GUTTER + dx, 0), SPELLING, "dx {dx}");
+            assert!(
+                buf[(GUTTER + dx, 0)]
+                    .style()
+                    .add_modifier
+                    .contains(Modifier::UNDERLINED)
+            );
+        }
+        assert_eq!(squiggle(&buf, GUTTER + 7, 0), None);
+        assert_eq!(bg(&buf, GUTTER + 2, 0), base_bg());
+    }
+
+    #[test]
+    fn grammar_diagnostic_uses_grammar_colour() {
+        let text = "a wrrod here";
+        let d = diagnostic(text, DiagnosticKind::Grammar, 2..7);
+        let buf = draw_squiggled(text, &plain(text), 0, 0..0, &[&d], 20, 1);
+        for dx in 2..7 {
+            assert_eq!(squiggle(&buf, GUTTER + dx, 0), GRAMMAR, "dx {dx}");
+        }
+        assert_eq!(squiggle(&buf, GUTTER + 1, 0), None);
+    }
+
+    #[test]
+    fn diagnostic_across_soft_wrap_underlines_both_rows_not_newline_cell() {
+        let text = "abcdefgh\nxy";
+        // Wrap width 4: "abcd", "efgh", "xy". The diagnostic covers
+        // "cdefgh" and the newline after it.
+        let d = diagnostic(text, DiagnosticKind::Spelling, 2..9);
+        let buf = draw_squiggled(text, &plain(text), 0, 0..11, &[&d], 5, 3);
+        assert_eq!(squiggle(&buf, GUTTER + 1, 0), None);
+        assert_eq!(squiggle(&buf, GUTTER + 2, 0), SPELLING);
+        assert_eq!(squiggle(&buf, GUTTER + 3, 0), SPELLING);
+        for dx in 0..4 {
+            assert_eq!(squiggle(&buf, GUTTER + dx, 1), SPELLING, "dx {dx}");
+        }
+        // The selected newline cell after "efgh" is not underlined.
+        assert_eq!(bg(&buf, GUTTER + 4, 1), Some(theme::selection_bg()));
+        assert_eq!(squiggle(&buf, GUTTER + 4, 1), None);
+        assert_eq!(squiggle(&buf, GUTTER, 2), None);
+    }
+
+    #[test]
+    fn overlap_prefers_spelling_colour() {
+        let text = "the wrrod is";
+        let grammar = diagnostic(text, DiagnosticKind::Grammar, 0..9);
+        let spelling = diagnostic(text, DiagnosticKind::Spelling, 4..9);
+        let buf = draw_squiggled(text, &plain(text), 0, 0..0, &[&grammar, &spelling], 20, 1);
+        for dx in 0..4 {
+            assert_eq!(squiggle(&buf, GUTTER + dx, 0), GRAMMAR, "dx {dx}");
+        }
+        for dx in 4..9 {
+            assert_eq!(squiggle(&buf, GUTTER + dx, 0), SPELLING, "dx {dx}");
+        }
+        assert_eq!(squiggle(&buf, GUTTER + 9, 0), None);
+    }
+
+    #[test]
+    fn overlap_prefers_spelling_when_it_starts_first() {
+        let text = "wrrod the";
+        let spelling = diagnostic(text, DiagnosticKind::Spelling, 0..5);
+        let grammar = diagnostic(text, DiagnosticKind::Grammar, 2..9);
+        let buf = draw_squiggled(text, &plain(text), 0, 0..0, &[&spelling, &grammar], 20, 1);
+        for dx in 0..5 {
+            assert_eq!(squiggle(&buf, GUTTER + dx, 0), SPELLING, "dx {dx}");
+        }
+        for dx in 5..9 {
+            assert_eq!(squiggle(&buf, GUTTER + dx, 0), GRAMMAR, "dx {dx}");
+        }
+    }
+
+    #[test]
+    fn selection_and_match_backgrounds_keep_the_underline() {
+        let text = "foo bar baz";
+        let matches = MatchHighlights {
+            ranges: vec![4..7, 8..11],
+            current: None,
+        };
+        let spans = overlay_matches(plain(text), &matches);
+        let d = diagnostic(text, DiagnosticKind::Spelling, 0..7);
+        let buf = draw_squiggled(text, &spans, 0, 1..2, &[&d], 20, 1);
+        assert_eq!(bg(&buf, GUTTER + 1, 0), Some(theme::selection_bg()));
+        assert_eq!(squiggle(&buf, GUTTER + 1, 0), SPELLING);
+        assert_eq!(
+            bg(&buf, GUTTER + 4, 0),
+            Some(theme::match_bg(MatchBackground::Other))
+        );
+        assert_eq!(squiggle(&buf, GUTTER + 4, 0), SPELLING);
+        assert_eq!(bg(&buf, GUTTER, 0), base_bg());
+        assert_eq!(squiggle(&buf, GUTTER, 0), SPELLING);
+    }
+
+    #[test]
+    fn tab_and_wide_char_underline_every_cell() {
+        // The terminal diff skips a wide char's hidden cell, so check the
+        // frame buffer itself.
+        let text = "\t漢z";
+        let layout = WrapLayout::new(text, 19);
+        let spans = plain(text);
+        let d = diagnostic(text, DiagnosticKind::Grammar, 0..2);
+        let view = RowsView {
+            text,
+            layout: &layout,
+            top_row: 0,
+            spans: &spans,
+            selection: 0..0,
+            caret: 0,
+            diagnostics: &[&d],
+        };
+        let mut buf = Buffer::empty(Rect::new(0, 0, 20, 1));
+        render(
+            &view,
+            Rect::new(0, 0, 0, 1),
+            Rect::new(0, 0, 20, 1),
+            &mut buf,
+        );
+        assert_eq!(buf[(4, 0)].symbol(), "漢");
+        for x in 0..6 {
+            assert_eq!(squiggle(&buf, x, 0), GRAMMAR, "x {x}");
+        }
+        assert_eq!(buf[(6, 0)].symbol(), "z");
+        assert_eq!(squiggle(&buf, 6, 0), None);
+    }
+
+    #[test]
+    fn diagnostics_off_screen_draw_nothing() {
+        let text = "a\nb\nc\nd\ne";
+        // Rows 1..3 ("b", "c") are visible: chars 2..5.
+        let above = diagnostic(text, DiagnosticKind::Spelling, 0..1);
+        let touching_top = diagnostic(text, DiagnosticKind::Spelling, 1..2);
+        let below = diagnostic(text, DiagnosticKind::Grammar, 6..9);
+        let past_end = Diagnostic {
+            chars: 100..200,
+            ..below.clone()
+        };
+        let buf = draw_squiggled(
+            text,
+            &plain(text),
+            1,
+            0..0,
+            &[&above, &touching_top, &below, &past_end],
+            5,
+            2,
+        );
+        for y in 0..2 {
+            for x in 0..buf.area.width {
+                assert_eq!(squiggle(&buf, x, y), None, "({x}, {y})");
+            }
+        }
+        // Scrolled past the end, nothing is drawn and nothing panics.
+        let _ = draw_squiggled(text, &plain(text), 50, 0..0, &[&above, &below], 5, 2);
+    }
+
+    #[test]
+    fn empty_diagnostics_draw_no_underline() {
+        let text = "fn main() {\n    let x = 1;\n}\n";
+        let buf = draw_squiggled(text, &highlight(text, "rs"), 0, 0..5, &[], 20, 4);
+        for y in 0..4 {
+            for x in 0..buf.area.width {
+                assert_eq!(squiggle(&buf, x, y), None, "({x}, {y})");
+            }
+        }
     }
 }

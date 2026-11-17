@@ -31,6 +31,7 @@ use std::time::{Duration, Instant};
 
 use frext_core::highlight::incremental::IncrementalHighlighter;
 use frext_core::highlight::{MatchHighlightsRef, overlay_matches};
+use frext_core::proofread::Diagnostic;
 use frext_core::syntax::language_from_path;
 use frext_core::tab::Tab;
 use ratatui::buffer::Buffer;
@@ -103,6 +104,15 @@ impl TabView {
             known,
         }
     }
+}
+
+/// What [`BufferView::render`] paints over a tab's text.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Overlays<'a> {
+    /// The search matches to paint.
+    pub matches: MatchHighlightsRef<'a>,
+    /// The proofreading diagnostics to underline.
+    pub diagnostics: &'a [&'a Diagnostic],
 }
 
 /// The editable view of the open tabs: per-tab caret, selection, undo
@@ -528,15 +538,18 @@ impl BufferView {
     /// screen position when it is visible. With no tab, both rects are
     /// blank.
     ///
-    /// `matches` are the search matches to paint, borrowed, as byte ranges
-    /// of the whole text; only those overlapping the visible lines are
-    /// copied and used.
+    /// `overlays` are what to paint over `tab`'s text, borrowed: its
+    /// search matches (byte ranges of the whole text, of which only those
+    /// overlapping the visible lines are copied and used) and its
+    /// proofreading diagnostics (sorted by start, possibly overlapping, of
+    /// which those intersecting the visible rows are underlined in their
+    /// squiggle colour).
     pub fn render(
         &mut self,
         tab: Option<&Tab>,
         gutter: Rect,
         editor: Rect,
-        matches: MatchHighlightsRef<'_>,
+        overlays: Overlays<'_>,
         buf: &mut Buffer,
         hits: &mut HitMap,
     ) -> Option<Position> {
@@ -568,7 +581,7 @@ impl BufferView {
         let spans = match (spans.first(), spans.last()) {
             (Some(first), Some(last)) => {
                 let window = first.bytes.start..last.bytes.end;
-                overlay_matches(spans, &matches.within(window))
+                overlay_matches(spans, &overlays.matches.within(window))
             }
             _ => spans,
         };
@@ -580,6 +593,7 @@ impl BufferView {
                 spans: &spans,
                 selection: view.cursor.selection(),
                 caret: view.cursor.caret(),
+                diagnostics: overlays.diagnostics,
             },
             gutter,
             editor,
@@ -647,7 +661,10 @@ mod tests {
             tab,
             Rect::new(0, 0, GUTTER, height),
             Rect::new(GUTTER, 0, width - GUTTER, height),
-            matches,
+            Overlays {
+                matches,
+                ..Overlays::default()
+            },
             &mut buf,
             &mut hits,
         );
@@ -1085,7 +1102,7 @@ mod tests {
             Some(&tab),
             Rect::new(0, 1, GUTTER, 5),
             Rect::new(GUTTER, 1, 8, 5),
-            MatchHighlightsRef::default(),
+            Overlays::default(),
             &mut buf,
             &mut hits,
         );
@@ -1147,7 +1164,7 @@ mod tests {
             None,
             Rect::new(0, 0, GUTTER, 2),
             Rect::new(GUTTER, 0, 4, 2),
-            MatchHighlightsRef::default(),
+            Overlays::default(),
             &mut buf,
             &mut hits,
         );

@@ -146,9 +146,13 @@ These come from reading the current code: `frext-core`'s
   .underline_color(colour)` to the `style` passed to `style_cells`, so
   every cell of a tab or wide char is underlined too. The selection
   newline cell is never underlined.
-- **Where diagnostics come from.** `BufferView::render` gains a
-  parameter `diagnostics: &[&Diagnostic]` (after `matches`) and passes
-  it through. `TermApp::render` computes
+- **Where diagnostics come from.** `BufferView::render`'s `matches`
+  parameter becomes `overlays: Overlays<'_>`, a new
+  `#[derive(Debug, Clone, Copy, Default)] pub struct Overlays<'a> {
+  pub matches: MatchHighlightsRef<'a>, pub diagnostics: &'a [&'a
+  Diagnostic] }` in `buffer/mod.rs`, so the signature stays at seven
+  arguments and needs no `too_many_arguments` suppression (07.2
+  review). `TermApp::render` computes
   `self.editor.proofread().diagnostics(tab.id, &tab.text)` for the
   active tab (empty without one).
 - **The status line.** The left side's default text (shown when there
@@ -286,12 +290,16 @@ What:
   - `draw_row` applies the underline rule decided above to `style`
     before `style_cells`. The newline selection cell is unchanged.
   - The module doc mentions the diagnostic underline.
-- `buffer/mod.rs`: `BufferView::render` gains `diagnostics:
-  &[&Diagnostic]` after `matches`, documented, passed into
-  `RowsView`. Its tests pass `&[]` where they do not test squiggles.
-- `app.rs`: the existing `self.buffer.render(..)` call passes `&[]`.
+- `buffer/mod.rs`: `Overlays` as decided under "Where diagnostics
+  come from"; `BufferView::render` takes it in place of `matches`,
+  documented, and passes `overlays.diagnostics` into `RowsView`. Its
+  tests pass `Overlays { matches, ..Overlays::default() }` or
+  `Overlays::default()` where they do not test squiggles.
+- `app.rs`: the existing `self.buffer.render(..)` call passes
+  `Overlays { matches: self.editor.match_highlights_ref(),
+  diagnostics: &[] }`.
   (07.3 passes real diagnostics.)
-- `benches/buffer.rs`: existing benches pass `&[]`. Add
+- `benches/buffer.rs`: existing benches pass no diagnostics. Add
   `buffer/render_with_squiggles_rust_5k_lines`: the same text and
   view, with one synthetic `Diagnostic` (alternating `Spelling` and
   `Grammar`, `suggestions` empty) over every occurrence of `self`,

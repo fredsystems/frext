@@ -2,17 +2,19 @@
 //!
 //! Measures [`BufferView`] over a deterministic 5,000-line synthetic Rust
 //! source in an 80x24 terminal: typing and rendering in a warm view at
-//! line 2,500, rendering with no change, and rendering with every
-//! `self` highlighted as a search match.
+//! line 2,500, rendering with no change, rendering with every `self`
+//! highlighted as a search match, and rendering with every `self` under a
+//! proofreading squiggle.
 
 use std::hint::black_box;
 use std::time::Instant;
 
 use criterion::{Criterion, criterion_group, criterion_main};
-use frext_core::highlight::{MatchHighlights, MatchHighlightsRef};
+use frext_core::highlight::MatchHighlights;
+use frext_core::proofread::{Diagnostic, DiagnosticKind};
 use frext_core::tab::Tab;
-use frext_term::buffer::BufferView;
 use frext_term::buffer::edit::EditAction;
+use frext_term::buffer::{BufferView, Overlays};
 use frext_term::hit::HitMap;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
@@ -85,18 +87,44 @@ const GUTTER: Rect = Rect::new(0, 0, 5, 24);
 const EDITOR: Rect = Rect::new(5, 0, 75, 24);
 
 fn render(view: &mut BufferView, tab: &Tab, buf: &mut Buffer, hits: &mut HitMap) {
-    render_with(view, tab, MatchHighlightsRef::default(), buf, hits);
+    render_with(view, tab, Overlays::default(), buf, hits);
 }
 
 fn render_with(
     view: &mut BufferView,
     tab: &Tab,
-    matches: MatchHighlightsRef<'_>,
+    overlays: Overlays<'_>,
     buf: &mut Buffer,
     hits: &mut HitMap,
 ) {
     hits.clear();
-    black_box(view.render(Some(tab), GUTTER, EDITOR, matches, buf, hits));
+    black_box(view.render(Some(tab), GUTTER, EDITOR, overlays, buf, hits));
+}
+
+/// One diagnostic over every `self` in `src`, alternating spelling and
+/// grammar.
+fn self_diagnostics(src: &str) -> Vec<Diagnostic> {
+    let (mut byte, mut char) = (0, 0);
+    src.match_indices("self")
+        .enumerate()
+        .map(|(n, (i, s))| {
+            char += src[byte..i].chars().count();
+            byte = i;
+            let start = char;
+            Diagnostic {
+                kind: if n % 2 == 0 {
+                    DiagnosticKind::Spelling
+                } else {
+                    DiagnosticKind::Grammar
+                },
+                bytes: i..i + s.len(),
+                chars: start..start + s.chars().count(),
+                flagged: s.to_owned(),
+                message: "Did you mean to spell \"self\" this way?".to_owned(),
+                suggestions: Vec::new(),
+            }
+        })
+        .collect()
 }
 
 fn bench_buffer(c: &mut Criterion) {
@@ -113,6 +141,8 @@ fn bench_buffer(c: &mut Criterion) {
         .collect();
     let current = ranges.iter().position(|r| r.start >= line_2500_byte);
     let matches = MatchHighlights { ranges, current };
+    let diagnostics = self_diagnostics(&src);
+    let diagnostic_refs: Vec<&Diagnostic> = diagnostics.iter().collect();
     let mut tab = Tab::new_untitled(1);
     tab.text = src;
     tab.path = Some("bench.rs".into());
@@ -138,7 +168,27 @@ fn bench_buffer(c: &mut Criterion) {
         b.iter(|| render(&mut view, &tab, &mut buf, &mut hits));
     });
     group.bench_function("render_with_matches_rust_5k_lines", |b| {
-        b.iter(|| render_with(&mut view, &tab, matches.as_ref(), &mut buf, &mut hits));
+        b.iter(|| {
+            let overlays = Overlays {
+                matches: matches.as_ref(),
+                ..Overlays::default()
+            };
+            render_with(&mut view, &tab, overlays, &mut buf, &mut hits);
+        });
+    });
+    group.bench_function("render_with_squiggles_rust_5k_lines", |b| {
+        b.iter(|| {
+            render_with(
+                &mut view,
+                &tab,
+                Overlays {
+                    diagnostics: &diagnostic_refs,
+                    ..Overlays::default()
+                },
+                &mut buf,
+                &mut hits,
+            );
+        });
     });
     group.finish();
 }
