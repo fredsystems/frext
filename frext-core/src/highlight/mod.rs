@@ -6,6 +6,12 @@
 //! then splits those spans so search matches carry a [`MatchBackground`]
 //! role. Each front end converts the spans and roles into its own text and
 //! colour types.
+//!
+//! [`incremental::IncrementalHighlighter`] produces the same spans for a
+//! window of lines, resuming from cached checkpoints instead of
+//! re-highlighting the whole buffer.
+
+pub mod incremental;
 
 use std::ops::Range;
 
@@ -16,7 +22,7 @@ use two_face::re_exports::syntect::{
 use crate::palette::Rgb;
 
 /// Foreground of the unhighlighted plain-text fallback: a neutral light grey.
-const PLAIN_FG: Rgb = Rgb::new(220, 220, 220);
+pub(crate) const PLAIN_FG: Rgb = Rgb::new(220, 220, 220);
 
 /// The background role of a search match.
 ///
@@ -63,15 +69,18 @@ pub struct MatchHighlights {
 /// highlighting fails part-way through.
 #[must_use]
 pub fn highlight(text: &str, language: &str) -> Vec<StyledSpan> {
-    highlight_impl(text, language).unwrap_or_else(|| {
-        vec![StyledSpan {
-            bytes: 0..text.len(),
-            fg: PLAIN_FG,
-            background: None,
-            italic: false,
-            underline: false,
-        }]
-    })
+    highlight_impl(text, language).unwrap_or_else(|| vec![plain_span(0..text.len())])
+}
+
+/// The unstyled plain-text fallback span over `bytes`.
+pub(crate) fn plain_span(bytes: Range<usize>) -> StyledSpan {
+    StyledSpan {
+        bytes,
+        fg: PLAIN_FG,
+        background: None,
+        italic: false,
+        underline: false,
+    }
 }
 
 /// The fallible highlighting core: `None` signals "no syntax / parse error",

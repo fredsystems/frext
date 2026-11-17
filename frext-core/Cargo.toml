@@ -24,5 +24,12 @@ thiserror = { workspace = true }
 trash = { workspace = true }
 two-face = { workspace = true }
 
+[dev-dependencies]
+criterion = { workspace = true }
+
+[[bench]]
+name = "highlight"
+harness = false
+
 [lints]
 workspace = true

@@ -5,15 +5,17 @@
 //! [`frext_core`] crate.
 
 pub mod app;
+pub mod buffer;
 pub mod cli;
 pub mod clipboard;
 pub mod complete;
-pub mod editor_view;
+pub mod editor_menu;
 pub mod events;
 pub mod hit;
 pub mod keymap;
 pub mod layout;
 pub mod logging;
+pub mod menu;
 pub mod popup;
 pub mod prompt;
 pub mod run;

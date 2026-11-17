@@ -4,7 +4,10 @@
 //! converts it into terminal [`Color`]s and [`Style`]s for each piece of
 //! the interface.
 
-use frext_core::palette::{self, BASE, MANTLE, OVERLAY1, Rgb, SUBTEXT0, SURFACE0, SURFACE1, TEXT};
+use frext_core::highlight::{MatchBackground, StyledSpan};
+use frext_core::palette::{
+    self, BASE, MANTLE, OVERLAY0, OVERLAY1, Rgb, SUBTEXT0, SURFACE0, SURFACE1, TEXT,
+};
 use ratatui::style::{Color, Modifier, Style};
 
 /// Converts a palette colour into a 24-bit terminal colour.
@@ -71,6 +74,12 @@ pub const fn popup_border() -> Style {
         .bg(color(SURFACE0))
 }
 
+/// A disabled entry inside a popup.
+#[must_use]
+pub const fn disabled() -> Style {
+    Style::new().fg(color(OVERLAY0)).bg(color(SURFACE0))
+}
+
 /// A text input field inside a popup.
 #[must_use]
 pub const fn input() -> Style {
@@ -89,6 +98,40 @@ pub fn button_focused() -> Style {
 #[must_use]
 pub fn hover_bg() -> Color {
     color(palette::selection().over(MANTLE))
+}
+
+/// The background of selected text in the editor.
+#[must_use]
+pub fn selection_bg() -> Color {
+    color(palette::selection().over(BASE))
+}
+
+/// The background of a search match in the editor.
+#[must_use]
+pub fn match_bg(role: MatchBackground) -> Color {
+    match role {
+        MatchBackground::Other => color(palette::search_match()),
+        MatchBackground::Current => color(palette::search_current_match().over(BASE)),
+    }
+}
+
+/// A syntax-highlighted run on the base background.
+#[must_use]
+pub fn span(span: &StyledSpan) -> Style {
+    let mut style = Style::new().fg(color(span.fg)).bg(color(BASE));
+    if span.italic {
+        style = style.add_modifier(Modifier::ITALIC);
+    }
+    if span.underline {
+        style = style.add_modifier(Modifier::UNDERLINED);
+    }
+    style
+}
+
+/// The glyph drawn in place of a control char.
+#[must_use]
+pub const fn replacement() -> Style {
+    Style::new().fg(color(palette::gutter())).bg(color(BASE))
 }
 
 #[cfg(test)]
@@ -171,6 +214,14 @@ mod tests {
     }
 
     #[test]
+    fn disabled_is_overlay0_on_surface0() {
+        assert_eq!(
+            colours(disabled()),
+            (Some(color(OVERLAY0)), Some(color(SURFACE0)))
+        );
+    }
+
+    #[test]
     fn input_is_text_on_surface1() {
         assert_eq!(colours(input()), (Some(color(TEXT)), Some(color(SURFACE1))));
     }
@@ -190,5 +241,60 @@ mod tests {
     fn hover_bg_is_selection_over_mantle() {
         assert_eq!(hover_bg(), color(palette::selection().over(MANTLE)));
         assert_ne!(hover_bg(), color(MANTLE));
+    }
+
+    #[test]
+    fn selection_bg_is_selection_over_base() {
+        assert_eq!(selection_bg(), color(palette::selection().over(BASE)));
+        assert_ne!(selection_bg(), color(BASE));
+    }
+
+    #[test]
+    fn match_bg_maps_both_roles() {
+        assert_eq!(
+            match_bg(MatchBackground::Other),
+            color(palette::search_match())
+        );
+        assert_eq!(
+            match_bg(MatchBackground::Current),
+            color(palette::search_current_match().over(BASE))
+        );
+        assert_ne!(
+            match_bg(MatchBackground::Other),
+            match_bg(MatchBackground::Current)
+        );
+    }
+
+    #[test]
+    fn span_uses_fg_on_base_with_flags() {
+        let plain = StyledSpan {
+            bytes: 0..1,
+            fg: Rgb::new(1, 2, 3),
+            background: Some(MatchBackground::Current),
+            italic: false,
+            underline: false,
+        };
+        let style = span(&plain);
+        assert_eq!(
+            colours(style),
+            (Some(Color::Rgb(1, 2, 3)), Some(color(BASE)))
+        );
+        assert!(style.add_modifier.is_empty());
+        let styled = StyledSpan {
+            italic: true,
+            underline: true,
+            ..plain
+        };
+        let style = span(&styled);
+        assert!(style.add_modifier.contains(Modifier::ITALIC));
+        assert!(style.add_modifier.contains(Modifier::UNDERLINED));
+    }
+
+    #[test]
+    fn replacement_is_gutter_on_base() {
+        assert_eq!(
+            colours(replacement()),
+            (Some(color(palette::gutter())), Some(color(BASE)))
+        );
     }
 }

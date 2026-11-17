@@ -1,6 +1,6 @@
 # 02 -- `frext-term` shell
 
-- **Status:** pending merge
+- **Status:** complete
 - **Depends on:** 01
 - **Branch:** `feat/frext-term-shell` (one branch, one commit per
   subtask, one PR)

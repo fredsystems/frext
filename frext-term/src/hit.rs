@@ -30,6 +30,10 @@ pub enum Target {
     PromptCandidate(usize),
     /// The editor body.
     Editor,
+    /// The body of a context menu.
+    MenuPopup,
+    /// The context-menu entry at this index.
+    MenuItem(usize),
 }
 
 impl Target {
@@ -46,7 +50,9 @@ impl Target {
             | Self::PromptInput
             | Self::PromptButton(_)
             | Self::PromptCandidate(_)
-            | Self::Editor => None,
+            | Self::Editor
+            | Self::MenuPopup
+            | Self::MenuItem(_) => None,
         }
     }
 }
@@ -136,5 +142,7 @@ mod tests {
         assert_eq!(Target::PromptButton(1).hint(), None);
         assert_eq!(Target::PromptCandidate(2).hint(), None);
         assert_eq!(Target::Editor.hint(), None);
+        assert_eq!(Target::MenuPopup.hint(), None);
+        assert_eq!(Target::MenuItem(4).hint(), None);
     }
 }
