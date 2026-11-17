@@ -2807,6 +2807,7 @@ dependencies = [
  "frext-core",
  "log",
  "ratatui",
+ "resvg",
  "rustix 1.1.6",
  "unicode-segmentation",
  "unicode-width",

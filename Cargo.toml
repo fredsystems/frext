@@ -33,6 +33,7 @@ harper-core = { version = "3.2.0", default-features = false, features = ["concur
 log = "0.4.35"
 ratatui = { version = "0.30.2", default-features = false, features = ["crossterm", "layout-cache", "underline-color"] }
 regex = "1.13.1"
+resvg = { version = "0.45.1", default-features = false }
 rfd = "0.18.0"
 rustix = { version = "1.1.6", features = ["event", "stdio"] }
 serde = { version = "1.0.229", features = ["derive"] }

@@ -9,6 +9,7 @@ use frext_core::editor::FolderState;
 use frext_core::palette::{self, Rgb};
 
 pub mod nerd_table;
+pub mod raster;
 
 /// The width of the icon slot in front of a tree row, in cells.
 pub const ICON_WIDTH: u16 = 2;
