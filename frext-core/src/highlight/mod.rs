@@ -53,12 +53,42 @@ pub struct StyledSpan {
 /// Search matches to paint over the syntax highlighting: every match range
 /// gets a background fill, and the `current` match (if any) gets a brighter
 /// one.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct MatchHighlights {
     /// Byte ranges of all matches in the buffer.
     pub ranges: Vec<Range<usize>>,
     /// Index into `ranges` of the currently-focused match, if any.
     pub current: Option<usize>,
+}
+
+impl MatchHighlights {
+    /// The matches that overlap the byte window `bytes`.
+    ///
+    /// Precondition: `ranges` are sorted by start and do not overlap, as
+    /// `SearchState` produces them.
+    ///
+    /// Returns the overlapping ranges, including any that cross either edge
+    /// of the window, unchanged (still in buffer byte offsets). `current` is
+    /// remapped to index the returned ranges, or `None` when the current
+    /// match is outside the window. An empty window gives no matches.
+    #[must_use]
+    pub fn within(&self, bytes: Range<usize>) -> Self {
+        if bytes.start >= bytes.end {
+            return Self::default();
+        }
+        let lo = self.ranges.partition_point(|r| r.end <= bytes.start);
+        let hi = self.ranges.partition_point(|r| r.start < bytes.end).max(lo);
+        let ranges = self
+            .ranges
+            .get(lo..hi)
+            .map(<[Range<usize>]>::to_vec)
+            .unwrap_or_default();
+        let current = self
+            .current
+            .filter(|c| (lo..hi).contains(c))
+            .map(|c| c - lo);
+        Self { ranges, current }
+    }
 }
 
 /// Highlight `text` for the syntax identified by `language` (a file-extension
@@ -324,5 +354,93 @@ mod tests {
 
         assert_eq!(current_span.background, Some(MatchBackground::Current));
         assert_eq!(other_span.background, Some(MatchBackground::Other));
+    }
+
+    /// Five matches spread over a buffer, used by the `within` tests.
+    fn spread_matches(current: Option<usize>) -> MatchHighlights {
+        MatchHighlights {
+            ranges: vec![0..3, 8..12, 20..24, 30..34, 40..43],
+            current,
+        }
+    }
+
+    #[test]
+    fn within_keeps_only_overlapping_matches_including_edge_crossers() {
+        // 8..12 crosses the window's start edge, 30..34 crosses its end edge;
+        // 0..3 and 40..43 lie wholly outside.
+        let m = spread_matches(None);
+        assert_eq!(
+            m.within(10..32),
+            MatchHighlights {
+                ranges: vec![8..12, 20..24, 30..34],
+                current: None,
+            }
+        );
+    }
+
+    #[test]
+    fn within_excludes_matches_that_only_touch_the_window() {
+        // 8..12 ends exactly at the window start; 20..24 starts exactly at
+        // its end. Neither overlaps.
+        let m = spread_matches(None);
+        assert!(m.within(12..20).ranges.is_empty());
+    }
+
+    #[test]
+    fn within_remaps_a_current_match_inside_the_window() {
+        let m = spread_matches(Some(3));
+        let w = m.within(10..32);
+        assert_eq!(w.current, Some(2));
+        assert_eq!(w.ranges.get(2), Some(&(30..34)));
+    }
+
+    #[test]
+    fn within_drops_a_current_match_outside_the_window() {
+        assert_eq!(spread_matches(Some(0)).within(10..32).current, None);
+        assert_eq!(spread_matches(Some(4)).within(10..32).current, None);
+    }
+
+    #[test]
+    fn within_an_empty_window_is_empty() {
+        let m = spread_matches(Some(2));
+        assert_eq!(m.within(21..21), MatchHighlights::default());
+        let (start, end) = (30, 10);
+        assert_eq!(m.within(start..end), MatchHighlights::default());
+    }
+
+    #[test]
+    fn within_with_no_matches_is_empty() {
+        assert_eq!(
+            MatchHighlights::default().within(0..100),
+            MatchHighlights::default()
+        );
+    }
+
+    #[test]
+    fn within_a_window_past_the_end_is_empty() {
+        assert_eq!(
+            spread_matches(Some(4)).within(50..60),
+            MatchHighlights::default()
+        );
+    }
+
+    #[test]
+    fn overlay_of_windowed_matches_equals_overlay_of_all_for_spans_inside() {
+        // Matches as over "foo bar foo baz foo qux foo".
+        let m = MatchHighlights {
+            ranges: vec![0..3, 8..11, 16..19, 24..27],
+            current: Some(2),
+        };
+        let window = 6..20;
+        // Hand-made spans tiling a sub-range that lies inside the window.
+        let spans: Vec<StyledSpan> = [7..10, 10..14, 14..18]
+            .into_iter()
+            .map(plain_span)
+            .collect();
+
+        assert_eq!(
+            overlay_matches(spans.clone(), &m.within(window)),
+            overlay_matches(spans, &m)
+        );
     }
 }
