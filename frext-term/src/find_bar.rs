@@ -4,15 +4,20 @@
 //! ([`Editor::search_pattern_mut`] / [`Editor::search_replacement_mut`]);
 //! the [`FindBar`] owns only their cursors and horizontal scroll, and the
 //! rects they were last drawn at.
+//!
+//! Input reaches a field through [`FindBar::handle_key`],
+//! [`FindBar::click`] and [`FindBar::paste`]; each answers with a
+//! [`FindReply`] saying what the app should do next.
 
-use frext_core::editor::{Editor, SearchOption, SearchState};
+use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use frext_core::editor::{Command, Editor, SearchOption, SearchState, StepDirection};
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Position, Rect};
 use ratatui::style::Style;
 use unicode_width::UnicodeWidthStr;
 
 use crate::hit::{HitMap, Target};
-use crate::text_input::TextInput;
+use crate::text_input::{InputOutcome, TextInput};
 use crate::theme;
 
 /// One of the bar's two text fields.
@@ -22,6 +27,39 @@ pub enum FindField {
     Pattern,
     /// The replace "With" field.
     Replacement,
+}
+
+impl FindField {
+    /// The other field.
+    const fn other(self) -> Self {
+        match self {
+            Self::Pattern => Self::Replacement,
+            Self::Replacement => Self::Pattern,
+        }
+    }
+}
+
+/// What the bar made of a key or a paste.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FindReply {
+    /// A command for the app to send.
+    Send(Command),
+    /// Move the focus to this field.
+    Focus(FindField),
+    /// The input was consumed; nothing else to do.
+    Handled,
+    /// The input is not for the bar.
+    Ignored,
+}
+
+/// Whether `key` switches between the fields: Tab without modifiers,
+/// `BackTab`, or Shift+Tab.
+fn is_field_switch(key: KeyEvent) -> bool {
+    match key.code {
+        KeyCode::Tab => key.modifiers == KeyModifiers::NONE || key.modifiers == KeyModifiers::SHIFT,
+        KeyCode::BackTab => true,
+        _ => false,
+    }
 }
 
 /// The most regex-error rows the bar shows.
@@ -270,6 +308,110 @@ impl FindBar {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// The input of `field`.
+    const fn input_mut(&mut self, field: FindField) -> &mut TextInput {
+        match field {
+            FindField::Pattern => &mut self.pattern,
+            FindField::Replacement => &mut self.replacement,
+        }
+    }
+
+    /// The text of `field`, which core owns.
+    fn text(editor: &Editor, field: FindField) -> &str {
+        match field {
+            FindField::Pattern => &editor.search().query().pattern,
+            FindField::Replacement => editor.search().replacement(),
+        }
+    }
+
+    /// The text of `field`, for editing.
+    fn text_mut(editor: &mut Editor, field: FindField) -> &mut String {
+        match field {
+            FindField::Pattern => editor.search_pattern_mut(),
+            FindField::Replacement => editor.search_replacement_mut(),
+        }
+    }
+
+    /// Handles one key event in the focused `field`.
+    ///
+    /// Tab, `BackTab` and Shift+Tab switch fields while the replace row is
+    /// shown. Every other key goes to the field's [`TextInput`]: an edit
+    /// of the find field recomputes the matches, Enter in the find field
+    /// steps to the next match (the previous one with Shift), and Enter
+    /// in the "With" field replaces the current match.
+    pub fn handle_key(
+        &mut self,
+        editor: &mut Editor,
+        field: FindField,
+        key: KeyEvent,
+    ) -> FindReply {
+        if key.kind == KeyEventKind::Release {
+            return FindReply::Ignored;
+        }
+        if is_field_switch(key) {
+            return if editor.search().replace_open() {
+                FindReply::Focus(field.other())
+            } else {
+                FindReply::Handled
+            };
+        }
+        let outcome = self
+            .input_mut(field)
+            .handle_key(Self::text_mut(editor, field), key);
+        let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+        match (field, outcome) {
+            (FindField::Pattern, InputOutcome::Edited) => {
+                FindReply::Send(Command::RecomputeMatches)
+            }
+            (FindField::Pattern, InputOutcome::Submit) => {
+                let direction = if shift {
+                    StepDirection::Backward
+                } else {
+                    StepDirection::Forward
+                };
+                FindReply::Send(Command::StepMatch(direction))
+            }
+            (FindField::Replacement, InputOutcome::Submit) if !shift => {
+                FindReply::Send(Command::ReplaceCurrent)
+            }
+            (FindField::Replacement, InputOutcome::Edited | InputOutcome::Submit)
+            | (_, InputOutcome::Moved) => FindReply::Handled,
+            (_, InputOutcome::Cancel) => FindReply::Send(Command::CloseSearch),
+            (_, InputOutcome::Ignored) => FindReply::Ignored,
+        }
+    }
+
+    /// Moves `field`'s cursor to the end of its text, for when it takes
+    /// the focus.
+    pub fn focus_field(&mut self, editor: &Editor, field: FindField) {
+        self.input_mut(field).move_to_end(Self::text(editor, field));
+    }
+
+    /// Places `field`'s cursor for a click at terminal `column`, relative
+    /// to where the field was last drawn. Does nothing if it was not
+    /// drawn.
+    pub fn click(&mut self, editor: &Editor, field: FindField, column: u16) {
+        let rect = match field {
+            FindField::Pattern => self.pattern_rect,
+            FindField::Replacement => self.replacement_rect,
+        };
+        if let Some(rect) = rect {
+            self.input_mut(field)
+                .click(Self::text(editor, field), column.saturating_sub(rect.x));
+        }
+    }
+
+    /// Inserts pasted `text` at `field`'s cursor, with line breaks turned
+    /// into spaces. A paste into the find field recomputes the matches.
+    pub fn paste(&mut self, editor: &mut Editor, field: FindField, text: &str) -> FindReply {
+        self.input_mut(field)
+            .insert_str(Self::text_mut(editor, field), text);
+        match field {
+            FindField::Pattern => FindReply::Send(Command::RecomputeMatches),
+            FindField::Replacement => FindReply::Handled,
+        }
     }
 
     /// Draws the bar into `area` and records its hit regions.
@@ -804,6 +946,219 @@ mod tests {
         assert_eq!(cursor, None);
         assert_eq!(hits.hit(6, 0), None);
         assert_eq!(bar.pattern_rect, None);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    fn press(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn shift(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::SHIFT)
+    }
+
+    const RECOMPUTE: FindReply = FindReply::Send(Command::RecomputeMatches);
+
+    #[test]
+    fn typing_into_find_recomputes_each_time() {
+        let (dir, mut editor) = fixture("type-find", "hello");
+        editor.apply(Command::OpenSearch(SearchBar::Find));
+        let mut bar = FindBar::new();
+        let reply = bar.handle_key(&mut editor, FindField::Pattern, press(KeyCode::Char('a')));
+        assert_eq!(reply, RECOMPUTE);
+        assert_eq!(editor.search().query().pattern, "a");
+        let reply = bar.handle_key(&mut editor, FindField::Pattern, press(KeyCode::Char('b')));
+        assert_eq!(reply, RECOMPUTE);
+        assert_eq!(editor.search().query().pattern, "ab");
+
+        let reply = bar.handle_key(&mut editor, FindField::Pattern, press(KeyCode::Backspace));
+        assert_eq!(reply, RECOMPUTE);
+        assert_eq!(editor.search().query().pattern, "a");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn cursor_keys_in_find_are_handled() {
+        let (dir, mut editor) = fixture("move-find", "hello");
+        editor.apply(Command::OpenSearch(SearchBar::Find));
+        find(&mut editor, "abc");
+        let mut bar = FindBar::new();
+        bar.focus_field(&editor, FindField::Pattern);
+        for code in [KeyCode::Left, KeyCode::Home] {
+            let reply = bar.handle_key(&mut editor, FindField::Pattern, press(code));
+            assert_eq!(reply, FindReply::Handled, "{code:?}");
+        }
+        assert_eq!(editor.search().query().pattern, "abc");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn enter_in_find_steps_through_matches() {
+        let (dir, mut editor) = fixture("enter-find", "hello");
+        editor.apply(Command::OpenSearch(SearchBar::Find));
+        let mut bar = FindBar::new();
+        assert_eq!(
+            bar.handle_key(&mut editor, FindField::Pattern, press(KeyCode::Enter)),
+            FindReply::Send(Command::StepMatch(StepDirection::Forward))
+        );
+        assert_eq!(
+            bar.handle_key(&mut editor, FindField::Pattern, shift(KeyCode::Enter)),
+            FindReply::Send(Command::StepMatch(StepDirection::Backward))
+        );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn enter_in_with_replaces_the_current_match() {
+        let (dir, mut editor) = fixture("enter-with", "hello");
+        editor.apply(Command::OpenSearch(SearchBar::FindReplace));
+        let mut bar = FindBar::new();
+        assert_eq!(
+            bar.handle_key(&mut editor, FindField::Replacement, press(KeyCode::Enter)),
+            FindReply::Send(Command::ReplaceCurrent)
+        );
+        assert_eq!(
+            bar.handle_key(&mut editor, FindField::Replacement, shift(KeyCode::Enter)),
+            FindReply::Handled
+        );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn typing_into_with_edits_the_replacement() {
+        let (dir, mut editor) = fixture("type-with", "hello");
+        editor.apply(Command::OpenSearch(SearchBar::FindReplace));
+        let mut bar = FindBar::new();
+        for c in ['b', 'y', 'e'] {
+            let reply =
+                bar.handle_key(&mut editor, FindField::Replacement, press(KeyCode::Char(c)));
+            assert_eq!(reply, FindReply::Handled);
+        }
+        assert_eq!(editor.search().replacement(), "bye");
+        assert_eq!(editor.search().query().pattern, "");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn tab_switches_fields_only_with_the_replace_row() {
+        let (dir, mut editor) = fixture("tab", "hello");
+        let keys = [
+            press(KeyCode::Tab),
+            press(KeyCode::BackTab),
+            shift(KeyCode::BackTab),
+            shift(KeyCode::Tab),
+        ];
+        let mut bar = FindBar::new();
+        editor.apply(Command::OpenSearch(SearchBar::FindReplace));
+        for key in keys {
+            assert_eq!(
+                bar.handle_key(&mut editor, FindField::Pattern, key),
+                FindReply::Focus(FindField::Replacement),
+                "{key:?}"
+            );
+            assert_eq!(
+                bar.handle_key(&mut editor, FindField::Replacement, key),
+                FindReply::Focus(FindField::Pattern),
+                "{key:?}"
+            );
+        }
+        editor.apply(Command::OpenSearch(SearchBar::Find));
+        for key in keys {
+            assert_eq!(
+                bar.handle_key(&mut editor, FindField::Pattern, key),
+                FindReply::Handled,
+                "{key:?}"
+            );
+        }
+        assert_eq!(editor.search().query().pattern, "");
+        assert_eq!(editor.search().replacement(), "");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn esc_closes_the_search() {
+        let (dir, mut editor) = fixture("esc", "hello");
+        editor.apply(Command::OpenSearch(SearchBar::FindReplace));
+        let mut bar = FindBar::new();
+        for field in [FindField::Pattern, FindField::Replacement] {
+            assert_eq!(
+                bar.handle_key(&mut editor, field, press(KeyCode::Esc)),
+                FindReply::Send(Command::CloseSearch)
+            );
+        }
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn alt_chars_and_releases_are_ignored() {
+        let (dir, mut editor) = fixture("ignored", "hello");
+        editor.apply(Command::OpenSearch(SearchBar::FindReplace));
+        let mut bar = FindBar::new();
+        let alt = KeyEvent::new(KeyCode::Char('x'), KeyModifiers::ALT);
+        let release = KeyEvent::new_with_kind(
+            KeyCode::Char('r'),
+            KeyModifiers::NONE,
+            KeyEventKind::Release,
+        );
+        let tab_release =
+            KeyEvent::new_with_kind(KeyCode::Tab, KeyModifiers::NONE, KeyEventKind::Release);
+        for field in [FindField::Pattern, FindField::Replacement] {
+            for key in [alt, release, tab_release] {
+                assert_eq!(
+                    bar.handle_key(&mut editor, field, key),
+                    FindReply::Ignored,
+                    "{key:?}"
+                );
+            }
+        }
+        assert_eq!(editor.search().query().pattern, "");
+        assert_eq!(editor.search().replacement(), "");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn focus_field_puts_the_cursor_at_the_end() {
+        let (dir, mut editor) = fixture("focus", "hello");
+        editor.apply(Command::OpenSearch(SearchBar::Find));
+        find(&mut editor, "hello");
+        let mut bar = FindBar::new();
+        bar.focus_field(&editor, FindField::Pattern);
+        let (_, _, cursor) = draw(&mut bar, &editor, Some(FindField::Pattern), None, 80, 1);
+        assert_eq!(cursor, Some(Position::new(6 + 5, 0)));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn click_places_the_cursor_after_a_render() {
+        let (dir, mut editor) = fixture("click", "hello");
+        editor.apply(Command::OpenSearch(SearchBar::Find));
+        find(&mut editor, "hello");
+        let mut bar = FindBar::new();
+        // Without a rect the click does nothing.
+        bar.click(&editor, FindField::Pattern, 6 + 2);
+        assert_eq!(bar.pattern.cursor(), 0);
+        draw(&mut bar, &editor, None, None, 80, 1);
+        bar.click(&editor, FindField::Pattern, 6 + 2);
+        let (_, _, cursor) = draw(&mut bar, &editor, Some(FindField::Pattern), None, 80, 1);
+        assert_eq!(cursor.map(|c| c.x), Some(8));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn paste_turns_line_breaks_into_spaces() {
+        let (dir, mut editor) = fixture("paste", "hello");
+        editor.apply(Command::OpenSearch(SearchBar::FindReplace));
+        let mut bar = FindBar::new();
+        assert_eq!(
+            bar.paste(&mut editor, FindField::Pattern, "a\nb"),
+            RECOMPUTE
+        );
+        assert_eq!(editor.search().query().pattern, "a b");
+        assert_eq!(
+            bar.paste(&mut editor, FindField::Replacement, "x\r\ny"),
+            FindReply::Handled
+        );
+        assert_eq!(editor.search().replacement(), "x y");
         fs::remove_dir_all(&dir).unwrap();
     }
 }
