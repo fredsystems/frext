@@ -7,6 +7,11 @@
 //! [`probe`] connects the three.
 //! The DA1 query goes last because every terminal answers it, so its
 //! reply marks the end of the batch.
+//!
+//! Non-reply bytes read before the DA1 reply are skipped, so keys typed
+//! during the probe's few milliseconds are lost. After the DA1 reply
+//! only the kitty graphics reply is still interpreted: under tmux it can
+//! arrive after tmux's own DA1 answer, and no key press produces it.
 
 use std::io::{self, Write};
 use std::os::fd::AsFd;
@@ -21,8 +26,25 @@ use super::tmux;
 /// How long the probe waits for the terminal's replies.
 pub const PROBE_TIMEOUT: Duration = Duration::from_secs(1);
 
+/// How long, under tmux, the probe keeps listening after the DA1 reply
+/// for a kitty graphics reply still on its way from the outer terminal.
+pub const TMUX_SETTLE: Duration = Duration::from_millis(100);
+
 /// The size of each read from the input.
 const READ_CHUNK: usize = 1024;
+
+/// The most reply bytes the probe collects before it stops reading.
+const MAX_REPLY_BYTES: usize = 64 * 1024;
+
+/// When [`read_replies`] stops after the DA1 reply.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Settle {
+    /// Stop as soon as the DA1 reply has arrived.
+    AtDa1,
+    /// After the DA1 reply, keep reading until nothing has arrived for
+    /// the given time (or the deadline passes).
+    QuietAfterDa1(Duration),
+}
 
 /// The escape byte.
 const ESC: u8 = 0x1b;
@@ -121,8 +143,9 @@ pub struct Replies {
 }
 
 /// Parses the terminal's replies. Unknown sequences and stray bytes are
-/// skipped, a sequence cut off at the end is ignored, and parsing stops
-/// after the DA1 reply.
+/// skipped, and a sequence cut off at the end is ignored. After the DA1
+/// reply only kitty graphics (APC) replies are still interpreted;
+/// everything else is ignored.
 #[must_use]
 pub fn parse(bytes: &[u8]) -> Replies {
     let mut replies = Replies::default();
@@ -132,9 +155,14 @@ pub fn parse(bytes: &[u8]) -> Replies {
             Step::End => break,
             Step::Skip(rest) => input = rest,
             Step::Token(token, rest) => {
-                if interpret(&token, &mut replies) == ReplyEnd::Da1 {
+                if replies.end == ReplyEnd::Da1 {
+                    if let Token::Apc(body) = token
+                        && let Some(reply) = kitty_reply(body)
+                    {
+                        replies.kitty_graphics = reply;
+                    }
+                } else if interpret(&token, &mut replies) == ReplyEnd::Da1 {
                     replies.end = ReplyEnd::Da1;
-                    break;
                 }
                 input = rest;
             }
@@ -144,21 +172,34 @@ pub fn parse(bytes: &[u8]) -> Replies {
 }
 
 /// Reads the terminal's replies from `input` until the DA1 reply has
-/// arrived, the input reaches end of file, or `timeout` has passed with
-/// nothing more to read. Interrupted calls are retried.
+/// arrived (and, with [`Settle::QuietAfterDa1`], the input has then
+/// been quiet for the given time), the input reaches end of file,
+/// 64 KiB have been read, or `timeout` has passed.
+/// Interrupted and would-block calls are retried.
 ///
 /// # Errors
 ///
 /// Returns the error from polling or reading `input`, other than an
-/// interruption.
-pub fn read_replies(input: impl AsFd, timeout: Duration) -> io::Result<Vec<u8>> {
+/// interruption or a would-block read.
+pub fn read_replies(input: impl AsFd, timeout: Duration, settle: Settle) -> io::Result<Vec<u8>> {
     let deadline = Instant::now().checked_add(timeout);
     let mut bytes = Vec::new();
     let mut buf = [0_u8; READ_CHUNK];
+    let mut da1_seen = false;
     loop {
-        let remaining = deadline.map(|d| to_timespec(d.saturating_duration_since(Instant::now())));
+        if deadline.is_some_and(|d| Instant::now() >= d) || bytes.len() >= MAX_REPLY_BYTES {
+            break;
+        }
+        let remaining = deadline.map(|d| d.saturating_duration_since(Instant::now()));
+        let wait = match settle {
+            Settle::QuietAfterDa1(quiet) if da1_seen => {
+                Some(remaining.map_or(quiet, |remaining| remaining.min(quiet)))
+            }
+            _ => remaining,
+        };
+        let wait = wait.map(to_timespec);
         let mut fds = [PollFd::new(&input, PollFlags::IN)];
-        match rustix::event::poll(&mut fds, remaining.as_ref()) {
+        match rustix::event::poll(&mut fds, wait.as_ref()) {
             Ok(0) => break,
             Ok(_) => {}
             Err(Errno::INTR) => continue,
@@ -167,12 +208,15 @@ pub fn read_replies(input: impl AsFd, timeout: Duration) -> io::Result<Vec<u8>> 
         let read = match rustix::io::read(&input, &mut buf) {
             Ok(0) => break,
             Ok(read) => read,
-            Err(Errno::INTR) => continue,
+            Err(Errno::INTR | Errno::AGAIN) => continue,
             Err(err) => return Err(io::Error::from(err)),
         };
         bytes.extend_from_slice(buf.get(..read).unwrap_or_default());
-        if parse(&bytes).end == ReplyEnd::Da1 {
-            break;
+        if !da1_seen && parse(&bytes).end == ReplyEnd::Da1 {
+            match settle {
+                Settle::AtDa1 => break,
+                Settle::QuietAfterDa1(_) => da1_seen = true,
+            }
         }
     }
     Ok(bytes)
@@ -187,8 +231,9 @@ fn to_timespec(duration: Duration) -> Timespec {
 }
 
 /// Writes [`query`] to `out`, reads the replies from `input` with
-/// [`read_replies`] and parses them. The raw replies are logged at
-/// `debug`.
+/// [`read_replies`] and parses them. Under tmux the read waits
+/// [`TMUX_SETTLE`] after the DA1 reply for a late kitty graphics reply.
+/// The raw replies are logged at `debug`.
 ///
 /// # Errors
 ///
@@ -201,7 +246,11 @@ pub fn probe(
 ) -> io::Result<Replies> {
     out.write_all(&query(multiplexer))?;
     out.flush()?;
-    let bytes = read_replies(input, timeout)?;
+    let settle = match multiplexer {
+        Multiplexer::Tmux => Settle::QuietAfterDa1(TMUX_SETTLE),
+        Multiplexer::None => Settle::AtDa1,
+    };
+    let bytes = read_replies(input, timeout, settle)?;
     log::debug!("terminal probe replies: {}", bytes.escape_ascii());
     Ok(parse(&bytes))
 }
@@ -287,12 +336,18 @@ fn csi(input: &[u8]) -> Step<'_> {
 }
 
 /// Reads a string sequence (DCS, APC, OSC) from `input`, which starts
-/// after its introducer, up to `ESC \` or BEL.
+/// after its introducer, up to `ESC \` or BEL. An `ESC` followed by
+/// anything else cancels the string, and tokenizing resumes at that
+/// `ESC`.
 fn string<'a>(input: &'a [u8], make: impl Fn(&'a [u8]) -> Token<'a>) -> Step<'a> {
     for (i, &byte) in input.iter().enumerate() {
         let terminator_len = match byte {
             BEL => 1,
-            ESC if input.get(i + 1) == Some(&b'\\') => 2,
+            ESC => match input.get(i + 1) {
+                Some(&b'\\') => 2,
+                Some(_) => return input.get(i..).map_or(Step::End, Step::Skip),
+                None => return Step::End,
+            },
             _ => continue,
         };
         return match (input.get(..i), input.get(i + terminator_len..)) {
@@ -651,11 +706,35 @@ mod tests {
     }
 
     #[test]
+    fn tmux_kitty_reply_after_da1_is_interpreted() {
+        let mut input = TMUX.to_vec();
+        input.extend_from_slice(b"\x1b_Gi=31;OK\x1b\\");
+        let replies = parse(&input);
+        assert_eq!(replies.kitty_graphics, KittyReply::Ok);
+        assert_eq!(replies.end, ReplyEnd::Da1);
+    }
+
+    #[test]
+    fn esc_cancels_an_unterminated_dcs() {
+        let mut input = b"\x1bPjunk".to_vec();
+        input.extend_from_slice(KITTY);
+        assert_eq!(parse(&input), parse(KITTY));
+    }
+
+    #[test]
+    fn esc_cancels_an_unterminated_apc() {
+        let replies = parse(b"\x1b_Gi=31;OK\x1b[?0u\x1b[?62c");
+        assert_eq!(replies.keyboard_flags, Some(0));
+        assert_eq!(replies.end, ReplyEnd::Da1);
+        assert_eq!(replies.kitty_graphics, KittyReply::Missing);
+    }
+
+    #[test]
     fn read_replies_stops_at_da1() {
         let (reader, mut writer) = io::pipe().unwrap();
         writer.write_all(KITTY).unwrap();
         let start = Instant::now();
-        let bytes = read_replies(&reader, Duration::from_secs(60)).unwrap();
+        let bytes = read_replies(&reader, Duration::from_secs(60), Settle::AtDa1).unwrap();
         assert_eq!(bytes, KITTY);
         assert!(start.elapsed() < Duration::from_secs(30));
         drop(writer);
@@ -664,7 +743,7 @@ mod tests {
     #[test]
     fn read_replies_on_an_empty_pipe_times_out_empty() {
         let (reader, _writer) = io::pipe().unwrap();
-        let bytes = read_replies(&reader, Duration::from_millis(50)).unwrap();
+        let bytes = read_replies(&reader, Duration::from_millis(50), Settle::AtDa1).unwrap();
         assert_eq!(bytes, Vec::<u8>::new());
     }
 
@@ -674,9 +753,86 @@ mod tests {
         writer.write_all(b"\x1b[?1u").unwrap();
         drop(writer);
         let start = Instant::now();
-        let bytes = read_replies(&reader, Duration::from_secs(60)).unwrap();
+        let bytes = read_replies(&reader, Duration::from_secs(60), Settle::AtDa1).unwrap();
         assert_eq!(bytes, b"\x1b[?1u");
         assert!(start.elapsed() < Duration::from_secs(30));
+    }
+
+    #[test]
+    fn read_replies_stops_at_the_size_cap() {
+        let (reader, mut writer) = io::pipe().unwrap();
+        // Writes until the reader is dropped and the write fails.
+        let noise = std::thread::spawn(move || {
+            let chunk = [b'x'; READ_CHUNK];
+            while writer.write_all(&chunk).is_ok() {}
+        });
+        let start = Instant::now();
+        let bytes = read_replies(&reader, Duration::from_secs(60), Settle::AtDa1).unwrap();
+        assert!(start.elapsed() < Duration::from_secs(30));
+        assert!(bytes.len() >= MAX_REPLY_BYTES);
+        assert!(bytes.len() <= MAX_REPLY_BYTES + READ_CHUNK);
+        drop(reader);
+        noise.join().unwrap();
+    }
+
+    #[test]
+    fn read_replies_stops_at_the_deadline_while_bytes_trickle_in() {
+        let (reader, mut writer) = io::pipe().unwrap();
+        // Writes until the reader is dropped and the write fails.
+        let trickle = std::thread::spawn(move || {
+            while writer.write_all(b"x").is_ok() {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        });
+        let start = Instant::now();
+        read_replies(&reader, Duration::from_millis(200), Settle::AtDa1).unwrap();
+        assert!(start.elapsed() < Duration::from_secs(30));
+        drop(reader);
+        trickle.join().unwrap();
+    }
+
+    #[test]
+    fn read_replies_waits_for_a_late_kitty_reply_after_da1() {
+        const LATE: &[u8] = b"\x1b_Gi=31;OK\x1b\\";
+        let (reader, mut writer) = io::pipe().unwrap();
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        // Keeps the pipe open until the test is done reading.
+        let late = std::thread::spawn(move || {
+            writer.write_all(TMUX).unwrap();
+            std::thread::sleep(Duration::from_millis(30));
+            writer.write_all(LATE).unwrap();
+            let _ = done_rx.recv();
+        });
+        let start = Instant::now();
+        let bytes = read_replies(
+            &reader,
+            Duration::from_secs(60),
+            Settle::QuietAfterDa1(Duration::from_millis(500)),
+        )
+        .unwrap();
+        assert!(start.elapsed() < Duration::from_secs(30));
+        let mut expected = TMUX.to_vec();
+        expected.extend_from_slice(LATE);
+        assert_eq!(bytes, expected);
+        drop(done_tx);
+        late.join().unwrap();
+    }
+
+    #[test]
+    fn probe_under_tmux_writes_the_tmux_query() {
+        let (reader, mut writer) = io::pipe().unwrap();
+        writer.write_all(TMUX).unwrap();
+        let mut out = Vec::new();
+        let replies = probe(
+            &mut out,
+            &reader,
+            Multiplexer::Tmux,
+            Duration::from_secs(60),
+        )
+        .unwrap();
+        assert_eq!(out, query(Multiplexer::Tmux));
+        assert_eq!(replies, parse(TMUX));
+        drop(writer);
     }
 
     #[test]

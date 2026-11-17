@@ -202,10 +202,10 @@ Manager module; ratatui-crossterm 0.1.2's `CrosstermBackend`; crossterm
     `$XDG_CONFIG_HOME/frext/config.toml` and defines no keys, so
     unknown keys (e.g. its example `theme`) must be ignored.
 - **New dependencies** (pinned, alphabetical, workspace-level):
-  - `toml = { version = "1.2.1", default-features = false, features = ["parse", "serde", "std"] }`
-    for `frext-core`. The implementer checks those feature names
-    against the registry source and keeps the minimal set that parses
-    into serde types.
+  - `toml = { version = "1.2.1", default-features = false, features = ["parse", "serde"] }`
+    for `frext-core`. (Planned with `"std"` as well; 06.1 found
+    `parse` + `serde` is the minimal set that parses into serde types,
+    and `toml::de::Error` still implements `Error` without `std`.)
   - `rustix = { version = "1.1.6", features = ["event", "stdio"] }` for
     `frext-term`.
 - **Modules.**
@@ -264,8 +264,9 @@ Manager module; ratatui-crossterm 0.1.2's `CrosstermBackend`; crossterm
           or `alacritty`.
         - `TERM_PROGRAM` equals (case-insensitive) `ghostty`,
           `wezterm`, `freminal`, `iTerm.app` or `vscode`.
-        - `TERM` equals `xterm-kitty`, `xterm-ghostty`, `wezterm`,
-          `alacritty` or `contour`, or starts with `foot`.
+        - `TERM` equals (case-insensitive) `xterm-kitty`,
+          `xterm-ghostty`, `wezterm`, `alacritty` or `contour`, or
+          starts with `foot`.
       - Otherwise `Straight`.
   - `images`, by `settings.icons`:
     - `Auto`: `KittyPlaceholders { cell_px }` when the kitty reply was
@@ -292,13 +293,16 @@ Manager module; ratatui-crossterm 0.1.2's `CrosstermBackend`; crossterm
   `crossterm::terminal::supports_keyboard_enhancement` is no longer
   called, which completes the hand-over plan 02 promised.
 - **Probe placement.** `TerminalGuard::enter` runs the probe right
-  after `enable_raw_mode` and before `write_setup`, so before the
-  alternate screen and long before `EventLoop::spawn_input`. A probe
-  I/O error is logged at `warn` and treated as "no replies"
-  (`Replies::default()`). It never aborts startup.
+  after `enable_raw_mode` and before `write_setup`, long before
+  `EventLoop::spawn_input`. A probe I/O error is logged at `warn` and
+  treated as "no replies" (`Replies::default()`). It never aborts
+  startup. (06.9 moves it after entering the alternate screen and
+  reads from the tty crossterm reads.)
 - **Bytes after DA1.** Whatever the read loop reads after the DA1 reply
   (a key typed during startup) is discarded. Only replies before DA1
-  are parsed.
+  are parsed. Non-reply bytes before DA1 are skipped too, so keys typed
+  during the probe's few milliseconds are lost; accepted (06.9 review,
+  finding 8). (06.9 keeps interpreting kitty APC replies after DA1.)
 - **Config.** `Config::load()` reads `Config::default_path()`
   (`ProjectDirs::from("io.github", "fredsystems", "frext")`'s
   `config_dir()` joined with `config.toml`, the same `ProjectDirs` the
@@ -880,6 +884,129 @@ draw any underline colour (plan 07); do NOT proceed further.
 
 Stop: report files changed, verification, and the logged caps line;
 await review.
+
+### 06.9 -- Review fixes (adversarial branch review)
+
+Surfaced by a CODE-REVIEW pass over `main...60f510b`. Findings 9 and
+10 (the case-insensitive `TERM` match and the trimmed `toml` features)
+were plan-text mismatches, fixed in the plan above. Finding 8 (keys
+typed during the probe are lost) is accepted and recorded under "Bytes
+after DA1". Finding 4 is deferred to 06.10.
+
+Scope: `frext-term/src/term/probe.rs`, `frext-term/src/terminal.rs`,
+`frext-term/src/term/caps.rs` (one doc comment).
+
+The fixes:
+
+- **A -- read the tty crossterm reads** (bug, finding 1). crossterm
+  reads stdin only when it is a terminal and `/dev/tty` otherwise. The
+  probe always read stdin, so `xargs frext-term` (stdin `/dev/null`) or
+  a pipe gave no replies, and the real replies later reached crossterm
+  as Alt+P / Alt+_ and typed text in the buffer. Now `terminal.rs` has
+  a private `fn run_probe(multiplexer: Multiplexer) ->
+  io::Result<Replies>`:
+  - When `io::stdin().is_terminal()` (`std::io::IsTerminal`), it probes
+    with `rustix::stdio::stdin()`.
+  - Otherwise it opens `/dev/tty` with `std::fs::File::open` and probes
+    with that file (a failure to open is returned as the error, which
+    `enter` already logs and treats as no replies).
+  - Queries are still written to `io::stdout()`, which crossterm and
+    ratatui write to.
+- **B -- the timeout and size are enforced** (bug, finding 2; risk,
+  finding 7). In `read_replies`:
+  - At the top of each turn, when a deadline exists and
+    `Instant::now() >= deadline`, the loop ends.
+  - `const MAX_REPLY_BYTES: usize = 64 * 1024;`: once `bytes.len()`
+    reaches it, the loop ends.
+  - `Errno::AGAIN` from `read` is retried like `Errno::INTR` (the
+    deadline check bounds the retries).
+- **C -- tmux: wait for late kitty replies** (bug, finding 3). tmux
+  answers DA1 itself, at once, while the wrapped kitty query is still
+  on its way to the outer terminal. Now:
+  - `pub enum Settle { AtDa1, QuietAfterDa1(Duration) }` (derive
+    `Debug, Clone, Copy, PartialEq, Eq`) and `pub const TMUX_SETTLE:
+    Duration = Duration::from_millis(100);`.
+  - `read_replies(input, timeout, settle: Settle)`: with `AtDa1`, the
+    loop ends at DA1 as before. With `QuietAfterDa1(quiet)`, once DA1
+    has been seen each poll waits at most `quiet` (and never past the
+    deadline), and a poll that returns 0 ends the loop.
+  - `probe` passes `QuietAfterDa1(TMUX_SETTLE)` under
+    `Multiplexer::Tmux` and `AtDa1` otherwise.
+  - `parse` keeps tokenizing after DA1 but interprets only APC tokens
+    (the kitty reply), which no key press produces. Everything else
+    after DA1 stays ignored.
+- **D -- probe inside the alternate screen, then clear** (risk,
+  finding 5). A terminal without APC/DCS parsing (the Linux console)
+  prints the queries' text. Now:
+  - `pub fn write_enter(out: &mut impl Write) -> io::Result<()>`
+    queues `EnterAlternateScreen` and flushes. `write_setup` no longer
+    enters the alternate screen (it writes mouse capture, bracketed
+    paste and the keyboard push). `write_restore` is unchanged and
+    still leaves the alternate screen last.
+  - `enter`: `enable_raw_mode`, then `write_enter` (on error: the same
+    undo as a `write_setup` failure, with `KeyboardMode::Legacy`, then
+    return the error), then the probe and caps, then `write_setup`,
+    unchanged from there.
+  - `write_setup` starts with `Clear(ClearType::All)` (`CSI 2 J`). It
+    runs right after the probe, inside the alternate screen, so it
+    wipes anything a terminal printed. (Not `Terminal::clear`, which
+    first reads the cursor position, a round trip that fails startup
+    on a terminal that does not answer it; found in the orchestrator's
+    pseudo-terminal run.)
+- **E -- an ESC cancels a string sequence** (risk, finding 6). In the
+  tokenizer, an `ESC` inside a DCS/APC/OSC body that is not followed by
+  `\` ends the string without a token, and tokenizing resumes at that
+  `ESC`. An `ESC` as the last byte is still a cut-off sequence.
+- **F -- docs.** `TerminalCaps::version` says it holds the XTVERSION
+  text after `>|`. The probe module doc says non-reply bytes before
+  DA1 are skipped and keys typed during the probe are lost.
+
+Tests:
+
+- B: a writer thread that keeps writing non-reply bytes (until the
+  write fails) makes `read_replies` with a 60 s timeout return in
+  under 30 s with between `MAX_REPLY_BYTES` and `MAX_REPLY_BYTES +
+  1024` bytes; a writer thread writing one byte every 10 ms makes it
+  return within 30 s with a 200 ms timeout
+- C: `parse` of the `TMUX` fixture followed by
+  `\x1b_Gi=31;OK\x1b\\` gives `kitty_graphics: Ok` and `end: Da1`;
+  `read_replies` with `QuietAfterDa1(500 ms)` returns the `TMUX`
+  fixture plus a kitty reply written 30 ms later by a writer thread,
+  in under 30 s with a 60 s timeout; `probe` under tmux writes
+  `query(Multiplexer::Tmux)`
+- D: `write_enter` writes exactly `\x1b[?1049h`; `write_setup` no
+  longer contains it and starts with `\x1b[2J`; `write_enter` +
+  `write_setup` equals the old setup bytes with `\x1b[2J` after the
+  alternate-screen switch
+- E: `\x1bPjunk` followed by the `KITTY` fixture parses like `KITTY`;
+  an unterminated `\x1b_Gi=31;OK` followed by `\x1b[?0u\x1b[?62c`
+  gives `keyboard_flags: Some(0)`, `end: Da1`, `kitty_graphics:
+  Missing`
+- A is checked by hand: the orchestrator's pseudo-terminal run with
+  stdin redirected from `/dev/null` still detects freminal
+
+Verification: the standard ritual.
+
+### 06.10 -- Cleanup (deferred): replies arriving after the probe
+
+Surfaced by the 06.9 review (finding 4), on `60f510b`.
+
+- **Surface point:** `probe::read_replies` gives up at the timeout (or
+  at DA1, plus `TMUX_SETTLE` under tmux).
+- **Impact:** a reply that arrives later (a very slow SSH link, or a
+  kitty reply through tmux slower than 100 ms) reaches crossterm's
+  reader, which reads `ESC P` / `ESC _` as Alt+P / Alt+_ and the rest
+  as typed characters, so the text lands in the buffer.
+- **Scope of fix:** `frext-term/src/events.rs` or the app's key
+  routing.
+- **Suggested approach:** when the probe ended without DA1, or under
+  tmux, have the input thread drop key events that form a DCS/APC
+  reply (Alt+P / Alt+_ followed by printable text up to Alt+\) for a
+  short window after startup.
+- **Verification:** a unit test feeding the events a late
+  `ESC P >| … ESC \` produces to the filter, and a manual run over a
+  slow link.
+- **Scheduling:** independent; any later `frext-term` branch.
 
 ## Manual smoke checklist
 

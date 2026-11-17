@@ -103,7 +103,8 @@ pub struct TerminalCaps {
     pub keyboard: KeyboardProtocol,
     /// The multiplexer frext runs inside.
     pub multiplexer: Multiplexer,
-    /// The raw XTVERSION reply, when the terminal sent one.
+    /// The XTVERSION text (the part of the reply after `>|`), when the
+    /// terminal sent one.
     pub version: Option<String>,
 }
 
