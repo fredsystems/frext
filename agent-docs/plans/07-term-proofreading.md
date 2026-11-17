@@ -505,13 +505,15 @@ Stop: report files changed and verification; await review.
 Surface point: 07.6, reported by its implementer; the trigger was
 corrected by the adversarial branch review.
 
-Impact: an edit made through a core command (Ctrl+X / Ctrl+V,
-`ApplySuggestion`, Replace / Replace all) goes through
-`BufferView::record_outside_edit`, which updates the view's text hash
+Impact: an edit made through a core command goes through
+`BufferView::record_outside_edit`, which updated the view's text hash
 but not its layout. Typing does not have the problem (`after_change`
-re-lays out). Until the next render, `fresh_layout` rejects the stale
-layout, so `caret_cell` is `None` and Shift+F10 / Menu opens the menu
-at the editor's top-left instead of below the caret.
+re-lays out), and neither do Cut, Paste and `ApplySuggestion`: they
+return `Effect::SetSelection`, which `TermApp::handle` applies at once
+through `set_selection` and so `prepare`. Replace all returns no
+effect, so after it, until the next render, `fresh_layout` rejected
+the stale layout, `caret_cell` was `None`, and Shift+F10 / Menu opened
+the menu at the editor's top-left instead of below the caret.
 
 Resolution: fixed in 07.9 (`record_outside_edit` refreshes the
 layout), with the regression test in 07.12.
@@ -669,8 +671,10 @@ Deliverable: tests: right-click on the space after `tset` and past the
 end of its line opens the plain menu; caret just after `tset` shows
 the message and the menu key opens its menu; a status message with a
 newline renders on one line; an empty message shows the path; with the
-sidebar focused the path is shown; Ctrl+X then Shift+F10 with no draw
-in between opens `below` the caret cell (07.7).
+sidebar focused the path is shown; Replace all then Shift+F10 with no
+draw in between opens `below` the caret cell (07.7; Ctrl+X would not
+do, since it re-lays out through its selection effect, and the test
+was checked to fail without the 07.9 refresh).
 
 Every review-fix subtask: the standard ritual; do NOT touch files
 outside its scope; one commit each, reviewed before committing.
