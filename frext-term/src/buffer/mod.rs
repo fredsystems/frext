@@ -14,7 +14,11 @@
 //! [`BufferView`] ties them together for the app: it keeps each tab's
 //! cursor, history, highlighter, layout and scroll position, applies
 //! keyboard and mouse input to the active tab, detects text changes it
-//! did not make, and renders the tab.
+//! did not make, and renders the tab with its [`Overlays`] (search
+//! matches painted, proofreading diagnostics underlined). Its read-only
+//! queries ([`BufferView::grapheme_at_cell`], [`BufferView::caret_cell`],
+//! [`BufferView::rect`]) answer from the last render's rect without
+//! moving anything.
 
 pub mod cells;
 pub mod cursor;
@@ -111,7 +115,8 @@ impl TabView {
 pub struct Overlays<'a> {
     /// The search matches to paint.
     pub matches: MatchHighlightsRef<'a>,
-    /// The proofreading diagnostics to underline.
+    /// The proofreading diagnostics to underline, sorted by start (as
+    /// `Proofreading::diagnostics` returns them); they may overlap.
     pub diagnostics: &'a [&'a Diagnostic],
 }
 
@@ -320,8 +325,10 @@ impl BufferView {
     /// where `before` is the text before it, as one undo group. A tab the
     /// view has never seen (a new tab edited before its first render)
     /// gets fresh view state for `before` first, so its edit is undoable
-    /// too; its layout is built on the next render. A recorded group is
-    /// never coalesced, so `_now` does not affect grouping.
+    /// too. The layout is rebuilt for the new text at the last rendered
+    /// width, so [`Self::caret_cell`] answers before the next render. A
+    /// recorded group is never coalesced, so `_now` does not affect
+    /// grouping.
     ///
     /// `after` is the selection a redo restores, clamped to the new text:
     /// the core command's own selection when it set one, in which case the
@@ -373,7 +380,9 @@ impl BufferView {
         if moves_cursor {
             view.cursor = after;
         }
-        view.known = text_hash(text);
+        let hash = text_hash(text);
+        view.known = hash;
+        refresh_layout(view, text, hash, wrap_width(self.rect));
     }
 
     /// Closes the open typing group of the tab with `tab_id`, if the view
@@ -396,36 +405,43 @@ impl BufferView {
         self.tabs.get(&tab_id).map(|view| view.cursor.caret())
     }
 
-    /// The view state of `tab` and its layout, when the layout is fresh
-    /// for `tab`'s current text and the last rendered editor width.
+    /// The view state of `tab` and its layout, when the view knows `tab`'s
+    /// current text and the layout is fresh for it and the last rendered
+    /// editor width.
     fn fresh_layout(&self, tab: &Tab) -> Option<(&TabView, &WrapLayout)> {
         let view = self.tabs.get(&tab.id)?;
         let (hash, layout) = view.layout.as_ref()?;
-        let fresh = *hash == text_hash(&tab.text) && layout.width() == wrap_width(self.rect);
+        let current = text_hash(&tab.text);
+        let fresh =
+            view.known == current && *hash == current && layout.width() == wrap_width(self.rect);
         fresh.then_some((view, layout))
     }
 
-    /// The char of `tab` under the absolute cell (`column`, `row`): the
-    /// char a left click there would put the caret at. Moves nothing.
+    /// The first char of the grapheme of `tab` drawn in the absolute cell
+    /// (`column`, `row`). Moves nothing.
     ///
-    /// `None` when the cell is outside the editor rect of the last
-    /// render, or the view has no layout for `tab`'s current text at that
-    /// rect's width (it does not know `tab`, or `tab` changed since).
+    /// `None` past a row's content, below the last row, outside the editor
+    /// rect of the last render, or without a fresh layout (the view does
+    /// not know `tab`, `tab` changed since, or the layout is for another
+    /// width).
     #[must_use]
-    pub fn char_at_cell(&self, tab: &Tab, column: u16, row: u16) -> Option<usize> {
+    pub fn grapheme_at_cell(&self, tab: &Tab, column: u16, row: u16) -> Option<usize> {
         if !self.rect.contains(Position { x: column, y: row }) {
             return None;
         }
-        let (view, _) = self.fresh_layout(tab)?;
-        Some(char_at_cell(view, &tab.text, self.rect, column, row))
+        let (view, layout) = self.fresh_layout(tab)?;
+        let visual_row =
+            top_row(layout, view.top).saturating_add(usize::from(row.saturating_sub(self.rect.y)));
+        layout.grapheme_at(&tab.text, visual_row, column.saturating_sub(self.rect.x))
     }
 
     /// The screen cell of `tab`'s caret, computed as [`Self::render`]
     /// does, over the editor rect of the last render.
     ///
-    /// `None` when the caret's row is scrolled off, its column is past
-    /// the right edge, or the view has no layout for `tab`'s current text
-    /// at that rect's width.
+    /// `None` when the caret's row is scrolled off, its column is at or
+    /// past the right edge, or the stored layout is stale for `tab`'s
+    /// current text or the rect's width (the view does not know `tab`,
+    /// `tab` changed since, or the editor was resized).
     #[must_use]
     pub fn caret_cell(&self, tab: &Tab) -> Option<Position> {
         let (view, layout) = self.fresh_layout(tab)?;
@@ -1315,16 +1331,15 @@ mod tests {
     }
 
     #[test]
-    fn char_at_cell_matches_a_click_without_moving_the_cursor() {
+    fn grapheme_at_cell_matches_a_click_without_moving_the_cursor() {
         let text = "abcdefghijklmnopqrstuvwxyz";
         let tab = tab(1, text);
         let mut view = BufferView::default();
+        // An 8-wide editor wraps at 7: row 1 starts at char 7 ('h').
         draw(&mut view, Some(&tab), 12, 4);
         view.set_selection(&tab, 1..3);
-        // Row 1 is the second wrapped row of the single line.
         let (column, row) = (GUTTER + 2, 1);
-        let found = view.char_at_cell(&tab, column, row).unwrap();
-        assert!(found > 0, "second-row char {found}");
+        assert_eq!(view.grapheme_at_cell(&tab, column, row), Some(9));
         assert_eq!(view.selection(1), Some(1..3));
         assert_eq!(view.caret(1), Some(3));
         assert!(!view.is_dragging());
@@ -1332,31 +1347,109 @@ mod tests {
         let mut clicked = BufferView::default();
         draw(&mut clicked, Some(&tab), 12, 4);
         clicked.mouse_down(&tab, column, row, Selecting::Move, Instant::now());
-        assert_eq!(clicked.caret(1), Some(found));
+        assert_eq!(clicked.caret(1), Some(9));
     }
 
     #[test]
-    fn char_at_cell_is_none_outside_the_editor_or_for_unknown_tabs() {
+    fn grapheme_at_cell_is_none_past_a_row_or_below_the_last_row() {
+        let tab = tab(1, "hi\nthere");
+        let mut view = BufferView::default();
+        draw(&mut view, Some(&tab), 12, 4);
+        assert_eq!(view.grapheme_at_cell(&tab, GUTTER + 1, 0), Some(1));
+        // Right of "hi", where a click would put the caret at its end.
+        assert_eq!(view.grapheme_at_cell(&tab, GUTTER + 2, 0), None);
+        assert_eq!(view.grapheme_at_cell(&tab, GUTTER + 5, 0), None);
+        assert_eq!(view.grapheme_at_cell(&tab, GUTTER + 4, 1), Some(7));
+        // Inside the editor, below the last row.
+        assert_eq!(view.grapheme_at_cell(&tab, GUTTER, 2), None);
+    }
+
+    #[test]
+    fn grapheme_at_cell_on_the_last_editor_column() {
+        // A full row is one column short of the editor: the last column
+        // is kept free, so nothing is drawn there.
+        let full = tab(1, "abcdefghij");
+        let mut view = BufferView::default();
+        draw(&mut view, Some(&full), 12, 3);
+        let last = view.rect().right() - 1;
+        assert_eq!(view.grapheme_at_cell(&full, last - 1, 0), Some(6));
+        assert_eq!(view.grapheme_at_cell(&full, last, 0), None);
+        // A grapheme wider than the wrap width overflows into it.
+        let wide = tab(2, "\tx");
+        draw(&mut view, Some(&wide), GUTTER + 4, 3);
+        let last = view.rect().right() - 1;
+        assert_eq!(view.grapheme_at_cell(&wide, last, 0), Some(0));
+        assert_eq!(view.grapheme_at_cell(&wide, GUTTER, 1), Some(1));
+    }
+
+    #[test]
+    fn grapheme_at_cell_is_none_outside_the_editor_or_for_unknown_tabs() {
         let tab = tab(1, "hello\nworld");
         let mut view = BufferView::default();
-        assert_eq!(view.char_at_cell(&tab, GUTTER, 0), None);
+        assert_eq!(view.grapheme_at_cell(&tab, GUTTER, 0), None);
         draw(&mut view, Some(&tab), 12, 3);
-        assert_eq!(view.char_at_cell(&tab, GUTTER, 0), Some(0));
+        assert_eq!(view.grapheme_at_cell(&tab, GUTTER, 0), Some(0));
         // In the gutter, left of the editor.
-        assert_eq!(view.char_at_cell(&tab, GUTTER - 1, 0), None);
+        assert_eq!(view.grapheme_at_cell(&tab, GUTTER - 1, 0), None);
         // Below and right of the editor.
-        assert_eq!(view.char_at_cell(&tab, GUTTER, 3), None);
-        assert_eq!(view.char_at_cell(&tab, 12, 0), None);
+        assert_eq!(view.grapheme_at_cell(&tab, GUTTER, 3), None);
+        assert_eq!(view.grapheme_at_cell(&tab, 12, 0), None);
         // A tab the view does not know.
         let mut other = tab.clone();
         other.id = 2;
-        assert_eq!(view.char_at_cell(&other, GUTTER, 0), None);
+        assert_eq!(view.grapheme_at_cell(&other, GUTTER, 0), None);
         assert_eq!(view.caret_cell(&other), None);
-        // A tab whose text changed since the last layout.
+        // A tab whose text changed since the last layout, unrecorded.
         let mut changed = tab.clone();
         changed.text.push('!');
-        assert_eq!(view.char_at_cell(&changed, GUTTER, 0), None);
+        assert_eq!(view.grapheme_at_cell(&changed, GUTTER, 0), None);
         assert_eq!(view.caret_cell(&changed), None);
+    }
+
+    #[test]
+    fn queries_are_none_after_a_render_at_another_width() {
+        let tab = tab(1, "hello");
+        let mut view = BufferView::default();
+        draw(&mut view, Some(&tab), 12, 3);
+        assert_eq!(view.grapheme_at_cell(&tab, GUTTER, 0), Some(0));
+        assert!(view.caret_cell(&tab).is_some());
+        draw(&mut view, None, 20, 3);
+        assert_eq!(view.grapheme_at_cell(&tab, GUTTER, 0), None);
+        assert_eq!(view.caret_cell(&tab), None);
+    }
+
+    #[test]
+    fn caret_cell_is_none_past_the_right_edge() {
+        // A 4-wide editor wraps at 3; a tab (4 cells) overflows alone on
+        // its row, so the caret after it is at column 4, the right edge.
+        let tab = tab(1, "\t");
+        let mut view = BufferView::default();
+        draw(&mut view, Some(&tab), GUTTER + 4, 3);
+        view.set_selection(&tab, 1..1);
+        assert_eq!(view.caret_cell(&tab), None);
+        let (_, caret, _) = draw(&mut view, Some(&tab), GUTTER + 4, 3);
+        assert_eq!(caret, None);
+    }
+
+    #[test]
+    fn caret_cell_is_fresh_after_record_outside_edit_without_a_render() {
+        let mut tab = tab(1, "hello world");
+        let mut view = BufferView::default();
+        draw(&mut view, Some(&tab), 20, 3);
+        view.set_selection(&tab, 5..5);
+        let before = tab.text.clone();
+        tab.text = "hello\nbig world".to_owned();
+        view.record_outside_edit(&tab, &before, None, Instant::now());
+        let cell = view.caret_cell(&tab);
+        assert_eq!(
+            cell,
+            Some(Position {
+                x: GUTTER + 3,
+                y: 1
+            })
+        );
+        let (_, caret, _) = draw(&mut view, Some(&tab), 20, 3);
+        assert_eq!(caret, cell);
     }
 
     #[test]

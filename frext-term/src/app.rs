@@ -552,7 +552,7 @@ impl TermApp {
                         // diagnostic the menu shows.
                         let diagnostic = self.editor.active_tab().and_then(|tab| {
                             let char_idx =
-                                self.buffer.char_at_cell(tab, mouse.column, mouse.row)?;
+                                self.buffer.grapheme_at_cell(tab, mouse.column, mouse.row)?;
                             self.editor
                                 .proofread()
                                 .diagnostic_at(tab.id, &tab.text, char_idx)
