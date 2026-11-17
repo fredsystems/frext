@@ -1,6 +1,6 @@
 # 07 -- TUI proofreading
 
-- **Status:** pending merge
+- **Status:** complete
 - **Depends on:** 03, 06
 - **Branch:** `feat/frext-term-proofreading` (one branch, one commit per
   subtask, one PR)
