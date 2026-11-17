@@ -9,6 +9,7 @@ pub mod buffer;
 pub mod cli;
 pub mod clipboard;
 pub mod complete;
+pub mod editor_menu;
 pub mod events;
 pub mod hit;
 pub mod keymap;

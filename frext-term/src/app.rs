@@ -16,16 +16,18 @@ use frext_core::lines::line_count;
 use frext_core::syntax::language_from_path;
 use ratatui::Frame;
 use ratatui::buffer::Buffer;
-use ratatui::layout::Rect;
+use ratatui::layout::{Position, Rect};
 use ratatui::style::Style;
 
 use crate::buffer::cursor::Selecting;
 use crate::buffer::edit::{Applied, EditAction};
 use crate::buffer::{BufferView, WHEEL_ROWS};
+use crate::editor_menu;
 use crate::events::AppEvent;
 use crate::hit::{HitMap, Target};
 use crate::keymap::{self, Action, Focus, KeyContext};
 use crate::layout;
+use crate::menu::{ContextMenu, Enablement, MenuReply};
 use crate::prompt::{PromptReply, PromptUi};
 use crate::status::{MessageKind, StatusLine};
 use crate::tab_bar;
@@ -62,6 +64,7 @@ pub struct TermApp {
     focus: Focus,
     sidebar: SidebarVisibility,
     prompt: PromptUi,
+    menu: Option<ContextMenu<Command>>,
     buffer: BufferView,
     status: StatusLine,
     hovered: Option<Target>,
@@ -93,6 +96,7 @@ impl TermApp {
             focus: Focus::Editor,
             sidebar: SidebarVisibility::Shown,
             prompt: PromptUi::new(base, home),
+            menu: None,
             buffer: BufferView::default(),
             status,
             hovered: None,
@@ -150,7 +154,9 @@ impl TermApp {
             AppEvent::Input(Event::Key(key)) => self.handle_key(key, now),
             AppEvent::Input(Event::Mouse(mouse)) => self.handle_mouse(mouse, now),
             AppEvent::Input(Event::Paste(text)) => {
-                if self.prompt.is_open(&self.editor) {
+                if self.menu.is_some() {
+                    // The open menu is modal: a paste is dropped.
+                } else if self.prompt.is_open(&self.editor) {
                     self.prompt.handle_paste(&mut self.editor, &text);
                 } else if self.focus == Focus::Editor
                     && let Some(view) = self.editor.active_view_mut()
@@ -190,6 +196,11 @@ impl TermApp {
         if key.kind == KeyEventKind::Release {
             return;
         }
+        if let Some(menu) = self.menu.as_mut() {
+            let reply = menu.handle_key(key);
+            self.menu_reply(reply, now);
+            return;
+        }
         if self.prompt.is_open(&self.editor) {
             match self.prompt.handle_key(&mut self.editor, key) {
                 PromptReply::Send(command) => self.send(command, now),
@@ -206,14 +217,7 @@ impl TermApp {
             return;
         };
         match action {
-            Action::Command(command) => {
-                let find = matches!(command, Command::OpenSearch(_));
-                self.send(command, now);
-                if find {
-                    self.status
-                        .set_message(FIND_BAR_MESSAGE, MessageKind::Info, now);
-                }
-            }
+            Action::Command(command) => self.send_command(command, now),
             Action::OpenFilePrompt => self.open_file_prompt(),
             Action::Quit => self.quit = Quit::Requested,
             Action::ToggleSidebar => {
@@ -237,12 +241,71 @@ impl TermApp {
         }
     }
 
-    fn handle_mouse(&mut self, mouse: MouseEvent, now: Instant) {
-        let target = self.hits.hit(mouse.column, mouse.row);
+    /// Sends a command chosen from a key binding or the editor menu. The
+    /// find commands also note that the find bar is not drawn yet.
+    fn send_command(&mut self, command: Command, now: Instant) {
+        let find = matches!(command, Command::OpenSearch(_));
+        self.send(command, now);
+        if find {
+            self.status
+                .set_message(FIND_BAR_MESSAGE, MessageKind::Info, now);
+        }
+    }
+
+    /// Acts on the open menu's reply: a choice closes it and is sent, a
+    /// dismissal closes it. Either way the hit map, which still holds the
+    /// menu's rows, is dropped until the next render.
+    fn menu_reply(&mut self, reply: MenuReply<Command>, now: Instant) {
+        match reply {
+            MenuReply::Chosen(command) => {
+                self.menu = None;
+                self.send_command(command, now);
+            }
+            MenuReply::Dismissed => self.forget_layout(),
+            MenuReply::Handled => {}
+        }
+    }
+
+    /// Records the mouse's hover target and shows its hint.
+    fn hover(&mut self, target: Option<Target>) {
+        self.hovered = target;
+        self.status.set_hint(target.and_then(Target::hint));
+    }
+
+    /// Routes a mouse event while the editor menu is open: it captures
+    /// clicks (one outside dismisses it without acting on what is under
+    /// it), and the wheel does nothing.
+    fn handle_menu_mouse(&mut self, mouse: MouseEvent, target: Option<Target>, now: Instant) {
         match mouse.kind {
             MouseEventKind::Moved | MouseEventKind::Drag(_) => {
-                self.hovered = target;
-                self.status.set_hint(target.and_then(Target::hint));
+                self.hover(target);
+                if let Some(menu) = self.menu.as_mut() {
+                    menu.hover(match target {
+                        Some(Target::MenuItem(index)) => Some(index),
+                        _ => None,
+                    });
+                }
+            }
+            MouseEventKind::Up(MouseButton::Left) => self.buffer.mouse_up(),
+            MouseEventKind::Down(MouseButton::Left | MouseButton::Right) => {
+                if let Some(menu) = self.menu.as_mut() {
+                    let reply = menu.click(target);
+                    self.menu_reply(reply, now);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_mouse(&mut self, mouse: MouseEvent, now: Instant) {
+        let target = self.hits.hit(mouse.column, mouse.row);
+        if self.menu.is_some() {
+            self.handle_menu_mouse(mouse, target, now);
+            return;
+        }
+        match mouse.kind {
+            MouseEventKind::Moved | MouseEventKind::Drag(_) => {
+                self.hover(target);
                 if mouse.kind == MouseEventKind::Drag(MouseButton::Left)
                     && self.buffer.is_dragging()
                     && !self.prompt.is_open(&self.editor)
@@ -291,6 +354,28 @@ impl TermApp {
                         | Target::MenuItem(_),
                     )
                     | None => {}
+                }
+            }
+            MouseEventKind::Down(MouseButton::Right) => {
+                if self.prompt.is_open(&self.editor) || target != Some(Target::Editor) {
+                    return;
+                }
+                if let Some(tab) = self.editor.active_tab() {
+                    let selection = if self
+                        .buffer
+                        .selection(tab.id)
+                        .is_some_and(|chars| !chars.is_empty())
+                    {
+                        Enablement::Enabled
+                    } else {
+                        Enablement::Disabled
+                    };
+                    self.menu = Some(ContextMenu::new(
+                        editor_menu::entries(selection),
+                        Position::new(mouse.column, mouse.row),
+                    ));
+                    // The chosen command acts on the editor's selection.
+                    self.focus = Focus::Editor;
                 }
             }
             MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
@@ -359,10 +444,12 @@ impl TermApp {
     /// rendered layout. Called whenever the layout may have changed
     /// before the next render, so a queued click cannot hit a target
     /// that has moved (such as a tab index shifted by a close); until
-    /// the next render, mouse events hit nothing.
+    /// the next render, mouse events hit nothing. The editor menu, which
+    /// is anchored to that layout, closes.
     fn forget_layout(&mut self) {
         self.hits.clear();
         self.hovered = None;
+        self.menu = None;
     }
 
     /// Carries out the queued effects, then drops the view state of tabs
@@ -445,10 +532,14 @@ impl TermApp {
             },
         );
         self.status.render(areas.status, buf, &left, &right);
+        if let Some(menu) = &self.menu {
+            menu.render(area, buf, &mut self.hits);
+        }
 
         let prompt_cursor = self.prompt.render(&self.editor, area, buf, &mut self.hits);
-        let editor_cursor =
-            caret.filter(|_| self.focus == Focus::Editor && !self.prompt.is_open(&self.editor));
+        let editor_cursor = caret.filter(|_| {
+            self.focus == Focus::Editor && self.menu.is_none() && !self.prompt.is_open(&self.editor)
+        });
         if let Some(position) = prompt_cursor.or(editor_cursor) {
             frame.set_cursor_position(position);
         }
@@ -1523,6 +1614,259 @@ mod tests {
         app.handle(mouse(left(MouseEventKind::Drag), 6, 2), now);
         app.handle(mouse(left(MouseEventKind::Up), 6, 2), now);
         assert_eq!(app.buffer.selection(id), before);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    fn right_click(app: &mut TermApp, column: u16, row: u16) {
+        app.handle(
+            mouse(MouseEventKind::Down(MouseButton::Right), column, row),
+            Instant::now(),
+        );
+    }
+
+    fn left_click(app: &mut TermApp, column: u16, row: u16) {
+        app.handle(
+            mouse(left(MouseEventKind::Down), column, row),
+            Instant::now(),
+        );
+        app.handle(mouse(left(MouseEventKind::Up), column, row), Instant::now());
+    }
+
+    /// The screen row of editor-menu entry `index` for a menu opened
+    /// downwards at `anchor_row`.
+    const fn menu_row(anchor_row: u16, index: u16) -> u16 {
+        anchor_row + 1 + index
+    }
+
+    /// "hello world" with "hello" selected.
+    fn app_with_hello_selected(dir: &Path) -> TermApp {
+        let mut app = app_with_text(dir, "hello world", KeyboardMode::Enhanced);
+        press(&mut app, KeyCode::Right, KeyModifiers::SHIFT, 5);
+        app
+    }
+
+    #[test]
+    fn a_right_click_opens_the_menu_without_moving_the_caret() {
+        let dir = temp_dir("menu-open");
+        let mut app = app_with_hello_selected(&dir);
+        let id = active_id(&app);
+        right_click(&mut app, 20, 1);
+        let menu = app.menu.as_ref().unwrap();
+        assert_eq!(
+            menu,
+            &ContextMenu::new(
+                editor_menu::entries(Enablement::Enabled),
+                Position::new(20, 1),
+            )
+        );
+        assert_eq!(app.buffer.selection(id), Some(0..5));
+        assert_eq!(app.buffer.caret(id), Some(5));
+        assert!(!app.buffer.is_dragging());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn without_a_selection_cut_and_copy_are_disabled_and_do_nothing() {
+        let dir = temp_dir("menu-disabled");
+        let mut app = app_with_text(&dir, "hello world", KeyboardMode::Enhanced);
+        right_click(&mut app, 10, 1);
+        assert_eq!(
+            app.menu.as_ref().unwrap(),
+            &ContextMenu::new(
+                editor_menu::entries(Enablement::Disabled),
+                Position::new(10, 1)
+            )
+        );
+        draw(&mut app);
+        app.handle(
+            mouse(MouseEventKind::Down(MouseButton::Left), 12, menu_row(1, 0)),
+            Instant::now(),
+        );
+        assert!(app.menu.is_some());
+        assert_eq!(text_of(&app), "hello world");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn right_clicks_off_the_editor_or_under_a_prompt_open_nothing() {
+        let dir = temp_dir("menu-off-editor");
+        let mut app = app_with_text(&dir, "hello", KeyboardMode::Enhanced);
+        right_click(&mut app, 1, 0);
+        assert!(app.menu.is_none());
+        right_click(&mut app, 0, 23);
+        assert!(app.menu.is_none());
+        app.handle(ctrl('o'), Instant::now());
+        draw(&mut app);
+        right_click(&mut app, 40, 20);
+        assert!(app.menu.is_none());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn clicking_copy_copies_the_selection() {
+        let dir = temp_dir("menu-copy");
+        let mut app = app_with_hello_selected(&dir);
+        right_click(&mut app, 10, 1);
+        draw(&mut app);
+        assert_eq!(app.hits.hit(12, menu_row(1, 1)), Some(Target::MenuItem(1)));
+        app.handle(
+            mouse(MouseEventKind::Down(MouseButton::Left), 12, menu_row(1, 1)),
+            Instant::now(),
+        );
+        assert!(app.menu.is_none());
+        assert_eq!(text_of(&app), "hello world");
+
+        draw(&mut app);
+        app.handle(key(KeyCode::End, KeyModifiers::CONTROL), Instant::now());
+        app.handle(ctrl('v'), Instant::now());
+        assert_eq!(text_of(&app), "hello worldhello");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn down_and_enter_cut_and_ctrl_z_restores() {
+        let dir = temp_dir("menu-cut");
+        let mut app = app_with_hello_selected(&dir);
+        right_click(&mut app, 10, 1);
+        app.handle(key(KeyCode::Down, KeyModifiers::NONE), Instant::now());
+        assert_eq!(app.menu.as_ref().unwrap().highlighted(), Some(0));
+        // The menu captured the arrow: the selection is untouched.
+        let id = active_id(&app);
+        assert_eq!(app.buffer.selection(id), Some(0..5));
+        app.handle(key(KeyCode::Enter, KeyModifiers::NONE), Instant::now());
+        assert!(app.menu.is_none());
+        assert_eq!(text_of(&app), " world");
+
+        app.handle(ctrl('z'), Instant::now());
+        assert_eq!(text_of(&app), "hello world");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn choosing_find_opens_the_search() {
+        let dir = temp_dir("menu-find");
+        let mut app = app_with_text(&dir, "hello world", KeyboardMode::Enhanced);
+        right_click(&mut app, 10, 1);
+        draw(&mut app);
+        app.handle(
+            mouse(MouseEventKind::Down(MouseButton::Left), 12, menu_row(1, 5)),
+            Instant::now(),
+        );
+        assert!(app.menu.is_none());
+        assert!(app.editor().search().is_open());
+        assert_eq!(
+            app.status.message(),
+            Some((FIND_BAR_MESSAGE, MessageKind::Info))
+        );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn esc_dismisses_the_menu() {
+        let dir = temp_dir("menu-esc");
+        let mut app = app_with_hello_selected(&dir);
+        right_click(&mut app, 10, 1);
+        app.handle(key(KeyCode::Esc, KeyModifiers::NONE), Instant::now());
+        assert!(app.menu.is_none());
+        assert_eq!(text_of(&app), "hello world");
+        assert!(!app.editor().search().is_open());
+        let id = active_id(&app);
+        assert_eq!(app.buffer.selection(id), Some(0..5));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn an_outside_click_dismisses_without_moving_the_caret() {
+        let dir = temp_dir("menu-outside");
+        let mut app = app_with_hello_selected(&dir);
+        right_click(&mut app, 10, 1);
+        draw(&mut app);
+        assert_eq!(app.hits.hit(4, 1), Some(Target::Editor));
+        left_click(&mut app, 4, 1);
+        assert!(app.menu.is_none());
+        // The menu's hit regions are gone until the next render.
+        assert_eq!(app.hits.hit(12, menu_row(1, 0)), None);
+        let id = active_id(&app);
+        assert_eq!(app.buffer.selection(id), Some(0..5));
+        assert!(!app.buffer.is_dragging());
+
+        // A right-click outside dismisses too, without reopening.
+        draw(&mut app);
+        right_click(&mut app, 10, 1);
+        assert!(app.menu.is_some());
+        draw(&mut app);
+        right_click(&mut app, 4, 1);
+        assert!(app.menu.is_none());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn hovering_an_item_highlights_it() {
+        let dir = temp_dir("menu-hover");
+        let mut app = app_with_text(&dir, "hello", KeyboardMode::Enhanced);
+        right_click(&mut app, 10, 1);
+        draw(&mut app);
+        app.handle(
+            mouse(MouseEventKind::Moved, 12, menu_row(1, 2)),
+            Instant::now(),
+        );
+        assert_eq!(app.menu.as_ref().unwrap().highlighted(), Some(2));
+        app.handle(mouse(MouseEventKind::Moved, 40, 20), Instant::now());
+        assert_eq!(app.menu.as_ref().unwrap().highlighted(), None);
+        assert_eq!(app.hovered, Some(Target::Editor));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_wheel_paste_and_resize_while_the_menu_is_open() {
+        let dir = temp_dir("menu-modal");
+        let file = long_file(&dir);
+        let mut app = app(&dir, &[file], KeyboardMode::Enhanced);
+        draw(&mut app);
+        right_click(&mut app, 40, 10);
+        draw(&mut app);
+        app.handle(mouse(MouseEventKind::ScrollDown, 70, 20), Instant::now());
+        app.handle(
+            AppEvent::Input(Event::Paste("zz".to_owned())),
+            Instant::now(),
+        );
+        assert!(app.menu.is_some());
+        let buf = draw(&mut app);
+        assert!(row_text(&buf, 1).starts_with("  1 line 1 "));
+        assert!(!text_of(&app).contains("zz"));
+
+        app.handle(AppEvent::Input(Event::Resize(100, 30)), Instant::now());
+        assert!(app.menu.is_none());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_menu_is_drawn_and_hides_the_frame_cursor() {
+        let dir = temp_dir("menu-draw");
+        let mut app = app_with_text(&dir, "hello world", KeyboardMode::Enhanced);
+        assert!(frame_cursor(&mut app).is_some());
+        right_click(&mut app, 10, 1);
+        let buf = draw(&mut app);
+        let labels = [
+            "Cut",
+            "Copy",
+            "Paste",
+            "Select all",
+            "",
+            "Find\u{2026}",
+            "Find and replace\u{2026}",
+            "",
+            "Save",
+        ];
+        for (index, label) in (0u16..).zip(labels) {
+            let row = row_text(&buf, menu_row(1, index));
+            let cells: String = row.chars().skip(12).take(label.chars().count()).collect();
+            assert_eq!(cells, label, "{row:?}");
+        }
+        assert_eq!(frame_cursor(&mut app), None);
+
+        app.handle(key(KeyCode::Esc, KeyModifiers::NONE), Instant::now());
+        assert!(frame_cursor(&mut app).is_some());
         fs::remove_dir_all(&dir).unwrap();
     }
 }
