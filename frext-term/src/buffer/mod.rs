@@ -277,6 +277,7 @@ impl BufferView {
         let Some((_, layout)) = view.layout.as_ref() else {
             return Applied::Unchanged;
         };
+        let is_move = matches!(action, EditAction::Move(..));
         let applied = edit::apply(
             EditTarget {
                 text: &mut tab.text,
@@ -289,6 +290,11 @@ impl BufferView {
             now,
         );
         after_change(view, &tab.text, rect, applied);
+        // A motion that leaves the caret where it was (Ctrl+Home at 0)
+        // still brings a wheel-scrolled caret back into view.
+        if is_move && applied == Applied::Unchanged {
+            keep_caret_visible(view, rect.height);
+        }
         applied
     }
 
@@ -684,6 +690,45 @@ mod tests {
         view.wheel(&tab, 1_000);
         assert_eq!(top_row_of(&view, 1), 99);
         assert_eq!(view.caret(1), Some(0));
+    }
+
+    #[test]
+    fn an_unmoved_doc_start_or_end_reveals_the_caret() {
+        let text = numbered(100);
+        let mut tab = tab(1, &text);
+        let mut view = BufferView::default();
+        let base = Instant::now();
+        draw(&mut view, Some(&tab), 12, 10);
+        assert_eq!(view.caret(1), Some(0));
+        view.wheel(&tab, 30);
+        assert_eq!(top_row_of(&view, 1), 30);
+        assert_eq!(
+            view.handle(
+                &mut tab,
+                EditAction::Move(Motion::DocStart, Selecting::Move),
+                base
+            ),
+            Applied::Unchanged
+        );
+        assert_eq!(top_row_of(&view, 1), 0);
+
+        let end = text.chars().count();
+        view.set_selection(&tab, end..end);
+        assert_eq!(top_row_of(&view, 1), 90);
+        view.wheel(&tab, -30);
+        assert_eq!(top_row_of(&view, 1), 60);
+        assert_eq!(
+            view.handle(
+                &mut tab,
+                EditAction::Move(Motion::DocEnd, Selecting::Move),
+                ms(base, 10)
+            ),
+            Applied::Unchanged
+        );
+        let top = top_row_of(&view, 1);
+        assert!(top <= 99 && 99 < top + 10, "caret row 99, top {top}");
+        let (_, caret, _) = draw(&mut view, Some(&tab), 12, 10);
+        assert!(caret.is_some());
     }
 
     #[test]
