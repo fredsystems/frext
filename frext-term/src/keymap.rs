@@ -3,7 +3,8 @@
 //!
 //! It covers the tab, search and focus shortcuts, and, while the editor
 //! has focus, the editing keys: typing, deleting, caret motion (Shift
-//! extends the selection), clipboard, and undo/redo.
+//! extends the selection), clipboard, and undo/redo. Shift+F10, or F22 /
+//! Menu plain or with Shift, open the editor's context menu at the caret.
 //!
 //! While the find bar is open, Alt+C / Alt+W / Alt+R / Alt+L toggle
 //! match case, whole word, regex and in-selection, whatever has focus.
@@ -60,6 +61,8 @@ pub enum Action {
     FocusEditor,
     /// Apply this edit action to the active buffer.
     Edit(EditAction),
+    /// Open the editor's context menu at the caret.
+    OpenEditorMenu,
 }
 
 /// The state a key binding depends on.
@@ -104,8 +107,24 @@ pub fn action_for(key: KeyEvent, ctx: KeyContext) -> Option<Action> {
         }
         KeyCode::Esc if ctx.search_open => Some(Action::Command(Command::CloseSearch)),
         KeyCode::Esc if ctx.focus == Focus::Sidebar => Some(Action::FocusEditor),
+        _ if ctx.focus == Focus::Editor && is_menu_key(key.code, mods) => {
+            Some(Action::OpenEditorMenu)
+        }
         _ if ctx.focus == Focus::Editor => editing_key(key.code, mods).map(Action::Edit),
         _ => None,
+    }
+}
+
+/// Whether `code` with `mods` is a context-menu key: Shift+F10, or
+/// F22 / Menu with no modifiers or exactly Shift (some terminals report
+/// Shift+F10 as F22). The file tree uses it too, so both open their menu
+/// on the same keys.
+pub(crate) fn is_menu_key(code: KeyCode, mods: KeyModifiers) -> bool {
+    let shifted = mods == KeyModifiers::SHIFT;
+    match code {
+        KeyCode::F(10) => shifted,
+        KeyCode::F(22) | KeyCode::Menu => mods.is_empty() || shifted,
+        _ => false,
     }
 }
 
@@ -875,6 +894,67 @@ mod tests {
             action_for(plain(KeyCode::Esc), finding()),
             cmd(Command::CloseSearch)
         );
+    }
+
+    /// Every key that opens the editor menu with editor focus.
+    fn menu_keys() -> [KeyEvent; 5] {
+        [
+            key(KeyCode::F(10), KeyModifiers::SHIFT),
+            plain(KeyCode::F(22)),
+            key(KeyCode::F(22), KeyModifiers::SHIFT),
+            plain(KeyCode::Menu),
+            key(KeyCode::Menu, KeyModifiers::SHIFT),
+        ]
+    }
+
+    #[test]
+    fn menu_keys_open_the_editor_menu_in_the_editor() {
+        for k in menu_keys() {
+            assert_eq!(action_for(k, ctx()), Some(Action::OpenEditorMenu), "{k:?}");
+            assert_eq!(
+                action_for(k, searching()),
+                Some(Action::OpenEditorMenu),
+                "{k:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn menu_keys_open_the_editor_menu_in_legacy_mode() {
+        for k in menu_keys() {
+            assert_eq!(
+                action_for(k, legacy()),
+                Some(Action::OpenEditorMenu),
+                "{k:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn other_modifiers_do_not_open_the_editor_menu() {
+        for k in [
+            plain(KeyCode::F(10)),
+            key(KeyCode::F(10), KeyModifiers::CONTROL | KeyModifiers::SHIFT),
+            key(KeyCode::F(10), KeyModifiers::ALT),
+            key(KeyCode::F(22), KeyModifiers::CONTROL),
+            key(KeyCode::Menu, KeyModifiers::ALT),
+        ] {
+            assert_ne!(action_for(k, ctx()), Some(Action::OpenEditorMenu), "{k:?}");
+        }
+    }
+
+    #[test]
+    fn menu_keys_do_not_open_the_editor_menu_outside_the_editor() {
+        let replacing = KeyContext {
+            focus: Focus::Find(FindField::Replacement),
+            ..searching()
+        };
+        for c in [sidebar(), finding(), replacing] {
+            for k in menu_keys() {
+                // Left unbound, so the tree or the find field gets the key.
+                assert_eq!(action_for(k, c), None, "{k:?} {c:?}");
+            }
+        }
     }
 
     #[test]

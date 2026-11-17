@@ -19,6 +19,8 @@ use frext_core::editor::{
     BufferChange, Command, Editor, EditorFocus, Effect, FolderState, SearchBar, StepDirection,
 };
 use frext_core::lines::line_count;
+use frext_core::proofread::Diagnostic;
+use frext_core::proofread::state::diagnostic_in;
 use frext_core::syntax::language_from_path;
 use frext_core::workspace::RowKind;
 use ratatui::Frame;
@@ -26,14 +28,14 @@ use ratatui::layout::Position;
 
 use crate::buffer::cursor::Selecting;
 use crate::buffer::edit::{Applied, EditAction};
-use crate::buffer::{BufferView, WHEEL_ROWS};
+use crate::buffer::{BufferView, Overlays, WHEEL_ROWS};
 use crate::editor_menu;
 use crate::events::AppEvent;
 use crate::find_bar::{self, FindBar, FindField, FindReply};
 use crate::hit::{HitMap, Target};
 use crate::keymap::{self, Action, Focus, KeyContext};
 use crate::layout;
-use crate::menu::{ContextMenu, Enablement, MenuReply};
+use crate::menu::{ContextMenu, Enablement, MenuAnchor, MenuReply};
 use crate::prompt::{PromptReply, PromptUi};
 use crate::status::{MessageKind, StatusLine};
 use crate::tab_bar;
@@ -51,6 +53,18 @@ enum SidebarVisibility {
     Hidden,
 }
 
+/// How the open menu was placed. A `Caret` menu is re-anchored to the
+/// caret on every render, so a layout change between opening it and the
+/// next draw (the find bar closing, say) cannot leave it stale; a
+/// `Pointer` menu stays where it opened.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MenuOrigin {
+    /// At a fixed cell: a right-click, or the tree's own keyboard menu.
+    Pointer,
+    /// From the keyboard at the editor's caret.
+    Caret,
+}
+
 /// Whether the user asked to quit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Quit {
@@ -66,6 +80,7 @@ pub struct TermApp {
     sidebar: SidebarVisibility,
     prompt: PromptUi,
     menu: Option<ContextMenu<Command>>,
+    menu_origin: MenuOrigin,
     find: FindBar,
     tree: FileTree,
     buffer: BufferView,
@@ -100,6 +115,7 @@ impl TermApp {
             sidebar: SidebarVisibility::Shown,
             prompt: PromptUi::new(base, home),
             menu: None,
+            menu_origin: MenuOrigin::Pointer,
             find: FindBar::new(),
             tree: FileTree::new(),
             buffer: BufferView::default(),
@@ -324,7 +340,31 @@ impl TermApp {
             },
             Action::FocusEditor => self.set_focus(Focus::Editor),
             Action::Edit(action) => self.edit(action, now),
+            Action::OpenEditorMenu => self.open_editor_menu_at_caret(),
         }
+    }
+
+    /// Opens the editor menu from the keyboard: with the diagnostic at
+    /// the caret, below the caret's cell, or at the editor's top-left
+    /// cell when the caret is not on screen. That placement comes from
+    /// the last render's layout; the next render re-anchors the menu to
+    /// the caret as drawn then ([`MenuOrigin::Caret`]).
+    fn open_editor_menu_at_caret(&mut self) {
+        let Some(tab) = self.editor.active_tab() else {
+            return;
+        };
+        let diagnostic = self.buffer.caret_span(tab).and_then(|span| {
+            let diagnostics = self.editor.proofread().diagnostics(tab.id, &tab.text);
+            diagnostic_in(&diagnostics, span).cloned()
+        });
+        let anchor = self.buffer.caret_cell(tab).map_or_else(
+            || {
+                let rect = self.buffer.rect();
+                MenuAnchor::At(Position::new(rect.x, rect.y))
+            },
+            MenuAnchor::Below,
+        );
+        self.open_editor_menu(diagnostic, anchor, MenuOrigin::Caret);
     }
 
     /// Routes a key the keymap left unbound to the file tree, over rows
@@ -337,7 +377,11 @@ impl TermApp {
         match self.tree.handle_key(key) {
             TreeReply::Send(command) => self.send(command, now),
             TreeReply::OpenMenu { path, kind, anchor } => {
-                self.menu = Some(ContextMenu::new(tree_menu::entries(&path, kind), anchor));
+                // The tree places its menu from its own rows: it stays put.
+                self.open_menu(
+                    ContextMenu::new(tree_menu::entries(&path, kind), anchor),
+                    MenuOrigin::Pointer,
+                );
             }
             TreeReply::Resized => self.forget_layout(),
             TreeReply::Handled | TreeReply::Ignored => {}
@@ -522,23 +566,34 @@ impl TermApp {
                 }
                 let at = Position::new(mouse.column, mouse.row);
                 match target {
-                    Some(Target::Editor) => self.open_editor_menu(at),
+                    Some(Target::Editor) => {
+                        // The caret stays put: the cell only picks the
+                        // diagnostic the menu shows.
+                        let diagnostic = self.editor.active_tab().and_then(|tab| {
+                            let chars =
+                                self.buffer.grapheme_at_cell(tab, mouse.column, mouse.row)?;
+                            let diagnostics =
+                                self.editor.proofread().diagnostics(tab.id, &tab.text);
+                            diagnostic_in(&diagnostics, chars).cloned()
+                        });
+                        self.open_editor_menu(diagnostic, MenuAnchor::At(at), MenuOrigin::Pointer);
+                    }
                     Some(Target::TreeRow(index)) => {
                         if let Some(row) = self.tree.row(index).cloned() {
                             self.tree.select(index);
-                            self.menu = Some(ContextMenu::new(
-                                tree_menu::entries(&row.path, row.kind),
-                                at,
-                            ));
+                            self.open_menu(
+                                ContextMenu::new(tree_menu::entries(&row.path, row.kind), at),
+                                MenuOrigin::Pointer,
+                            );
                             self.set_focus(Focus::Sidebar);
                         }
                     }
                     Some(Target::TreeEmpty) => {
                         if let Some(workspace) = self.editor.workspace() {
-                            self.menu = Some(ContextMenu::new(
-                                tree_menu::dir_entries(&workspace.root),
-                                at,
-                            ));
+                            self.open_menu(
+                                ContextMenu::new(tree_menu::dir_entries(&workspace.root), at),
+                                MenuOrigin::Pointer,
+                            );
                             self.set_focus(Focus::Sidebar);
                         }
                     }
@@ -585,9 +640,21 @@ impl TermApp {
         }
     }
 
-    /// Opens the editor menu at `at`, its cut and copy enabled only over
-    /// a selection.
-    fn open_editor_menu(&mut self, at: Position) {
+    /// Opens `menu`, recording how it was placed.
+    fn open_menu(&mut self, menu: ContextMenu<Command>, origin: MenuOrigin) {
+        self.menu = Some(menu);
+        self.menu_origin = origin;
+    }
+
+    /// Opens the editor menu placed by `anchor` from `origin`, leading
+    /// with `diagnostic`'s items when there is one, its cut and copy
+    /// enabled only over a selection.
+    fn open_editor_menu(
+        &mut self,
+        diagnostic: Option<Diagnostic>,
+        anchor: MenuAnchor,
+        origin: MenuOrigin,
+    ) {
         if let Some(tab) = self.editor.active_tab() {
             let selection = if self
                 .buffer
@@ -598,7 +665,8 @@ impl TermApp {
             } else {
                 Enablement::Disabled
             };
-            self.menu = Some(ContextMenu::new(editor_menu::entries(selection), at));
+            let entries = editor_menu::entries(selection, diagnostic.as_ref());
+            self.open_menu(ContextMenu::anchored(entries, anchor), origin);
             // The chosen command acts on the editor's selection.
             self.set_focus(Focus::Editor);
         }
@@ -792,22 +860,47 @@ impl TermApp {
                 self.status.set_hint(None);
             }
         }
+        let proofread = self.editor.proofread();
+        let diagnostics = tab.map_or_else(Vec::new, |tab| proofread.diagnostics(tab.id, &tab.text));
         let caret = self.buffer.render(
             tab,
             areas.gutter,
             areas.editor,
-            self.editor.match_highlights_ref(),
+            Overlays {
+                matches: self.editor.match_highlights_ref(),
+                diagnostics: &diagnostics,
+            },
             buf,
             &mut self.hits,
         );
+        // A keyboard menu follows the caret as this frame drew it: the
+        // layout may have moved since the menu was opened.
+        if self.menu_origin == MenuOrigin::Caret
+            && let Some(menu) = self.menu.as_mut()
+        {
+            menu.set_anchor(caret.map_or(
+                MenuAnchor::At(Position::new(areas.editor.x, areas.editor.y)),
+                MenuAnchor::Below,
+            ));
+        }
 
         let (left, right) = tab.map_or_else(
             || (String::new(), String::new()),
             |tab| {
-                let left = tab.path.as_deref().map_or_else(
-                    || tab.display_name(),
-                    |path| self.editor.relative_to_root(path),
-                );
+                // The caret as the view holds it after rendering; the
+                // message only describes it while the editor has focus.
+                let message = self
+                    .buffer
+                    .caret_span(tab)
+                    .filter(|_| self.focus == Focus::Editor)
+                    .and_then(|span| diagnostic_in(&diagnostics, span))
+                    .and_then(|diagnostic| status_text(&diagnostic.message));
+                let left = message.unwrap_or_else(|| {
+                    tab.path.as_deref().map_or_else(
+                        || tab.display_name(),
+                        |path| self.editor.relative_to_root(path),
+                    )
+                });
                 let mut language = language_from_path(tab.path.as_deref());
                 if language.is_empty() {
                     "plain text".clone_into(&mut language);
@@ -832,6 +925,13 @@ impl TermApp {
             frame.set_cursor_position(position);
         }
     }
+}
+
+/// A diagnostic `message` as one status line: its words joined by single
+/// spaces, or `None` when it has none.
+fn status_text(message: &str) -> Option<String> {
+    let line = message.split_whitespace().collect::<Vec<_>>().join(" ");
+    (!line.is_empty()).then_some(line)
 }
 
 /// `"1 line"` for a single line, `"{n} lines"` otherwise.
@@ -2067,7 +2167,7 @@ mod tests {
         assert_eq!(
             menu,
             &ContextMenu::new(
-                editor_menu::entries(Enablement::Enabled),
+                editor_menu::entries(Enablement::Enabled, None),
                 Position::new(20, 1),
             )
         );
@@ -2085,7 +2185,7 @@ mod tests {
         assert_eq!(
             app.menu.as_ref().unwrap(),
             &ContextMenu::new(
-                editor_menu::entries(Enablement::Disabled),
+                editor_menu::entries(Enablement::Disabled, None),
                 Position::new(10, 1)
             )
         );
@@ -3774,5 +3874,613 @@ mod tests {
             assert_eq!(app.status.hint(), None);
         }
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Squiggles, the status line and the editor menu over diagnostics.
+    mod proofreading {
+        use frext_core::proofread::DiagnosticKind;
+        use ratatui::style::{Color, Modifier};
+
+        use super::*;
+        use crate::menu::MenuEntry;
+
+        /// Runs one proofreading pass over the active tab and waits for it:
+        /// starts the editor's worker with a notify that signals a channel,
+        /// queues a check, waits for the notify, then polls. Must be the
+        /// first `begin_frame` on `app` (only the first notify is kept).
+        ///
+        /// The worker sends each result before calling notify, so once the
+        /// notify arrives the result for this one request is ready to poll.
+        fn proofread(app: &mut TermApp) {
+            let (tx, rx) = std::sync::mpsc::channel();
+            app.begin_frame(move || {
+                let _ = tx.send(());
+            });
+            app.end_frame();
+            rx.recv_timeout(Duration::from_secs(60)).unwrap();
+            app.begin_frame(|| {});
+        }
+
+        const MISSPELT: &str = "This is a tset of the editor.";
+
+        /// Wide enough that neither a temp-dir path nor a diagnostic message
+        /// is truncated on the status row.
+        const STATUS_WIDTH: u16 = 300;
+
+        /// The spelling diagnostic over `tset` in the active tab.
+        fn tset_diagnostic(app: &TermApp) -> Diagnostic {
+            let tab = app.editor().active_tab().unwrap();
+            app.editor()
+                .proofread()
+                .diagnostics(tab.id, &tab.text)
+                .into_iter()
+                .find(|d| d.kind == DiagnosticKind::Spelling && d.flagged == "tset")
+                .cloned()
+                .unwrap()
+        }
+
+        /// The squiggle colour of `cell`, `None` for `Color::Reset`;
+        /// asserts that a coloured cell is also underlined.
+        fn underline_of(cell: &ratatui::buffer::Cell) -> Option<Color> {
+            let colour = Some(cell.underline_color).filter(|&c| c != Color::Reset);
+            if colour.is_some() {
+                assert!(
+                    cell.modifier.contains(Modifier::UNDERLINED),
+                    "underline colour without an underline: {cell:?}"
+                );
+            }
+            colour
+        }
+
+        /// The status row text the path of the active tab gives.
+        fn path_status(app: &TermApp) -> String {
+            let tab = app.editor().active_tab().unwrap();
+            format!(
+                " {} ",
+                app.editor().relative_to_root(tab.path.as_deref().unwrap())
+            )
+        }
+
+        #[test]
+        fn proofreading_results_squiggle_on_the_next_draw() {
+            let dir = temp_dir("squiggles");
+            let mut app = app_with_text(&dir, MISSPELT, KeyboardMode::Enhanced);
+            let buf = draw(&mut app);
+            let unchecked: Vec<_> = (1..23)
+                .flat_map(|y| (0..80).map(move |x| (x, y)))
+                .filter(|&(x, y)| underline_of(&buf[(x, y)]).is_some())
+                .collect();
+            assert!(
+                unchecked.is_empty(),
+                "underlined before checking: {unchecked:?}"
+            );
+
+            // The worker's notify fires, `begin_frame` polls the result,
+            // and the next draw shows it. The waker's hop to
+            // `AppEvent::Wake` is covered by the events tests.
+            proofread(&mut app);
+            let diagnostic = tset_diagnostic(&app);
+            let buf = draw(&mut app);
+            for char_idx in diagnostic.chars.clone() {
+                let x = column_of_char(char_idx);
+                assert_eq!(
+                    underline_of(&buf[(x, 1)]),
+                    Some(theme::squiggle(DiagnosticKind::Spelling)),
+                    "char {char_idx} of {diagnostic:?}"
+                );
+            }
+            fs::remove_dir_all(&dir).unwrap();
+        }
+
+        #[test]
+        fn the_status_line_shows_the_diagnostic_under_the_caret() {
+            let dir = temp_dir("status-diagnostic");
+            let mut app = app_with_text(&dir, MISSPELT, KeyboardMode::Enhanced);
+            proofread(&mut app);
+            let diagnostic = tset_diagnostic(&app);
+            let tab_id = app.editor().active_tab().unwrap().id;
+            assert_eq!(app.buffer.caret(tab_id), Some(0));
+            assert!(
+                app.editor()
+                    .proofread()
+                    .diagnostic_at(tab_id, MISSPELT, 0)
+                    .is_none()
+            );
+
+            press(
+                &mut app,
+                KeyCode::Right,
+                KeyModifiers::NONE,
+                diagnostic.chars.start + 1,
+            );
+            let buf = draw_sized(&mut app, STATUS_WIDTH, 24);
+            assert!(
+                row_text(&buf, 23)
+                    .starts_with(&format!(" {} ", status_text(&diagnostic.message).unwrap())),
+                "{:?}",
+                row_text(&buf, 23)
+            );
+
+            app.handle(key(KeyCode::Home, KeyModifiers::NONE), Instant::now());
+            assert_eq!(app.buffer.caret(tab_id), Some(0));
+            let buf = draw_sized(&mut app, STATUS_WIDTH, 24);
+            let status = row_text(&buf, 23);
+            assert!(status.starts_with(&path_status(&app)), "{status:?}");
+            fs::remove_dir_all(&dir).unwrap();
+        }
+
+        #[test]
+        fn a_status_message_outranks_the_diagnostic_under_the_caret() {
+            let dir = temp_dir("status-message-over-diagnostic");
+            let mut app = app_with_text(&dir, MISSPELT, KeyboardMode::Enhanced);
+            proofread(&mut app);
+            let diagnostic = tset_diagnostic(&app);
+            press(
+                &mut app,
+                KeyCode::Right,
+                KeyModifiers::NONE,
+                diagnostic.chars.start + 1,
+            );
+            app.status
+                .set_message("Saved", MessageKind::Info, Instant::now());
+            let buf = draw_sized(&mut app, STATUS_WIDTH, 24);
+            let status = row_text(&buf, 23);
+            assert!(status.starts_with(" Saved "), "{status:?}");
+            assert!(!status.contains(&diagnostic.message), "{status:?}");
+            fs::remove_dir_all(&dir).unwrap();
+        }
+
+        /// The screen column of char `char_idx` of `MISSPELT`, a one-line
+        /// ASCII file drawn after its gutter.
+        fn column_of_char(char_idx: usize) -> u16 {
+            layout::gutter_width(line_count(MISSPELT)) + u16::try_from(char_idx).unwrap()
+        }
+
+        /// `MISSPELT`, proofread and drawn.
+        fn proofread_app(dir: &Path) -> TermApp {
+            let mut app = app_with_text(dir, MISSPELT, KeyboardMode::Enhanced);
+            proofread(&mut app);
+            draw(&mut app);
+            app
+        }
+
+        /// The entries of the editor menu with no selection over `diagnostic`.
+        fn menu_entries(diagnostic: Option<&Diagnostic>) -> Vec<MenuEntry<Command>> {
+            editor_menu::entries(Enablement::Disabled, diagnostic)
+        }
+
+        /// Chooses the item labelled `label` from the open menu, whose entries
+        /// are `entries`, with Down until it is highlighted, then Enter.
+        fn choose(app: &mut TermApp, entries: &[MenuEntry<Command>], label: &str) {
+            let index = entries
+                .iter()
+                .position(|entry| matches!(entry, MenuEntry::Item { label: l, .. } if l == label))
+                .unwrap();
+            for _ in 0..entries.len() {
+                if app.menu.as_ref().unwrap().highlighted() == Some(index) {
+                    break;
+                }
+                app.handle(key(KeyCode::Down, KeyModifiers::NONE), Instant::now());
+            }
+            assert_eq!(app.menu.as_ref().unwrap().highlighted(), Some(index));
+            app.handle(key(KeyCode::Enter, KeyModifiers::NONE), Instant::now());
+            assert!(app.menu.is_none());
+        }
+
+        /// Opens the editor menu over `tset` with a right-click on its second
+        /// char, returning the diagnostic and the menu's entries.
+        fn right_click_tset(app: &mut TermApp) -> (Diagnostic, Vec<MenuEntry<Command>>) {
+            let diagnostic = tset_diagnostic(app);
+            right_click(app, column_of_char(diagnostic.chars.start + 1), 1);
+            let entries = menu_entries(Some(&diagnostic));
+            (diagnostic, entries)
+        }
+
+        /// Asserts that no cell of `diagnostic` is underlined on a fresh draw.
+        fn assert_not_underlined(app: &mut TermApp, diagnostic: &Diagnostic) {
+            let buf = draw(app);
+            for char_idx in diagnostic.chars.clone() {
+                let x = column_of_char(char_idx);
+                assert_eq!(underline_of(&buf[(x, 1)]), None, "char {char_idx}");
+            }
+        }
+
+        #[test]
+        fn a_right_click_on_a_diagnostic_opens_its_menu_without_moving_the_caret() {
+            let dir = temp_dir("menu-diagnostic");
+            let mut app = proofread_app(&dir);
+            let id = active_id(&app);
+            let diagnostic = tset_diagnostic(&app);
+            let x = column_of_char(diagnostic.chars.start + 1);
+            right_click(&mut app, x, 1);
+            assert_eq!(
+                app.menu,
+                Some(ContextMenu::new(
+                    menu_entries(Some(&diagnostic)),
+                    Position::new(x, 1)
+                ))
+            );
+            assert_eq!(app.buffer.caret(id), Some(0));
+            assert_eq!(app.buffer.selection(id), Some(0..0));
+            fs::remove_dir_all(&dir).unwrap();
+        }
+
+        #[test]
+        fn a_right_click_on_a_clean_word_opens_the_plain_menu() {
+            let dir = temp_dir("menu-clean-word");
+            let mut app = proofread_app(&dir);
+            let id = active_id(&app);
+            // The "h" of "This".
+            assert!(
+                app.editor()
+                    .proofread()
+                    .diagnostic_at(id, MISSPELT, 1)
+                    .is_none()
+            );
+            let x = column_of_char(1);
+            right_click(&mut app, x, 1);
+            assert_eq!(
+                app.menu,
+                Some(ContextMenu::new(menu_entries(None), Position::new(x, 1)))
+            );
+            assert_eq!(app.buffer.caret(id), Some(0));
+            fs::remove_dir_all(&dir).unwrap();
+        }
+
+        #[test]
+        fn choosing_a_suggestion_replaces_the_word_and_ctrl_z_restores() {
+            let dir = temp_dir("menu-suggestion");
+            let mut app = proofread_app(&dir);
+            let (diagnostic, entries) = right_click_tset(&mut app);
+            let suggestion = diagnostic.suggestions.first().unwrap().clone();
+            assert!(!suggestion.is_empty(), "{diagnostic:?}");
+            choose(&mut app, &entries, &suggestion);
+            assert_eq!(text_of(&app), MISSPELT.replacen("tset", &suggestion, 1));
+
+            app.handle(ctrl('z'), Instant::now());
+            assert_eq!(text_of(&app), MISSPELT);
+            fs::remove_dir_all(&dir).unwrap();
+        }
+
+        #[test]
+        fn adding_to_the_dictionary_removes_the_squiggle() {
+            let dir = temp_dir("menu-add-word");
+            let mut app = proofread_app(&dir);
+            let (diagnostic, entries) = right_click_tset(&mut app);
+            choose(&mut app, &entries, "Add \u{201c}tset\u{201d} to dictionary");
+            assert!(app.editor().proofread().user_words().any(|w| w == "tset"));
+            // The store, and so the dictionary, lives under the temp dir.
+            let dictionary = fs::read_to_string(dir.join("state").join("dictionary.txt")).unwrap();
+            assert!(
+                dictionary.lines().any(|line| line == "tset"),
+                "{dictionary:?}"
+            );
+            assert_not_underlined(&mut app, &diagnostic);
+            assert_eq!(text_of(&app), MISSPELT);
+            fs::remove_dir_all(&dir).unwrap();
+        }
+
+        #[test]
+        fn ignoring_removes_the_squiggle() {
+            let dir = temp_dir("menu-ignore");
+            let mut app = proofread_app(&dir);
+            let (diagnostic, entries) = right_click_tset(&mut app);
+            choose(&mut app, &entries, "Ignore");
+            assert_not_underlined(&mut app, &diagnostic);
+            assert_eq!(text_of(&app), MISSPELT);
+            fs::remove_dir_all(&dir).unwrap();
+        }
+
+        /// The keys that open the editor menu at the caret.
+        const EDITOR_MENU_KEYS: [(KeyCode, KeyModifiers); 3] = [
+            (KeyCode::F(10), KeyModifiers::SHIFT),
+            (KeyCode::F(22), KeyModifiers::NONE),
+            (KeyCode::Menu, KeyModifiers::NONE),
+        ];
+
+        #[test]
+        fn menu_keys_open_the_diagnostic_menu_below_the_caret() {
+            let dir = temp_dir("menu-key-diagnostic");
+            let mut app = proofread_app(&dir);
+            let diagnostic = tset_diagnostic(&app);
+            let caret = diagnostic.chars.start + 1;
+            press(&mut app, KeyCode::Right, KeyModifiers::NONE, caret);
+            let id = active_id(&app);
+            let cell = app
+                .buffer
+                .caret_cell(app.editor().active_tab().unwrap())
+                .unwrap();
+            assert_eq!(cell, Position::new(column_of_char(caret), 1));
+            for (code, modifiers) in EDITOR_MENU_KEYS {
+                app.handle(key(code, modifiers), Instant::now());
+                assert_eq!(
+                    app.menu,
+                    Some(ContextMenu::below(menu_entries(Some(&diagnostic)), cell)),
+                    "{code:?} {modifiers:?}"
+                );
+                assert_eq!(app.buffer.caret(id), Some(caret));
+                app.handle(key(KeyCode::Esc, KeyModifiers::NONE), Instant::now());
+                assert!(app.menu.is_none());
+            }
+            fs::remove_dir_all(&dir).unwrap();
+        }
+
+        #[test]
+        fn menu_keys_on_a_clean_word_open_the_plain_menu_below_the_caret() {
+            let dir = temp_dir("menu-key-clean");
+            let mut app = proofread_app(&dir);
+            let id = active_id(&app);
+            assert!(
+                app.editor()
+                    .proofread()
+                    .diagnostic_at(id, MISSPELT, 0)
+                    .is_none()
+            );
+            let cell = app
+                .buffer
+                .caret_cell(app.editor().active_tab().unwrap())
+                .unwrap();
+            assert_eq!(cell, Position::new(column_of_char(0), 1));
+            for (code, modifiers) in EDITOR_MENU_KEYS {
+                app.handle(key(code, modifiers), Instant::now());
+                assert_eq!(
+                    app.menu,
+                    Some(ContextMenu::below(menu_entries(None), cell)),
+                    "{code:?} {modifiers:?}"
+                );
+                app.handle(key(KeyCode::Esc, KeyModifiers::NONE), Instant::now());
+            }
+            fs::remove_dir_all(&dir).unwrap();
+        }
+
+        #[test]
+        fn the_menu_key_opens_at_the_editor_top_left_when_the_caret_is_off_screen() {
+            let dir = temp_dir("menu-key-off-screen");
+            let text: String = (1..=100).map(|n| format!("line {n}\n")).collect();
+            let mut app = app_with_text(&dir, &text, KeyboardMode::Enhanced);
+            let id = active_id(&app);
+            for _ in 0..10 {
+                app.handle(mouse(MouseEventKind::ScrollDown, 10, 5), Instant::now());
+            }
+            draw(&mut app);
+            assert_eq!(app.buffer.caret(id), Some(0));
+            assert_eq!(
+                app.buffer.caret_cell(app.editor().active_tab().unwrap()),
+                None
+            );
+            let rect = app.buffer.rect();
+            assert_eq!(rect.y, 1);
+            app.handle(key(KeyCode::F(10), KeyModifiers::SHIFT), Instant::now());
+            assert_eq!(
+                app.menu,
+                Some(ContextMenu::new(
+                    menu_entries(None),
+                    Position::new(rect.x, rect.y)
+                ))
+            );
+            fs::remove_dir_all(&dir).unwrap();
+        }
+
+        /// Closing the find bar moves the editor up; the menu key pressed
+        /// in the same batch places the menu from the old layout, and the
+        /// next draw re-anchors it under the caret as drawn then.
+        #[test]
+        fn the_menu_key_menu_follows_the_caret_drawn_after_the_find_bar_closes() {
+            let dir = temp_dir("menu-key-follows-caret");
+            let mut app = app_with_text(&dir, "hello\nworld", KeyboardMode::Enhanced);
+            app.handle(ctrl('f'), Instant::now());
+            draw(&mut app);
+            let open_rect = app.buffer.rect();
+            assert!(open_rect.y > 1, "{open_rect:?}");
+            // No draw from here to the menu key.
+            app.handle(key(KeyCode::Esc, KeyModifiers::NONE), Instant::now());
+            assert!(!app.editor().search().is_open());
+            assert_eq!(app.focus, Focus::Editor);
+            app.handle(key(KeyCode::F(10), KeyModifiers::SHIFT), Instant::now());
+            // The initial placement is from the last draw, under the bar.
+            let stale = Position::new(open_rect.x, open_rect.y);
+            assert_eq!(
+                app.menu,
+                Some(ContextMenu::below(menu_entries(None), stale))
+            );
+
+            let buf = draw(&mut app);
+            let cell = app
+                .buffer
+                .caret_cell(app.editor().active_tab().unwrap())
+                .unwrap();
+            assert_eq!(cell.y, 1, "the caret is drawn on the first text row");
+            let area = buf.area;
+            let rect = app.menu.as_ref().unwrap().rect(area);
+            assert_eq!((rect.x, rect.y), (cell.x, cell.y + 1));
+            assert_eq!(
+                row_text(&buf, rect.y).chars().nth(usize::from(rect.x)),
+                Some('┌')
+            );
+            fs::remove_dir_all(&dir).unwrap();
+        }
+
+        #[test]
+        fn a_right_click_menu_stays_where_it_opened_across_draws() {
+            let dir = temp_dir("right-click-menu-stays");
+            let mut app = app_with_text(&dir, "hello\nworld", KeyboardMode::Enhanced);
+            app.handle(ctrl('f'), Instant::now());
+            draw(&mut app);
+            // Past the text of the editor's second row, away from the caret.
+            let y = app.buffer.rect().y + 1;
+            right_click(&mut app, 20, y);
+            let expected = ContextMenu::new(menu_entries(None), Position::new(20, y));
+            assert_eq!(app.menu.as_ref(), Some(&expected));
+            for _ in 0..2 {
+                let buf = draw(&mut app);
+                assert_eq!(app.menu.as_ref(), Some(&expected));
+                assert_eq!(row_text(&buf, y).chars().nth(20), Some('┌'));
+            }
+            fs::remove_dir_all(&dir).unwrap();
+        }
+
+        #[test]
+        fn menu_keys_in_the_sidebar_still_open_the_tree_menu() {
+            let (dir, ws, mut app) = tree_app("tree-menu-key");
+            let cargo = ws.join("Cargo.toml");
+            app.handle(ctrl('e'), Instant::now());
+            press(&mut app, KeyCode::Down, KeyModifiers::NONE, 3);
+            let expected =
+                ContextMenu::new(tree_menu::file_entries(&cargo), Position::new(5, tree_y(2)));
+            for (code, modifiers) in EDITOR_MENU_KEYS {
+                app.handle(key(code, modifiers), Instant::now());
+                assert_eq!(app.menu.as_ref(), Some(&expected), "{code:?} {modifiers:?}");
+                assert_eq!(app.focus, Focus::Sidebar);
+                app.handle(key(KeyCode::Esc, KeyModifiers::NONE), Instant::now());
+                assert!(app.menu.is_none());
+                draw(&mut app);
+            }
+            fs::remove_dir_all(&dir).unwrap();
+        }
+
+        /// Asserts that a right-click at (`x`, `y`) opens the plain editor
+        /// menu there, then closes it.
+        fn assert_plain_menu_at(app: &mut TermApp, x: u16, y: u16) {
+            right_click(app, x, y);
+            assert_eq!(
+                app.menu,
+                Some(ContextMenu::new(menu_entries(None), Position::new(x, y))),
+                "({x}, {y})"
+            );
+            app.handle(key(KeyCode::Esc, KeyModifiers::NONE), Instant::now());
+            assert!(app.menu.is_none());
+            // Clicks hit-test against the last draw.
+            draw(app);
+        }
+
+        #[test]
+        fn right_clicks_after_a_diagnostic_or_past_the_text_open_the_plain_menu() {
+            let dir = temp_dir("menu-after-diagnostic");
+            let mut app = proofread_app(&dir);
+            let diagnostic = tset_diagnostic(&app);
+            assert_eq!(MISSPELT.chars().nth(diagnostic.chars.end), Some(' '));
+            // The space right after `tset`.
+            assert_plain_menu_at(&mut app, column_of_char(diagnostic.chars.end), 1);
+            // Past the end of the line's content.
+            let past = column_of_char(MISSPELT.chars().count());
+            assert_plain_menu_at(&mut app, past, 1);
+            assert_plain_menu_at(&mut app, past + 20, 1);
+            // Below the last row.
+            assert_plain_menu_at(&mut app, column_of_char(diagnostic.chars.start), 5);
+            fs::remove_dir_all(&dir).unwrap();
+        }
+
+        #[test]
+        fn a_caret_just_after_a_diagnostic_shows_it_and_opens_its_menu() {
+            let dir = temp_dir("caret-after-diagnostic");
+            let mut app = proofread_app(&dir);
+            let diagnostic = tset_diagnostic(&app);
+            let caret = diagnostic.chars.end;
+            press(&mut app, KeyCode::Right, KeyModifiers::NONE, caret);
+            let buf = draw_sized(&mut app, STATUS_WIDTH, 24);
+            let status = row_text(&buf, 23);
+            let message = status_text(&diagnostic.message).unwrap();
+            assert!(status.starts_with(&format!(" {message} ")), "{status:?}");
+
+            let cell = app
+                .buffer
+                .caret_cell(app.editor().active_tab().unwrap())
+                .unwrap();
+            assert_eq!(cell, Position::new(column_of_char(caret), 1));
+            app.handle(key(KeyCode::F(10), KeyModifiers::SHIFT), Instant::now());
+            assert_eq!(
+                app.menu,
+                Some(ContextMenu::below(menu_entries(Some(&diagnostic)), cell))
+            );
+            fs::remove_dir_all(&dir).unwrap();
+        }
+
+        #[test]
+        fn status_text_puts_a_message_on_one_line() {
+            assert_eq!(status_text("a\nb  c").as_deref(), Some("a b c"));
+            assert_eq!(status_text("\tword\r\n").as_deref(), Some("word"));
+        }
+
+        #[test]
+        fn status_text_of_a_blank_message_is_none_so_the_path_shows() {
+            assert_eq!(status_text("  \n"), None);
+            assert_eq!(status_text(""), None);
+        }
+
+        #[test]
+        fn the_status_line_shows_the_path_while_the_sidebar_has_focus() {
+            let dir = temp_dir("status-sidebar-focus");
+            let ws = dir.join("ws");
+            fs::create_dir_all(&ws).unwrap();
+            let file = ws.join("text.txt");
+            fs::write(&file, MISSPELT).unwrap();
+            let editor = open_editor(&dir, &[file], Some(&ws));
+            let mut app = TermApp::new(editor, KeyboardMode::Enhanced, ws.clone(), None);
+            draw(&mut app);
+            proofread(&mut app);
+            let diagnostic = tset_diagnostic(&app);
+            press(
+                &mut app,
+                KeyCode::Right,
+                KeyModifiers::NONE,
+                diagnostic.chars.start + 1,
+            );
+            let message = status_text(&diagnostic.message).unwrap();
+            let buf = draw_sized(&mut app, STATUS_WIDTH, 24);
+            let status = row_text(&buf, 23);
+            assert!(status.starts_with(&format!(" {message} ")), "{status:?}");
+
+            app.handle(ctrl('e'), Instant::now());
+            assert_eq!(app.focus, Focus::Sidebar);
+            let buf = draw_sized(&mut app, STATUS_WIDTH, 24);
+            let status = row_text(&buf, 23);
+            assert!(status.starts_with(&path_status(&app)), "{status:?}");
+            assert!(!status.contains(&message), "{status:?}");
+            fs::remove_dir_all(&dir).unwrap();
+        }
+
+        /// Replace all is the core edit that returns no `SetSelection`, so
+        /// only `record_outside_edit` re-lays the view out: the menu key
+        /// still opens below the caret with no draw in between (07.7).
+        #[test]
+        fn the_menu_key_after_replace_all_opens_below_the_caret_without_a_draw() {
+            let dir = temp_dir("menu-key-after-replace-all");
+            let mut app = app_with_text(&dir, "a\na", KeyboardMode::Enhanced);
+            let id = active_id(&app);
+            app.handle(ctrl('h'), Instant::now());
+            type_text(&mut app, "a");
+            press(&mut app, KeyCode::Tab, KeyModifiers::NONE, 1);
+            type_text(&mut app, "bb");
+            let x = drawn_column(&mut app, 2, "[Replace all]");
+            // No draw from here to the menu key.
+            left_click(&mut app, x, 2);
+            assert_eq!(text_of(&app), "bb\nbb");
+            // The caret goes to the end of the diffed change.
+            assert_eq!(app.buffer.caret(id), Some(5));
+            app.handle(ctrl('e'), Instant::now());
+            assert_eq!(app.focus, Focus::Editor);
+
+            // Under the tab bar and the find and replace rows, after the
+            // gutter: row 1, column 2 of the text.
+            let rect = app.buffer.rect();
+            assert_eq!(rect.y, 3);
+            let cell = app.buffer.caret_cell(app.editor().active_tab().unwrap());
+            let expected = Position::new(rect.x + 2, rect.y + 1);
+            assert_eq!(cell, Some(expected));
+            app.handle(key(KeyCode::F(10), KeyModifiers::SHIFT), Instant::now());
+            assert_eq!(
+                app.menu,
+                Some(ContextMenu::below(menu_entries(None), expected))
+            );
+
+            // A real draw puts the caret on the same cell.
+            app.handle(key(KeyCode::Esc, KeyModifiers::NONE), Instant::now());
+            draw(&mut app);
+            assert_eq!(
+                app.buffer.caret_cell(app.editor().active_tab().unwrap()),
+                Some(expected)
+            );
+            fs::remove_dir_all(&dir).unwrap();
+        }
     }
 }

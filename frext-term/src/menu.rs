@@ -1,9 +1,11 @@
 //! A right-click context menu.
 //!
-//! A [`ContextMenu`] is a bordered list of [`MenuEntry`]s opened at a
-//! screen cell. While it is open it is modal: keys and clicks go to it
-//! first, and each returns a [`MenuReply`] telling the app whether an
-//! item was chosen or the menu was dismissed.
+//! A [`ContextMenu`] is a bordered list of [`MenuEntry`]s placed by a
+//! [`MenuAnchor`]: at a screen cell (a right-click) or on the row below
+//! one (opened from the keyboard at the caret). While it is open it is
+//! modal: keys and clicks go to it first, and each returns a
+//! [`MenuReply`] telling the app whether an item was chosen or the menu
+//! was dismissed.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind};
 use ratatui::buffer::Buffer;
@@ -37,6 +39,9 @@ pub enum MenuEntry<T> {
     },
     /// A horizontal rule between groups of items.
     Separator,
+    /// One row of text that cannot be chosen: drawn greyed out, never
+    /// highlighted, and skipped by keys and hover.
+    Note(String),
 }
 
 impl<T> MenuEntry<T> {
@@ -63,23 +68,62 @@ pub enum MenuReply<T> {
     Handled,
 }
 
+/// Where a context menu opens relative to a screen cell.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MenuAnchor {
+    /// Opens at the cell, moved left or upwards to stay on screen.
+    At(Position),
+    /// Never covers the cell's row when the area has room on either side
+    /// of it: opens on the row under the cell if the menu fits below, else
+    /// ends on the row above it if it fits above, else opens on the side
+    /// with more room (below on a tie), cut to that room, and scrolls.
+    /// A cut keeps at least three rows (both borders and one item), so
+    /// only an area without three rows on either side of the cell
+    /// overlaps it.
+    Below(Position),
+}
+
 /// A context menu anchored at a screen cell.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContextMenu<T> {
     entries: Vec<MenuEntry<T>>,
-    anchor: Position,
+    anchor: MenuAnchor,
     highlighted: Option<usize>,
 }
 
 impl<T: Clone> ContextMenu<T> {
-    /// A menu of `entries` opened at `anchor`, with nothing highlighted.
+    /// A menu of `entries` placed by `anchor`, with nothing highlighted.
     #[must_use]
-    pub const fn new(entries: Vec<MenuEntry<T>>, anchor: Position) -> Self {
+    pub const fn anchored(entries: Vec<MenuEntry<T>>, anchor: MenuAnchor) -> Self {
         Self {
             entries,
             anchor,
             highlighted: None,
         }
+    }
+
+    /// A menu of `entries` opened at `anchor` ([`MenuAnchor::At`]), with
+    /// nothing highlighted.
+    #[must_use]
+    pub const fn new(entries: Vec<MenuEntry<T>>, anchor: Position) -> Self {
+        Self::anchored(entries, MenuAnchor::At(anchor))
+    }
+
+    /// A menu of `entries` placed around `cell` by [`MenuAnchor::Below`]:
+    /// below the cell's row, else above it, else on the side with more
+    /// room and cut to it when that room is at least three rows, with
+    /// nothing highlighted. Used when the menu is opened from the keyboard
+    /// at the caret, so the menu does not cover the caret's row unless
+    /// the area has fewer than three rows on either side of it.
+    #[must_use]
+    pub const fn below(entries: Vec<MenuEntry<T>>, cell: Position) -> Self {
+        Self::anchored(entries, MenuAnchor::Below(cell))
+    }
+
+    /// Re-places the menu by `anchor`. The entries and the highlight are
+    /// kept, so a menu re-anchored while open keeps its keyboard state.
+    pub const fn set_anchor(&mut self, anchor: MenuAnchor) {
+        self.anchor = anchor;
     }
 
     /// The entry index of the highlighted item, if any.
@@ -172,8 +216,13 @@ impl<T: Clone> ContextMenu<T> {
         }
     }
 
-    /// Where the menu is drawn inside `area`: at the anchor, moved left
-    /// or opened upwards to stay on screen, then clamped into `area`.
+    /// Where the menu is drawn inside `area`: placed by its
+    /// [`MenuAnchor`], moved left or opened upwards to stay on screen,
+    /// then clamped into `area`. A [`MenuAnchor::Below`] menu that fits
+    /// on neither side of its cell's row is cut to the larger side when
+    /// that side has at least three rows (else it is clamped, and may
+    /// cover the row), so the rect can be shorter than the entries;
+    /// [`ContextMenu::render`] then scrolls.
     #[must_use]
     pub fn rect(&self, area: Rect) -> Rect {
         let longest = self
@@ -181,6 +230,7 @@ impl<T: Clone> ContextMenu<T> {
             .iter()
             .map(|entry| match entry {
                 MenuEntry::Item { label, .. } => label.width(),
+                MenuEntry::Note(text) => text.width(),
                 MenuEntry::Separator => 0,
             })
             .max()
@@ -190,13 +240,21 @@ impl<T: Clone> ContextMenu<T> {
             .unwrap_or(u16::MAX)
             .saturating_add(2);
 
-        let mut x = self.anchor.x;
-        let mut y = self.anchor.y;
+        let (mut x, mut y, height) = match self.anchor {
+            MenuAnchor::At(cell) => {
+                let mut y = cell.y;
+                if y.saturating_add(height) > area.bottom() {
+                    y = cell.y.saturating_add(1).saturating_sub(height);
+                }
+                (cell.x, y, height)
+            }
+            MenuAnchor::Below(cell) => {
+                let (y, height) = below_placement(cell.y, height, area);
+                (cell.x, y, height)
+            }
+        };
         if x.saturating_add(width) > area.right() {
             x = area.right().saturating_sub(width);
-        }
-        if y.saturating_add(height) > area.bottom() {
-            y = self.anchor.y.saturating_add(1).saturating_sub(height);
         }
 
         let width = width.min(area.width);
@@ -218,7 +276,8 @@ impl<T: Clone> ContextMenu<T> {
 
     /// Draws the menu over `area` and records its hit regions: the whole
     /// menu as [`Target::MenuPopup`], then each item row as
-    /// [`Target::MenuItem`] with its entry index.
+    /// [`Target::MenuItem`] with its entry index. Note rows get no region
+    /// of their own, so a click on one hits [`Target::MenuPopup`].
     ///
     /// When the menu is clamped shorter than its entries, only a window of
     /// them is drawn: from the first entry, or scrolled down just enough
@@ -257,6 +316,13 @@ impl<T: Clone> ContextMenu<T> {
                     }
                     hits.push(row, Target::MenuItem(index));
                 }
+                MenuEntry::Note(text) => {
+                    let style = theme::disabled();
+                    buf.set_style(Rect::new(inner.x, y, inner.width, 1), style);
+                    if inner.width > 1 {
+                        buf.set_stringn(inner.x + 1, y, text, usize::from(inner.width - 1), style);
+                    }
+                }
                 MenuEntry::Separator => {
                     if r.width >= 2 {
                         let rule = format!("├{}┤", "─".repeat(usize::from(r.width - 2)));
@@ -265,6 +331,45 @@ impl<T: Clone> ContextMenu<T> {
                 }
             }
         }
+    }
+}
+
+/// The fewest rows a [`MenuAnchor::Below`] menu is cut to: a border on
+/// each side plus one item row. A shorter cut would show no item at all,
+/// which is worse than covering the cell's row.
+const MIN_CUT_HEIGHT: u16 = 3;
+
+/// The top row and height of a [`MenuAnchor::Below`] menu `height` rows
+/// tall around the row `cell_y`, inside `area`.
+///
+/// A `cell_y` outside `area` is first clamped onto its nearest row, so a
+/// caret reported past the edge places the menu as if it were on the edge
+/// row. The menu opens under that row if it fits, else ends just above it
+/// if it fits there, else takes the side with more room (below on a tie)
+/// with its height cut to that room, provided that room is at least
+/// [`MIN_CUT_HEIGHT`] rows. When neither side has that many rows, the old
+/// "below, else above" position is returned uncut and the caller's clamp
+/// settles it, which may cover the cell's row.
+fn below_placement(cell_y: u16, height: u16, area: Rect) -> (u16, u16) {
+    let row = cell_y.min(area.bottom().saturating_sub(1)).max(area.y);
+    let below = area.bottom().saturating_sub(row.saturating_add(1));
+    let above = row.saturating_sub(area.y);
+    if height <= below {
+        (row.saturating_add(1), height)
+    } else if height <= above {
+        (row.saturating_sub(height), height)
+    } else if below.max(above) >= MIN_CUT_HEIGHT {
+        if below >= above {
+            (row.saturating_add(1), below)
+        } else {
+            (area.y, above)
+        }
+    } else {
+        let mut y = cell_y.saturating_add(1);
+        if y.saturating_add(height) > area.bottom() {
+            y = cell_y.saturating_sub(height);
+        }
+        (y, height)
     }
 }
 
@@ -590,5 +695,288 @@ mod tests {
         assert_eq!(hits.hit(15, 7), Some(Target::Editor));
         assert_eq!(hits.hit(5, 8), Some(Target::MenuPopup));
         assert_eq!(hits.hit(5, 9), Some(Target::Editor));
+    }
+
+    /// A long note, A, ---, B: the note is entry 0.
+    fn noted(anchor: Position) -> ContextMenu<u8> {
+        ContextMenu::new(
+            vec![
+                MenuEntry::Note("A long note text".to_owned()),
+                item("A", Enablement::Enabled, 0),
+                MenuEntry::Separator,
+                item("B", Enablement::Enabled, 1),
+            ],
+            anchor,
+        )
+    }
+
+    #[test]
+    fn a_note_widens_the_menu_and_is_drawn_greyed_out() {
+        let menu = noted(Position::new(1, 1));
+        // "A long note text" is 16 wide.
+        assert_eq!(menu.rect(Rect::new(0, 0, 40, 10)), Rect::new(1, 1, 20, 6));
+        let (buf, _) = render_into(&menu, Rect::new(0, 0, 40, 10));
+        assert_eq!(
+            row_text(&buf, 2),
+            " │ A long note text │                   "
+        );
+        for x in 2..20 {
+            assert_eq!(buf[(x, 2)].style().fg, theme::disabled().fg, "x {x}");
+        }
+        assert_eq!(buf[(3, 3)].style().fg, theme::popup().fg);
+    }
+
+    #[test]
+    fn a_note_is_skipped_by_keys_and_hover() {
+        let mut menu = noted(Position::new(0, 0));
+        let mut seen = Vec::new();
+        for _ in 0..3 {
+            menu.handle_key(press(KeyCode::Down));
+            seen.push(menu.highlighted());
+        }
+        assert_eq!(seen, vec![Some(1), Some(3), Some(1)]);
+        let mut seen = Vec::new();
+        for _ in 0..3 {
+            menu.handle_key(press(KeyCode::Up));
+            seen.push(menu.highlighted());
+        }
+        assert_eq!(seen, vec![Some(3), Some(1), Some(3)]);
+        menu.hover(Some(0));
+        assert_eq!(menu.highlighted(), Some(3));
+        menu.hover(None);
+        menu.hover(Some(0));
+        assert_eq!(menu.highlighted(), None);
+    }
+
+    #[test]
+    fn a_click_on_a_note_is_consumed() {
+        let mut menu = noted(Position::new(1, 1));
+        let (_, hits) = render_into(&menu, Rect::new(0, 0, 40, 10));
+        for x in 2..20 {
+            assert_eq!(hits.hit(x, 2), Some(Target::MenuPopup), "x {x}");
+        }
+        assert_eq!(hits.hit(3, 3), Some(Target::MenuItem(1)));
+        assert_eq!(menu.click(hits.hit(5, 2)), MenuReply::Handled);
+        assert_eq!(menu.highlighted(), None);
+    }
+
+    fn sample_below(cell: Position) -> ContextMenu<u8> {
+        let mut menu = sample(cell);
+        menu.anchor = MenuAnchor::Below(cell);
+        assert_eq!(
+            menu,
+            ContextMenu::below(menu.entries.clone(), cell),
+            "below stores a Below anchor"
+        );
+        menu
+    }
+
+    #[test]
+    fn below_opens_under_the_cell() {
+        let menu = sample_below(Position::new(5, 3));
+        assert_eq!(menu.rect(Rect::new(0, 0, 80, 24)), Rect::new(5, 4, 14, 8));
+    }
+
+    #[test]
+    fn below_near_the_bottom_opens_upwards_above_the_cell() {
+        let area = Rect::new(0, 0, 80, 24);
+        for y in [17, 20, 23] {
+            let rect = sample_below(Position::new(5, y)).rect(area);
+            assert_eq!(rect.bottom(), y, "cell y {y}");
+            assert_eq!(rect.height, 8);
+            assert_eq!(rect.x, 5);
+        }
+        // The last row that still fits below.
+        assert_eq!(
+            sample_below(Position::new(5, 15)).rect(area),
+            Rect::new(5, 16, 14, 8)
+        );
+    }
+
+    #[test]
+    fn below_near_the_right_edge_shifts_left() {
+        let area = Rect::new(0, 0, 80, 24);
+        let rect = sample_below(Position::new(75, 3)).rect(area);
+        assert_eq!(rect.right(), area.right());
+        assert_eq!(rect, Rect::new(66, 4, 14, 8));
+    }
+
+    #[test]
+    fn below_in_a_small_area_is_cut_and_clamped() {
+        // The 8-row menu fits on neither side of any row of this 4-row
+        // area (rows 1..5). On the edge rows the larger side has 3 rows,
+        // enough for a cut, so it is cut to that side instead of being
+        // clamped over the whole area (and the cell's row). On the middle
+        // rows neither side has 3 rows, so it is clamped over the whole
+        // area. A cell outside the area is treated as being on its
+        // nearest row.
+        let area = Rect::new(2, 1, 6, 4);
+        for (cell, want) in [
+            // Row 1 (clamped from 0): 0 above, 3 below: cut below.
+            (Position::new(0, 0), Rect::new(2, 2, 6, 3)),
+            // Row 2: 1 above, 2 below: clamped.
+            (Position::new(4, 2), area),
+            // Row 3: 2 above, 1 below: clamped.
+            (Position::new(4, 3), area),
+            // Row 4: 3 above, 0 below: cut above.
+            (Position::new(7, 4), Rect::new(2, 1, 6, 3)),
+            (Position::new(u16::MAX, u16::MAX), Rect::new(2, 1, 6, 3)),
+        ] {
+            assert_eq!(sample_below(cell).rect(area), want, "cell {cell:?}");
+        }
+        let area = Rect::new(0, 0, 80, 10);
+        let rect = sample_below(Position::new(5, 4)).rect(area);
+        assert!(
+            rect.y >= area.y && rect.bottom() <= area.bottom(),
+            "{rect:?}"
+        );
+        let empty: ContextMenu<u8> = ContextMenu::below(Vec::new(), Position::new(u16::MAX, 0));
+        assert_eq!(empty.rect(Rect::new(0, 0, 0, 0)), Rect::new(0, 0, 0, 0));
+    }
+
+    /// Fifteen enabled items "Item 0" to "Item 14": 17 rows, 11 columns.
+    fn seventeen(cell: Position) -> ContextMenu<u8> {
+        let entries = (0..15)
+            .map(|i| item(&format!("Item {i}"), Enablement::Enabled, i))
+            .collect();
+        ContextMenu::below(entries, cell)
+    }
+
+    #[test]
+    fn below_never_covers_the_cells_row() {
+        let area = Rect::new(0, 0, 80, 24);
+        for y in 0..24 {
+            let rect = seventeen(Position::new(3, y)).rect(area);
+            assert!(!(rect.y <= y && y < rect.bottom()), "y {y}: {rect:?}");
+            assert_eq!(rect.intersection(area), rect, "y {y}: {rect:?}");
+            let below = 23 - y;
+            let above = y;
+            if below >= 17 {
+                assert_eq!((rect.y, rect.height), (y + 1, 17), "y {y}");
+            } else if above >= 17 {
+                assert_eq!((rect.y, rect.height), (y - 17, 17), "y {y}");
+            } else if below >= above {
+                assert_eq!((rect.y, rect.height), (y + 1, below), "y {y}");
+            } else {
+                assert_eq!((rect.y, rect.height), (0, above), "y {y}");
+            }
+        }
+    }
+
+    #[test]
+    fn below_takes_the_side_with_more_room_and_cuts_to_it() {
+        let area = Rect::new(0, 0, 80, 24);
+        // 10 rows above, 13 below.
+        assert_eq!(
+            seventeen(Position::new(3, 10)).rect(area),
+            Rect::new(3, 11, 11, 13)
+        );
+        // 14 rows above, 9 below.
+        assert_eq!(
+            seventeen(Position::new(3, 14)).rect(area),
+            Rect::new(3, 0, 11, 14)
+        );
+    }
+
+    #[test]
+    fn below_on_a_tie_opens_below() {
+        // 12 rows on each side of row 12.
+        let area = Rect::new(0, 0, 80, 25);
+        assert_eq!(
+            seventeen(Position::new(3, 12)).rect(area),
+            Rect::new(3, 13, 11, 12)
+        );
+    }
+
+    #[test]
+    fn below_with_under_three_rows_on_each_side_is_clamped() {
+        // Row 2 of a 5-row area has 2 rows above and 2 below: a cut to
+        // either would show no item, so the 8-row menu is clamped over
+        // the whole area, covering the cell's row.
+        let area = Rect::new(0, 0, 80, 5);
+        assert_eq!(
+            sample_below(Position::new(5, 2)).rect(area),
+            Rect::new(5, 0, 14, 5)
+        );
+    }
+
+    #[test]
+    fn below_in_a_one_row_area_falls_back_to_the_clamp() {
+        let area = Rect::new(0, 5, 80, 1);
+        for y in [0, 5, 6, u16::MAX] {
+            assert_eq!(
+                sample_below(Position::new(5, y)).rect(area),
+                Rect::new(5, 5, 14, 1),
+                "y {y}"
+            );
+        }
+    }
+
+    #[test]
+    fn anchored_matches_new_and_below() {
+        let entries = sample(Position::new(0, 0)).entries;
+        let p = Position::new(4, 7);
+        assert_eq!(
+            ContextMenu::anchored(entries.clone(), MenuAnchor::At(p)),
+            ContextMenu::new(entries.clone(), p)
+        );
+        assert_eq!(
+            ContextMenu::anchored(entries.clone(), MenuAnchor::Below(p)),
+            ContextMenu::below(entries, p)
+        );
+    }
+
+    #[test]
+    fn set_anchor_moves_the_rect_and_keeps_the_highlight() {
+        let area = Rect::new(0, 0, 80, 24);
+        let mut menu = sample_below(Position::new(5, 3));
+        menu.handle_key(press(KeyCode::Down));
+        menu.handle_key(press(KeyCode::Down));
+        assert_eq!(menu.highlighted(), Some(3));
+
+        menu.set_anchor(MenuAnchor::Below(Position::new(10, 7)));
+        assert_eq!(menu.rect(area), Rect::new(10, 8, 14, 8));
+        assert_eq!(menu.highlighted(), Some(3));
+
+        menu.set_anchor(MenuAnchor::At(Position::new(2, 1)));
+        assert_eq!(menu.rect(area), Rect::new(2, 1, 14, 8));
+        assert_eq!(menu.highlighted(), Some(3));
+
+        let before = menu.clone();
+        menu.set_anchor(MenuAnchor::At(Position::new(2, 1)));
+        assert_eq!(menu, before);
+    }
+
+    #[test]
+    fn a_cut_below_menu_draws_inside_its_rect_and_scrolls() {
+        let area = Rect::new(0, 0, 20, 24);
+        let mut menu = seventeen(Position::new(0, 10));
+        menu.handle_key(press(KeyCode::Up));
+        assert_eq!(menu.highlighted(), Some(14));
+        let rect = menu.rect(area);
+        assert_eq!(rect, Rect::new(0, 11, 11, 13));
+        let (buf, hits) = render_into(&menu, area);
+
+        for y in 0..11 {
+            assert_eq!(row_text(&buf, y), " ".repeat(20), "row {y}");
+        }
+        for y in 11..24 {
+            let outside: String = row_text(&buf, y).chars().skip(11).collect();
+            assert_eq!(outside, " ".repeat(9), "row {y}");
+        }
+        // 11 inner rows: entries 4..15 on rows 12..23.
+        assert_eq!(row_text(&buf, 11), "┌─────────┐         ");
+        assert_eq!(row_text(&buf, 12), "│ Item 4  │         ");
+        assert_eq!(row_text(&buf, 22), "│ Item 14 │         ");
+        assert_eq!(row_text(&buf, 23), "└─────────┘         ");
+        for x in 1..10 {
+            assert_eq!(buf[(x, 22)].style().bg, theme::button_focused().bg);
+        }
+        assert_eq!(hits.hit(2, 22), Some(Target::MenuItem(14)));
+        assert_eq!(hits.hit(2, 12), Some(Target::MenuItem(4)));
+        assert_eq!(hits.hit(2, 10), None);
+        for y in 0..24 {
+            assert!(!row_text(&buf, y).contains("Item 3"), "row {y}");
+        }
     }
 }

@@ -1,9 +1,11 @@
 //! Per-session proofreading state the app drives each frame: which revision
 //! of each tab was last sent to the [`Worker`], the latest results per tab,
-//! the personal dictionary, and the session's ignored diagnostics.
+//! the personal dictionary, and the session's ignored diagnostics. Also
+//! [`diagnostic_in`], the lookup of the diagnostic over a char range.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::hash::{DefaultHasher, Hash, Hasher};
+use std::ops::Range;
 use std::path::Path;
 
 use super::worker::{CheckRequest, CheckResult, Worker};
@@ -149,8 +151,13 @@ impl Proofreading {
     /// The diagnostic under the cursor position `char_idx`, preferring a
     /// spelling one when several overlap (its fixes are the most specific).
     ///
-    /// The range end is inclusive: a click on the right half of a word's
-    /// last glyph resolves to the cursor position just *after* it.
+    /// This is [`diagnostic_in`] over [`Self::diagnostics`] with the
+    /// caret-equivalent range `char_idx - 1 .. char_idx + 1` (saturating).
+    /// Its intersection test is an end-inclusive caret test, so a click on
+    /// the right half of a word's last glyph resolves to the cursor position
+    /// just *after* it. At `char_idx == 0` the range is `0..1`, which meets
+    /// exactly the diagnostics starting at 0; diagnostics are never empty,
+    /// so that is the same as `start <= 0 <= end`.
     #[must_use]
     pub fn diagnostic_at<'a>(
         &'a self,
@@ -158,17 +165,9 @@ impl Proofreading {
         text: &'a str,
         char_idx: usize,
     ) -> Option<&'a Diagnostic> {
-        let mut hits = self
-            .diagnostics(tab_id, text)
-            .into_iter()
-            .filter(|d| d.chars.start <= char_idx && char_idx <= d.chars.end);
-        let first = hits.next()?;
-        if first.kind == DiagnosticKind::Spelling {
-            return Some(first);
-        }
-        Some(
-            hits.find(|d| d.kind == DiagnosticKind::Spelling)
-                .unwrap_or(first),
+        diagnostic_in(
+            &self.diagnostics(tab_id, text),
+            char_idx.saturating_sub(1)..char_idx.saturating_add(1),
         )
     }
 
@@ -215,6 +214,37 @@ impl Proofreading {
         log::error!("proofreading worker stopped; proofreading disabled");
         self.worker = WorkerSlot::Unavailable;
     }
+}
+
+/// The diagnostic among `diagnostics` over the chars `chars`.
+///
+/// Of those whose `chars` intersect `chars` (half-open on both sides, the
+/// renderer's rule), the first is returned, unless it is not a spelling
+/// diagnostic and a later one is, in which case the first spelling one wins
+/// (its fixes are the most specific).
+///
+/// A drawn cell passes its grapheme's char range. A caret passes the
+/// graphemes either side of it: from the start of the grapheme ending at the
+/// caret to the end of the grapheme starting there. Over single-char
+/// graphemes that is `c - 1 .. c + 1`, whose intersection is exactly an
+/// end-inclusive caret test (`start <= c <= end`).
+#[must_use]
+pub fn diagnostic_in<'a>(
+    diagnostics: &[&'a Diagnostic],
+    chars: Range<usize>,
+) -> Option<&'a Diagnostic> {
+    let mut hits = diagnostics
+        .iter()
+        .copied()
+        .filter(|d| d.chars.start < chars.end && chars.start < d.chars.end);
+    let first = hits.next()?;
+    if first.kind == DiagnosticKind::Spelling {
+        return Some(first);
+    }
+    Some(
+        hits.find(|d| d.kind == DiagnosticKind::Spelling)
+            .unwrap_or(first),
+    )
 }
 
 /// A revision id for a (text, path) pair. Only ever compared for equality
@@ -370,6 +400,84 @@ mod tests {
         // Just past the end of "wrrod" (cursor after its last glyph).
         assert_eq!(at(9), Some(DiagnosticKind::Spelling));
         assert_eq!(at(10), None);
+    }
+
+    #[test]
+    fn diagnostic_at_the_start_of_the_text() {
+        let text = "wrrod here";
+        let state = with_results(1, vec![diagnostic(DiagnosticKind::Spelling, text, "wrrod")]);
+        assert!(state.diagnostic_at(1, text, 0).is_some());
+        let later = "a wrrod";
+        let state = with_results(
+            1,
+            vec![diagnostic(DiagnosticKind::Spelling, later, "wrrod")],
+        );
+        assert!(state.diagnostic_at(1, later, 0).is_none());
+    }
+
+    #[test]
+    fn cell_ranges_match_half_open() {
+        let text = "a wrrod here";
+        let wrrod = diagnostic(DiagnosticKind::Spelling, text, "wrrod");
+        assert_eq!(wrrod.chars, 2..7);
+        let all = [&wrrod];
+        let at = |chars| diagnostic_in(&all, chars).map(|d| d.flagged.as_str());
+        assert_eq!(at(1..2), None, "before start");
+        assert_eq!(at(2..3), Some("wrrod"), "at start");
+        assert_eq!(at(4..5), Some("wrrod"), "inside");
+        assert_eq!(at(6..7), Some("wrrod"), "on last char");
+        assert_eq!(at(7..8), None, "just past the end");
+    }
+
+    #[test]
+    fn caret_ranges_include_the_end() {
+        let text = "a wrrod here";
+        let wrrod = diagnostic(DiagnosticKind::Spelling, text, "wrrod");
+        let all = [&wrrod];
+        let caret = |c: usize| diagnostic_in(&all, c - 1..c + 1).map(|d| d.flagged.as_str());
+        assert_eq!(caret(1), None, "before start");
+        assert_eq!(caret(2), Some("wrrod"), "at start");
+        assert_eq!(caret(7), Some("wrrod"), "just past the end");
+        assert_eq!(caret(8), None, "one further");
+    }
+
+    #[test]
+    fn a_range_ending_where_a_diagnostic_starts_does_not_match() {
+        let text = "a wrrod here";
+        let wrrod = diagnostic(DiagnosticKind::Spelling, text, "wrrod");
+        let all = [&wrrod];
+        assert!(diagnostic_in(&all, 0..2).is_none());
+        assert!(diagnostic_in(&all, 7..9).is_none());
+    }
+
+    #[test]
+    fn diagnostic_in_prefers_overlapping_spelling() {
+        let text = "the wrrod here";
+        let grammar = diagnostic(DiagnosticKind::Grammar, text, "the wrrod");
+        let spelling = diagnostic(DiagnosticKind::Spelling, text, "wrrod");
+        let all = [&grammar, &spelling];
+        let kind = |chars| diagnostic_in(&all, chars).map(|d| d.kind);
+        assert_eq!(kind(5..6), Some(DiagnosticKind::Spelling));
+        assert_eq!(kind(4..6), Some(DiagnosticKind::Spelling));
+        assert_eq!(kind(1..2), Some(DiagnosticKind::Grammar));
+    }
+
+    #[test]
+    fn grammar_starting_at_a_spelling_end_wins_only_for_a_cell() {
+        let text = "wrrod, here";
+        let spelling = diagnostic(DiagnosticKind::Spelling, text, "wrrod");
+        let grammar = diagnostic(DiagnosticKind::Grammar, text, ", here");
+        assert_eq!(spelling.chars.end, grammar.chars.start);
+        let all = [&spelling, &grammar];
+        let kind = |chars| diagnostic_in(&all, chars).map(|d| d.kind);
+        assert_eq!(kind(5..6), Some(DiagnosticKind::Grammar), "cell");
+        assert_eq!(kind(4..6), Some(DiagnosticKind::Spelling), "caret at 5");
+    }
+
+    #[test]
+    fn diagnostic_in_an_empty_slice_is_none() {
+        assert!(diagnostic_in(&[], 0..1).is_none());
+        assert!(diagnostic_in(&[], 0..0).is_none());
     }
 
     #[test]

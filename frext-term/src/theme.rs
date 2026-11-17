@@ -8,6 +8,7 @@ use frext_core::highlight::{MatchBackground, StyledSpan};
 use frext_core::palette::{
     self, BASE, MANTLE, OVERLAY0, OVERLAY1, Rgb, SUBTEXT0, SURFACE0, SURFACE1, TEXT,
 };
+use frext_core::proofread::DiagnosticKind;
 use ratatui::style::{Color, Modifier, Style};
 
 /// Converts a palette colour into a 24-bit terminal colour.
@@ -142,6 +143,16 @@ pub fn span(span: &StyledSpan) -> Style {
         style = style.add_modifier(Modifier::UNDERLINED);
     }
     style
+}
+
+/// The colour of the underline under a proofreading diagnostic of
+/// `kind`.
+#[must_use]
+pub const fn squiggle(kind: DiagnosticKind) -> Color {
+    match kind {
+        DiagnosticKind::Spelling => color(palette::spelling_squiggle()),
+        DiagnosticKind::Grammar => color(palette::grammar_squiggle()),
+    }
 }
 
 /// The glyph drawn in place of a control char.
@@ -357,6 +368,30 @@ mod tests {
         let style = span(&styled);
         assert!(style.add_modifier.contains(Modifier::ITALIC));
         assert!(style.add_modifier.contains(Modifier::UNDERLINED));
+    }
+
+    #[test]
+    fn squiggle_maps_both_kinds() {
+        assert_eq!(
+            squiggle(DiagnosticKind::Spelling),
+            color(palette::spelling_squiggle())
+        );
+        assert_eq!(
+            squiggle(DiagnosticKind::Grammar),
+            color(palette::grammar_squiggle())
+        );
+        assert_eq!(
+            squiggle(DiagnosticKind::Spelling),
+            Color::Rgb(0xf3, 0x8b, 0xa8)
+        );
+        assert_eq!(
+            squiggle(DiagnosticKind::Grammar),
+            Color::Rgb(0xa6, 0xe3, 0xa1)
+        );
+        assert_ne!(
+            squiggle(DiagnosticKind::Spelling),
+            squiggle(DiagnosticKind::Grammar)
+        );
     }
 
     #[test]
