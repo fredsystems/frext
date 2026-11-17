@@ -545,12 +545,13 @@ What:
   | `GHOSTTY`   | `\x1b_Gi=31;OK\x1b\\` `\x1b[6;17;8t` `\x1bP>\|ghostty 1.1.3\x1b\\` `\x1bP1+r536d756c78=1b5b343a25703125646d\x1b\\` `\x1b[?0u` `\x1b[?62;22c`          |
   | `FOOT`      | `\x1b[6;16;8t` `\x1bP>\|foot(1.20.2)\x1b\\` `\x1bP1+r536d756c78=1b5b343a25703125646d\x1b\\` `\x1b[?0u` `\x1b[?62;4;22c`                              |
   | `WEZTERM`   | `\x1b_Gi=31;OK\x1b\\` `\x1b[6;18;9t` `\x1bP>\|WezTerm 20240203-110809-5046fc22\x1b\\` `\x1bP0+r536d756c78\x1b\\` `\x1b[?65;4;6;18;22c`                 |
-  | `FREMINAL`  | `\x1b_Gi=31;OK\x1b\\` `\x1b[6;18;9t` `\x1bP>\|XTerm(Freminal 0.13.0-beta.2)\x1b\\` `\x1bP1+r536d756c78=1b5b343a25703125646d\x1b\\` `\x1b[?0u` `\x1b[?65;1;2;4;6;17;18;22c` |
+  | `FREMINAL`  | `\x1b_Gi=31;OK\x1b\\` `\x1b[6;20;10t` `\x1bP>\|XTerm(Freminal 0.13.0-beta.3)\x1b\\` `\x1bP1+r536d756c78=1B5B343A25703125646D\x1b\\` `\x1b[?0u` `\x1b[?65;1;2;4;6;17;18;22c` |
   | `ALACRITTY` | `\x1b[?0u` `\x1b[?6c`                                                                                                                                 |
   | `TMUX`      | `\x1bP>\|tmux 3.5a\x1b\\` `\x1b[?1;2c`                                                                                                                |
 
   (The spaces between sequences are for reading only. `\|` is a
-  literal `|`.)
+  literal `|`.) `FREMINAL` was replaced by a real recording from
+  freminal 0.13.0-beta.3 after 06.8; the others are still synthesised.
 
 Deliverable: tests in `probe.rs`:
 
@@ -614,7 +615,7 @@ Deliverable: tests, using the fixtures from
   | `GHOSTTY`   | `TERM=xterm-ghostty`, `TERM_PROGRAM=ghostty`                    | Kitty 8x17    | `Curly`    | `Kitty { 0 }`   | `None`      |
   | `FOOT`      | `TERM=foot`                                                     | `None`        | `Curly`    | `Kitty { 0 }`   | `None`      |
   | `WEZTERM`   | `TERM_PROGRAM=WezTerm`, `WEZTERM_EXECUTABLE=/usr/bin/wezterm`   | `None`        | `Curly`    | `Legacy`        | `None`      |
-  | `FREMINAL`  | `TERM=xterm-256color`, `TERM_PROGRAM=freminal`                  | Kitty 9x18    | `Curly`    | `Kitty { 0 }`   | `None`      |
+  | `FREMINAL`  | `TERM=xterm-256color`, `TERM_PROGRAM=freminal`                  | Kitty 10x20   | `Curly`    | `Kitty { 0 }`   | `None`      |
   | `ALACRITTY` | `TERM=alacritty`                                                | `None`        | `Curly`    | `Kitty { 0 }`   | `None`      |
   | `TMUX`      | `TMUX=/tmp/tmux-1000/default,1,0`, `TERM=tmux-256color`, `TERM_PROGRAM=tmux` | `None` | `Straight` | `Legacy` | `Tmux` |
 

@@ -402,7 +402,7 @@ fn number(digits: &[u8]) -> Option<u16> {
 ///
 /// These are synthesised from each terminal's documented reply format,
 /// not recorded from a live terminal. The manual smoke checklist records
-/// real ones.
+/// real ones. `FREMINAL` is the exception: it is recorded.
 #[cfg(test)]
 pub(crate) mod fixtures {
     /// kitty.
@@ -435,11 +435,11 @@ pub(crate) mod fixtures {
         \x1bP0+r536d756c78\x1b\\\
         \x1b[?65;4;6;18;22c";
 
-    /// freminal.
+    /// freminal, recorded from freminal 0.13.0-beta.3.
     pub(crate) const FREMINAL: &[u8] = b"\x1b_Gi=31;OK\x1b\\\
-        \x1b[6;18;9t\
-        \x1bP>|XTerm(Freminal 0.13.0-beta.2)\x1b\\\
-        \x1bP1+r536d756c78=1b5b343a25703125646d\x1b\\\
+        \x1b[6;20;10t\
+        \x1bP>|XTerm(Freminal 0.13.0-beta.3)\x1b\\\
+        \x1bP1+r536d756c78=1B5B343A25703125646D\x1b\\\
         \x1b[?0u\
         \x1b[?65;1;2;4;6;17;18;22c";
 
@@ -546,8 +546,8 @@ mod tests {
             parse(FREMINAL),
             Replies {
                 kitty_graphics: KittyReply::Ok,
-                cell_px: cell(9, 18),
-                xtversion: Some("XTerm(Freminal 0.13.0-beta.2)".to_owned()),
+                cell_px: cell(10, 20),
+                xtversion: Some("XTerm(Freminal 0.13.0-beta.3)".to_owned()),
                 smulx: TcapReply::Supported,
                 keyboard_flags: Some(0),
                 end: ReplyEnd::Da1,

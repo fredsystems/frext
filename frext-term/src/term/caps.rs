@@ -399,11 +399,11 @@ mod tests {
         check(
             fixtures::FREMINAL,
             &[("TERM", "xterm-256color"), ("TERM_PROGRAM", "freminal")],
-            kitty(9, 18),
+            kitty(10, 20),
             UnderlineStyle::Curly,
             KeyboardProtocol::Kitty { flags: 0 },
             Multiplexer::None,
-            "XTerm(Freminal 0.13.0-beta.2)",
+            "XTerm(Freminal 0.13.0-beta.3)",
         );
     }
 
@@ -446,7 +446,7 @@ mod tests {
             &TermEnv::default(),
             TermConfig::default(),
         );
-        assert_eq!(caps.images, kitty(9, 18));
+        assert_eq!(caps.images, kitty(10, 20));
         assert_eq!(caps.underline, UnderlineStyle::Curly);
         assert_eq!(caps.keyboard, KeyboardProtocol::Kitty { flags: 0 });
     }
