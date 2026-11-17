@@ -929,3 +929,66 @@ screen, so C's binary search pays off with many matches, or with a long
 line, which this bench does not show. F's shared `paint::fill` keeps the
 row-then-column loop of the old buffer copies: a `positions()` version
 cost up to 4%.
+
+### 04.11 -- Review fixes (PR #42)
+
+Surfaced by the Copilot and CodeRabbit reviews of PR #42 (`16c43b2`),
+including CodeRabbit's comments outside the diff. All of them come from
+04.10's own code (A and B) or from `send`. Each lands as its own commit
+with a regression test, followed by the standard ritual.
+
+- **A -- The scope guesses where an edit happened from the text alone.**
+  `track_range` locates the edit from the common prefix and suffix. In
+  repeated text that is ambiguous: scope `4..7` in `"foo foo foo"` with
+  `"foo "` inserted at 0 stays `4..7`, and scope `2..5` in `"aaaaZ"` with
+  an `a` inserted at 0 becomes `2..6`. Replace all can then change text
+  outside the selection. Fix (`frext-core/src/edit_ops.rs`,
+  `frext-core/src/editor/search.rs`, `frext-core/src/editor/editing.rs`,
+  `frext-core/src/editor/mod.rs`; `frext-term/src/app.rs`):
+  - `edit_ops::shift_range(range, at, removed, inserted) -> Range<usize>`
+    (chars) maps a range through one positioned edit:
+    - a start before `at` is kept, and an end at or before `at` is kept
+    - a boundary at or after `at + removed` shifts by
+      `inserted - removed`
+    - a start inside the removed text moves to `at`, and an end inside
+      it moves to `at + inserted`
+    - so text inserted exactly at either boundary lands outside the
+      range
+  - **Core edits track the scope exactly.** Each one calls a private
+    `Editor::track_scope_edit(at, removed, inserted)` (chars), which
+    shifts the scope and re-bases it on the new text before
+    `commit_edit`:
+    - Cut, Paste and ApplySuggestion
+    - ReplaceCurrent, at the replaced match
+    - Replace all within a scope: every replacement lies inside it, so
+      its end shifts by the total change
+  - **View edits are aligned with the caret.** `track_range` gains
+    `caret: Option<usize>`, the char caret the view reported with
+    `set_selection` (collapsed, after the edit). Among the alignments of
+    the same minimal edit that both texts allow, it picks one where the
+    caret is the end of the inserted text, else one where the caret is
+    the edit's start, else the longest common prefix as before. The
+    mapping then goes through `shift_range`.
+  - **The TUI reports its selection before every `commit_edit`**
+    (`after_edit`), as the GUI already does, so the caret hint is
+    exact.
+- **B -- An empty pattern skips scope tracking.** `recompute_matches`
+  returned before `scope_bytes()`, so later edits were merged into one
+  diff. Fix: refresh the scope first. (`frext-core/src/editor/search.rs`)
+- **C -- In-selection from the sidebar captures no scope.** `send`
+  passed `None` while the sidebar had focus, so turning `[sel]` on from
+  there searched the whole buffer. Fix: `send` always passes the
+  editor's selection. This is GUI parity, because egui keeps reporting
+  the editor's cursor range when the editor is unfocused. The editing
+  Ctrl letters stay editor-only in the keymap. (`frext-term/src/app.rs`)
+- **D -- The selection is stale after a core edit with no
+  `SetSelection`.** After Replace all, or a Replace that leaves no
+  match, the TUI kept the old selection over changed text, and typing
+  replaced unrelated text. Fix: when `record_outside_edit` gets no
+  `after`, it also collapses the live cursor to the recorded caret (the
+  end of the inserted text). Redo restores the same caret.
+  (`frext-term/src/buffer/mod.rs`)
+- **E -- Replace does not wrap when no match follows.** Replacing the
+  last `ab` in `"ab ab aab"` with `b` kept index 2. Fix: when no match
+  starts at or after the replaced position and matches remain, `current`
+  becomes `Some(0)`. (`frext-core/src/editor/search.rs`)
