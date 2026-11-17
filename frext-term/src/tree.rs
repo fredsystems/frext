@@ -5,14 +5,20 @@
 //! [`frext_core::editor::Command`]. [`FileTree`] owns only the sidebar's
 //! view state: the rows from the last refresh, the selected row, the
 //! scroll position, the width and the border drag.
+//!
+//! While the sidebar has focus, keys the global keymap leaves unbound go
+//! to [`FileTree::handle_key`], which moves the selection itself and
+//! answers with a [`TreeReply`] for whatever the app must do: send a
+//! command, open a context menu, or re-lay out after a resize.
 
 use std::path::{Path, PathBuf};
 
-use frext_core::editor::{Editor, FolderState};
+use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use frext_core::editor::{Command, Editor, FolderState};
 use frext_core::palette::MANTLE;
 use frext_core::workspace::{RowKind, TreeRow, Workspace, visible_rows};
 use ratatui::buffer::Buffer;
-use ratatui::layout::Rect;
+use ratatui::layout::{Position, Rect};
 use ratatui::style::{Modifier, Style};
 
 use crate::hit::{HitMap, Target};
@@ -62,6 +68,46 @@ pub enum Refresh {
     Unchanged,
     /// The rows differ, so hit regions built from the old rows are stale.
     Changed,
+}
+
+/// What the app must do after [`FileTree::handle_key`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TreeReply {
+    /// Send this command to the editor.
+    Send(Command),
+    /// Open the context menu for `path` (a row of `kind`) at `anchor`.
+    OpenMenu {
+        /// The file or folder the menu acts on.
+        path: PathBuf,
+        /// Whether it is a file or a folder, which picks the menu.
+        kind: RowKind,
+        /// The cell the menu is anchored at.
+        anchor: Position,
+    },
+    /// The width changed (or was asked to), so the layout is stale.
+    Resized,
+    /// The tree used the key; nothing else to do.
+    Handled,
+    /// The tree does not use the key.
+    Ignored,
+}
+
+/// The modifiers that make the tree ignore a key.
+const BLOCKING_MODIFIERS: KeyModifiers = KeyModifiers::CONTROL
+    .union(KeyModifiers::ALT)
+    .union(KeyModifiers::SUPER)
+    .union(KeyModifiers::HYPER)
+    .union(KeyModifiers::META);
+
+/// A selection move made by a motion key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Motion {
+    Up,
+    Down,
+    PageUp,
+    PageDown,
+    Home,
+    End,
 }
 
 /// The state of the border drag.
@@ -206,6 +252,240 @@ impl FileTree {
             });
         if let Some(index) = index {
             self.select(index);
+        }
+    }
+
+    /// The index of the selected row in the current rows, if any.
+    fn current(&self) -> Option<usize> {
+        let path = self.selected.as_deref()?;
+        match self.rows.get(self.selected_index) {
+            Some(row) if row.path == path => Some(self.selected_index),
+            _ => self.position(path),
+        }
+    }
+
+    /// The rows the sidebar showed at the last render (at least 1).
+    fn rows_height(&self) -> usize {
+        usize::from(self.area.height.saturating_sub(1)).max(1)
+    }
+
+    /// Selects row `index` and scrolls it into view.
+    fn select_visible(&mut self, index: usize) {
+        self.select(index);
+        let height = self.rows_height();
+        if index < self.top {
+            self.top = index;
+        } else if index >= self.top.saturating_add(height) {
+            self.top = index.saturating_add(1).saturating_sub(height);
+        }
+    }
+
+    /// Handles a key while the sidebar has focus, over the rows of the
+    /// last refresh.
+    ///
+    /// Up / Down / PageUp / PageDown / Home / End move the selection;
+    /// Right and Left expand, collapse or walk the folders; Enter toggles
+    /// a folder or opens a file; Shift+F10, `F(22)` and Menu open the
+    /// context menu; `<` and `>` narrow and widen the sidebar. Any key
+    /// with Ctrl or Alt, and any release, is [`TreeReply::Ignored`].
+    pub fn handle_key(&mut self, key: KeyEvent) -> TreeReply {
+        if key.kind == KeyEventKind::Release || key.modifiers.intersects(BLOCKING_MODIFIERS) {
+            return TreeReply::Ignored;
+        }
+        let plain = key.modifiers.is_empty();
+        let shifted = key.modifiers == KeyModifiers::SHIFT;
+        match key.code {
+            KeyCode::Up if plain => self.motion(Motion::Up),
+            KeyCode::Down if plain => self.motion(Motion::Down),
+            KeyCode::PageUp if plain => self.motion(Motion::PageUp),
+            KeyCode::PageDown if plain => self.motion(Motion::PageDown),
+            KeyCode::Home if plain => self.motion(Motion::Home),
+            KeyCode::End if plain => self.motion(Motion::End),
+            KeyCode::Right if plain => self.right(),
+            KeyCode::Left if plain => self.left(),
+            KeyCode::Enter if plain => self.enter(),
+            KeyCode::F(10) if shifted => self.open_menu(),
+            KeyCode::F(22) | KeyCode::Menu if plain || shifted => self.open_menu(),
+            KeyCode::Char('<') if plain || shifted => {
+                self.width = clamp_width(self.width.saturating_sub(1), self.total);
+                TreeReply::Resized
+            }
+            KeyCode::Char('>') if plain || shifted => {
+                self.width = clamp_width(self.width.saturating_add(1), self.total);
+                TreeReply::Resized
+            }
+            _ => TreeReply::Ignored,
+        }
+    }
+
+    /// Moves the selection; with nothing selected, selects the first row
+    /// (the last for End).
+    fn motion(&mut self, motion: Motion) -> TreeReply {
+        let Some(last) = self.rows.len().checked_sub(1) else {
+            return TreeReply::Handled;
+        };
+        let page = self.rows_height().saturating_sub(1).max(1);
+        let target = match (self.current(), motion) {
+            (_, Motion::End) => last,
+            (None, _) | (Some(_), Motion::Home) => 0,
+            (Some(index), Motion::Up) => index.saturating_sub(1),
+            (Some(index), Motion::Down) => index.saturating_add(1).min(last),
+            (Some(index), Motion::PageUp) => index.saturating_sub(page),
+            (Some(index), Motion::PageDown) => index.saturating_add(page).min(last),
+        };
+        self.select_visible(target);
+        TreeReply::Handled
+    }
+
+    /// Right: expands a collapsed folder, or steps into an expanded one.
+    fn right(&mut self) -> TreeReply {
+        let Some(index) = self.current() else {
+            return TreeReply::Handled;
+        };
+        let Some(row) = self.rows.get(index) else {
+            return TreeReply::Handled;
+        };
+        match row.kind {
+            RowKind::Dir(FolderState::Collapsed) => TreeReply::Send(Command::SetExpanded {
+                dir: row.path.clone(),
+                state: FolderState::Expanded,
+            }),
+            RowKind::Dir(FolderState::Expanded) => {
+                let child = index.saturating_add(1);
+                let is_child = self.rows.get(child).is_some_and(|next| {
+                    next.depth == row.depth.saturating_add(1) && next.path.starts_with(&row.path)
+                });
+                if is_child {
+                    self.select_visible(child);
+                }
+                TreeReply::Handled
+            }
+            RowKind::File => TreeReply::Handled,
+        }
+    }
+
+    /// Left: collapses an expanded folder, or steps out to the parent.
+    fn left(&mut self) -> TreeReply {
+        let Some(index) = self.current() else {
+            return TreeReply::Handled;
+        };
+        let Some(row) = self.rows.get(index) else {
+            return TreeReply::Handled;
+        };
+        if row.kind == RowKind::Dir(FolderState::Expanded) {
+            return TreeReply::Send(Command::SetExpanded {
+                dir: row.path.clone(),
+                state: FolderState::Collapsed,
+            });
+        }
+        if row.depth > 0
+            && let Some(parent) = row.path.parent().and_then(|path| self.position(path))
+        {
+            self.select_visible(parent);
+        }
+        TreeReply::Handled
+    }
+
+    /// Enter: toggles a folder or opens a file.
+    fn enter(&self) -> TreeReply {
+        let Some(row) = self.current().and_then(|index| self.rows.get(index)) else {
+            return TreeReply::Handled;
+        };
+        let command = match row.kind {
+            RowKind::Dir(state) => Command::SetExpanded {
+                dir: row.path.clone(),
+                state: match state {
+                    FolderState::Expanded => FolderState::Collapsed,
+                    FolderState::Collapsed => FolderState::Expanded,
+                },
+            },
+            RowKind::File => Command::OpenPath(row.path.clone()),
+        };
+        TreeReply::Send(command)
+    }
+
+    /// The context menu for the selected row, or for the root with none.
+    fn open_menu(&self) -> TreeReply {
+        let anchor = self.menu_anchor();
+        if let Some(row) = self.current().and_then(|index| self.rows.get(index)) {
+            return TreeReply::OpenMenu {
+                path: row.path.clone(),
+                kind: row.kind,
+                anchor,
+            };
+        }
+        match &self.root {
+            Some(root) => TreeReply::OpenMenu {
+                path: root.clone(),
+                kind: RowKind::Dir(FolderState::Expanded),
+                anchor,
+            },
+            None => TreeReply::Ignored,
+        }
+    }
+
+    /// Where a keyboard-opened menu is anchored: the selected row's name
+    /// column when that row is drawn, else the first row's left edge.
+    #[must_use]
+    pub fn menu_anchor(&self) -> Position {
+        let fallback = Position::new(self.area.x.saturating_add(1), self.area.y.saturating_add(1));
+        let drawn = usize::from(self.area.height.saturating_sub(1));
+        let Some((index, row)) = self
+            .current()
+            .and_then(|index| self.rows.get(index).map(|row| (index, row)))
+        else {
+            return fallback;
+        };
+        if index < self.top || index >= self.top.saturating_add(drawn) {
+            return fallback;
+        }
+        let indent = u16::try_from(row.depth.saturating_mul(2)).unwrap_or(u16::MAX);
+        let offset = u16::try_from(index.saturating_sub(self.top)).unwrap_or(u16::MAX);
+        Position::new(
+            fallback
+                .x
+                .saturating_add(indent)
+                .saturating_add(2)
+                .saturating_add(ICON_WIDTH),
+            fallback.y.saturating_add(offset),
+        )
+    }
+
+    /// Scrolls the rows by `rows` (down when positive), keeping the last
+    /// row at the bottom at most. The selection does not move.
+    pub fn wheel(&mut self, rows: i32) {
+        let by = usize::try_from(rows.unsigned_abs()).unwrap_or(usize::MAX);
+        let top = if rows >= 0 {
+            self.top.saturating_add(by)
+        } else {
+            self.top.saturating_sub(by)
+        };
+        self.top = top.min(self.rows.len().saturating_sub(self.rows_height()));
+    }
+
+    /// Starts dragging the border.
+    pub fn begin_resize(&mut self) {
+        self.resize = Resize::Dragging;
+    }
+
+    /// Stops dragging the border.
+    pub fn end_resize(&mut self) {
+        self.resize = Resize::Idle;
+    }
+
+    /// Whether the border is being dragged.
+    #[must_use]
+    pub fn is_resizing(&self) -> bool {
+        self.resize == Resize::Dragging
+    }
+
+    /// While dragging, sets the width so the border sits at `column`.
+    pub fn drag_to(&mut self, column: u16) {
+        if self.resize == Resize::Dragging {
+            self.width = clamp_width(
+                column.saturating_sub(self.area.x).saturating_add(1),
+                self.total,
+            );
         }
     }
 
@@ -817,6 +1097,433 @@ mod tests {
         for (x, y) in [(0, 0), (2, 0), (0, 1), (29, 3), (10, 7)] {
             assert_eq!(hits.hit(x, y), None);
         }
+    }
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn key_with(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
+        KeyEvent::new(code, modifiers)
+    }
+
+    /// Renders `tree` once into a `screen`-sized buffer at `area`.
+    fn render_in(tree: &mut FileTree, editor: &Editor, area: Rect, screen: Rect) {
+        let mut buf = Buffer::empty(screen);
+        let mut hits = HitMap::default();
+        tree.render(editor, TreeFocus::Focused, None, area, &mut buf, &mut hits);
+    }
+
+    /// A tree rendered once over the fixture in `area`.
+    fn keyed(tag: &str, area: Rect) -> (PathBuf, Editor, FileTree) {
+        let (project, editor) = fixture(tag, &[]);
+        let mut tree = FileTree::new();
+        render_in(&mut tree, &editor, area, SCREEN);
+        (project, editor, tree)
+    }
+
+    fn selected_index(tree: &FileTree) -> Option<usize> {
+        tree.selected().and_then(|path| tree.position(path))
+    }
+
+    #[test]
+    fn down_from_nothing_selects_the_first_row() {
+        let (_, _, mut tree) = keyed("down-first", SIDEBAR);
+        assert_eq!(tree.handle_key(key(KeyCode::Down)), TreeReply::Handled);
+        assert_eq!(selected_index(&tree), Some(0));
+    }
+
+    #[test]
+    fn end_from_nothing_selects_the_last_row() {
+        let (_, _, mut tree) = keyed("end-first", SIDEBAR);
+        assert_eq!(tree.handle_key(key(KeyCode::End)), TreeReply::Handled);
+        assert_eq!(selected_index(&tree), Some(3));
+    }
+
+    #[test]
+    fn up_and_down_step_and_stop_at_the_ends() {
+        let (_, _, mut tree) = keyed("step", SIDEBAR);
+        tree.handle_key(key(KeyCode::Down));
+        for want in [1, 2, 3, 3] {
+            assert_eq!(tree.handle_key(key(KeyCode::Down)), TreeReply::Handled);
+            assert_eq!(selected_index(&tree), Some(want));
+        }
+        for want in [2, 1, 0, 0] {
+            assert_eq!(tree.handle_key(key(KeyCode::Up)), TreeReply::Handled);
+            assert_eq!(selected_index(&tree), Some(want));
+        }
+    }
+
+    #[test]
+    fn home_and_end() {
+        let (_, _, mut tree) = keyed("home-end", SIDEBAR);
+        tree.select(1);
+        assert_eq!(tree.handle_key(key(KeyCode::End)), TreeReply::Handled);
+        assert_eq!(selected_index(&tree), Some(3));
+        assert_eq!(tree.handle_key(key(KeyCode::Home)), TreeReply::Handled);
+        assert_eq!(selected_index(&tree), Some(0));
+    }
+
+    #[test]
+    fn motion_keys_with_no_rows_are_handled() {
+        let mut tree = FileTree::new();
+        for code in [
+            KeyCode::Up,
+            KeyCode::Down,
+            KeyCode::PageUp,
+            KeyCode::PageDown,
+            KeyCode::Home,
+            KeyCode::End,
+        ] {
+            assert_eq!(tree.handle_key(key(code)), TreeReply::Handled, "{code:?}");
+        }
+        assert_eq!(tree.selected(), None);
+    }
+
+    #[test]
+    fn page_keys_move_by_rows_height_minus_one() {
+        let (project, editor) = fixture("page", &[]);
+        for name in ["w1.txt", "w2.txt", "w3.txt", "w4.txt"] {
+            fs::write(project.join(name), "").unwrap();
+        }
+        let mut tree = FileTree::new();
+        // Four rows shown, so a page is three rows.
+        render_in(&mut tree, &editor, Rect::new(0, 0, 30, 5), SCREEN);
+        assert_eq!(tree.rows().len(), 8);
+        tree.select(0);
+        for want in [3, 6, 7] {
+            assert_eq!(tree.handle_key(key(KeyCode::PageDown)), TreeReply::Handled);
+            assert_eq!(selected_index(&tree), Some(want));
+        }
+        for want in [4, 1, 0] {
+            assert_eq!(tree.handle_key(key(KeyCode::PageUp)), TreeReply::Handled);
+            assert_eq!(selected_index(&tree), Some(want));
+        }
+    }
+
+    #[test]
+    fn page_keys_move_by_one_in_a_one_row_sidebar() {
+        let (_, _, mut tree) = keyed("page-one", Rect::new(0, 0, 30, 2));
+        tree.select(0);
+        tree.handle_key(key(KeyCode::PageDown));
+        assert_eq!(selected_index(&tree), Some(1));
+        tree.handle_key(key(KeyCode::PageUp));
+        assert_eq!(selected_index(&tree), Some(0));
+    }
+
+    #[test]
+    fn selection_scrolls_into_view_in_a_short_sidebar() {
+        let area = Rect::new(0, 0, 30, 3);
+        let (project, editor, mut tree) = keyed("into-view", area);
+        for _ in 0..3 {
+            tree.handle_key(key(KeyCode::Down));
+        }
+        assert_eq!(selected_index(&tree), Some(2));
+        assert_eq!(tree.top, 1);
+        tree.handle_key(key(KeyCode::End));
+        assert_eq!(tree.top, 2);
+        let mut buf = Buffer::empty(SCREEN);
+        let mut hits = HitMap::default();
+        tree.render(&editor, TreeFocus::Focused, None, area, &mut buf, &mut hits);
+        assert_eq!(row_text(&buf, 2), "     README.md");
+        assert_eq!(buf[(0, 2)].bg, theme::tree_cursor_bg());
+        assert_eq!(tree.selected(), Some(project.join("README.md").as_path()));
+
+        tree.handle_key(key(KeyCode::Home));
+        assert_eq!(tree.top, 0);
+    }
+
+    #[test]
+    fn right_expands_then_steps_into_a_folder() {
+        let (project, mut editor, mut tree) = keyed("right", SIDEBAR);
+        let src = project.join("src");
+        tree.select(1);
+        let reply = tree.handle_key(key(KeyCode::Right));
+        let expand = Command::SetExpanded {
+            dir: src.clone(),
+            state: FolderState::Expanded,
+        };
+        assert_eq!(reply, TreeReply::Send(expand.clone()));
+        assert_eq!(tree.selected(), Some(src.as_path()));
+
+        editor.apply(expand);
+        tree.refresh(editor.workspace());
+        assert_eq!(tree.handle_key(key(KeyCode::Right)), TreeReply::Handled);
+        assert_eq!(tree.selected(), Some(src.join("main.rs").as_path()));
+    }
+
+    #[test]
+    fn right_on_a_file_or_an_empty_expanded_folder_does_nothing() {
+        let (project, mut editor, mut tree) = keyed("right-file", SIDEBAR);
+        let cargo = project.join("Cargo.toml");
+        tree.select(2);
+        assert_eq!(tree.handle_key(key(KeyCode::Right)), TreeReply::Handled);
+        assert_eq!(tree.selected(), Some(cargo.as_path()));
+
+        let docs = project.join("docs");
+        editor.apply(Command::SetExpanded {
+            dir: docs.clone(),
+            state: FolderState::Expanded,
+        });
+        tree.refresh(editor.workspace());
+        tree.select(0);
+        assert_eq!(tree.handle_key(key(KeyCode::Right)), TreeReply::Handled);
+        assert_eq!(tree.selected(), Some(docs.as_path()));
+    }
+
+    #[test]
+    fn left_collapses_then_steps_out() {
+        let (project, mut editor, mut tree) = keyed("left", SIDEBAR);
+        let src = project.join("src");
+        editor.apply(Command::SetExpanded {
+            dir: src.clone(),
+            state: FolderState::Expanded,
+        });
+        tree.refresh(editor.workspace());
+        tree.select(1);
+        assert_eq!(
+            tree.handle_key(key(KeyCode::Left)),
+            TreeReply::Send(Command::SetExpanded {
+                dir: src.clone(),
+                state: FolderState::Collapsed,
+            })
+        );
+
+        tree.select(2);
+        assert_eq!(tree.selected(), Some(src.join("main.rs").as_path()));
+        assert_eq!(tree.handle_key(key(KeyCode::Left)), TreeReply::Handled);
+        assert_eq!(tree.selected(), Some(src.as_path()));
+    }
+
+    #[test]
+    fn left_at_depth_zero_changes_nothing() {
+        let (project, _, mut tree) = keyed("left-top", SIDEBAR);
+        for (index, name) in [(0, "docs"), (3, "README.md")] {
+            tree.select(index);
+            let width = tree.width();
+            let top = tree.top;
+            assert_eq!(tree.handle_key(key(KeyCode::Left)), TreeReply::Handled);
+            assert_eq!(tree.selected(), Some(project.join(name).as_path()));
+            assert_eq!((tree.width(), tree.top), (width, top));
+        }
+    }
+
+    #[test]
+    fn enter_toggles_a_folder_and_opens_a_file() {
+        let (project, mut editor, mut tree) = keyed("enter", SIDEBAR);
+        let src = project.join("src");
+        tree.select(1);
+        let expand = Command::SetExpanded {
+            dir: src.clone(),
+            state: FolderState::Expanded,
+        };
+        assert_eq!(
+            tree.handle_key(key(KeyCode::Enter)),
+            TreeReply::Send(expand.clone())
+        );
+        editor.apply(expand);
+        tree.refresh(editor.workspace());
+        assert_eq!(
+            tree.handle_key(key(KeyCode::Enter)),
+            TreeReply::Send(Command::SetExpanded {
+                dir: src.clone(),
+                state: FolderState::Collapsed,
+            })
+        );
+
+        tree.select(2);
+        assert_eq!(
+            tree.handle_key(key(KeyCode::Enter)),
+            TreeReply::Send(Command::OpenPath(src.join("main.rs")))
+        );
+    }
+
+    #[test]
+    fn right_left_enter_with_nothing_selected_are_handled() {
+        let (_, _, mut tree) = keyed("unselected-keys", SIDEBAR);
+        for code in [KeyCode::Right, KeyCode::Left, KeyCode::Enter] {
+            assert_eq!(tree.handle_key(key(code)), TreeReply::Handled, "{code:?}");
+        }
+        assert_eq!(tree.selected(), None);
+    }
+
+    #[test]
+    fn menu_keys_open_the_selected_rows_menu() {
+        let (project, _, mut tree) = keyed("menu", SIDEBAR);
+        let menu_keys = [
+            key_with(KeyCode::F(10), KeyModifiers::SHIFT),
+            key(KeyCode::F(22)),
+            key_with(KeyCode::F(22), KeyModifiers::SHIFT),
+            key(KeyCode::Menu),
+            key_with(KeyCode::Menu, KeyModifiers::SHIFT),
+        ];
+        for (index, name, kind, anchor) in [
+            (2, "Cargo.toml", RowKind::File, Position::new(5, 3)),
+            (
+                1,
+                "src",
+                RowKind::Dir(FolderState::Collapsed),
+                Position::new(5, 2),
+            ),
+        ] {
+            tree.select(index);
+            assert_eq!(tree.menu_anchor(), anchor);
+            for event in menu_keys {
+                assert_eq!(
+                    tree.handle_key(event),
+                    TreeReply::OpenMenu {
+                        path: project.join(name),
+                        kind,
+                        anchor,
+                    },
+                    "{event:?}"
+                );
+            }
+        }
+        assert_eq!(tree.handle_key(key(KeyCode::F(10))), TreeReply::Ignored);
+    }
+
+    #[test]
+    fn menu_keys_with_nothing_selected_open_the_root_menu() {
+        let (_, editor, mut tree) = keyed("menu-root", SIDEBAR);
+        let root = editor.workspace().unwrap().root.clone();
+        assert_eq!(
+            tree.handle_key(key_with(KeyCode::F(10), KeyModifiers::SHIFT)),
+            TreeReply::OpenMenu {
+                path: root,
+                kind: RowKind::Dir(FolderState::Expanded),
+                anchor: Position::new(1, 1),
+            }
+        );
+    }
+
+    #[test]
+    fn menu_keys_without_a_workspace_are_ignored() {
+        let mut tree = FileTree::new();
+        assert_eq!(tree.handle_key(key(KeyCode::Menu)), TreeReply::Ignored);
+        assert_eq!(tree.handle_key(key(KeyCode::F(22))), TreeReply::Ignored);
+    }
+
+    #[test]
+    fn menu_anchor_follows_depth_area_and_scroll() {
+        let (project, mut editor) = fixture("anchor", &[]);
+        editor.apply(Command::SetExpanded {
+            dir: project.join("src"),
+            state: FolderState::Expanded,
+        });
+        let mut tree = FileTree::new();
+        let area = Rect::new(5, 2, 30, 4);
+        render_in(&mut tree, &editor, area, Rect::new(0, 0, 60, 8));
+        // main.rs: depth 1, row 2, drawn on the third rows line.
+        tree.select(2);
+        assert_eq!(tree.menu_anchor(), Position::new(12, 5));
+
+        tree.top = 1;
+        assert_eq!(tree.menu_anchor(), Position::new(12, 4));
+        // README.md (row 4) is below the three drawn rows.
+        tree.select(4);
+        assert_eq!(tree.menu_anchor(), Position::new(6, 3));
+        tree.top = 2;
+        assert_eq!(tree.menu_anchor(), Position::new(10, 5));
+        // docs (row 0) is now scrolled off.
+        tree.select(0);
+        assert_eq!(tree.menu_anchor(), Position::new(6, 3));
+    }
+
+    #[test]
+    fn angle_brackets_resize_and_clamp() {
+        let (_, _, mut tree) = keyed("resize-keys", SIDEBAR);
+        // SCREEN is 50 wide, so the widest is 30, the default.
+        assert_eq!(tree.handle_key(key(KeyCode::Char('>'))), TreeReply::Resized);
+        assert_eq!(tree.width(), 30);
+        assert_eq!(tree.handle_key(key(KeyCode::Char('<'))), TreeReply::Resized);
+        assert_eq!(tree.width(), 29);
+        assert_eq!(
+            tree.handle_key(key_with(KeyCode::Char('<'), KeyModifiers::SHIFT)),
+            TreeReply::Resized
+        );
+        assert_eq!(tree.width(), 28);
+        assert_eq!(
+            tree.handle_key(key_with(KeyCode::Char('>'), KeyModifiers::SHIFT)),
+            TreeReply::Resized
+        );
+        assert_eq!(tree.width(), 29);
+        for _ in 0..40 {
+            assert_eq!(tree.handle_key(key(KeyCode::Char('<'))), TreeReply::Resized);
+        }
+        assert_eq!(tree.width(), MIN_WIDTH);
+        for _ in 0..40 {
+            tree.handle_key(key(KeyCode::Char('>')));
+        }
+        assert_eq!(tree.width(), SCREEN.width - MIN_EDITOR_WIDTH);
+    }
+
+    #[test]
+    fn modified_and_unbound_keys_are_ignored() {
+        let (_, _, mut tree) = keyed("ignored", SIDEBAR);
+        tree.select(1);
+        let width = tree.width();
+        let release =
+            KeyEvent::new_with_kind(KeyCode::Down, KeyModifiers::NONE, KeyEventKind::Release);
+        for event in [
+            key_with(KeyCode::Down, KeyModifiers::CONTROL),
+            key_with(KeyCode::Right, KeyModifiers::ALT),
+            key_with(KeyCode::Down, KeyModifiers::SHIFT),
+            key_with(KeyCode::Char('<'), KeyModifiers::CONTROL),
+            key_with(KeyCode::Menu, KeyModifiers::SUPER),
+            key(KeyCode::Char('x')),
+            release,
+        ] {
+            assert_eq!(tree.handle_key(event), TreeReply::Ignored, "{event:?}");
+        }
+        assert_eq!(selected_index(&tree), Some(1));
+        assert_eq!(tree.width(), width);
+    }
+
+    #[test]
+    fn wheel_clamps_and_leaves_the_selection() {
+        let (_, _, mut tree) = keyed("wheel", Rect::new(0, 0, 30, 3));
+        tree.select(1);
+        tree.wheel(1);
+        assert_eq!(tree.top, 1);
+        tree.wheel(5);
+        assert_eq!(tree.top, 2);
+        tree.wheel(i32::MAX);
+        assert_eq!(tree.top, 2);
+        tree.wheel(-1);
+        assert_eq!(tree.top, 1);
+        tree.wheel(i32::MIN);
+        assert_eq!(tree.top, 0);
+        assert_eq!(selected_index(&tree), Some(1));
+    }
+
+    #[test]
+    fn drag_to_only_while_resizing() {
+        let (_, editor) = fixture("drag", &[]);
+        let mut tree = FileTree::new();
+        render_in(
+            &mut tree,
+            &editor,
+            Rect::new(5, 0, 30, 8),
+            Rect::new(0, 0, 80, 8),
+        );
+        assert!(!tree.is_resizing());
+        tree.drag_to(20);
+        assert_eq!(tree.width(), DEFAULT_WIDTH);
+
+        tree.begin_resize();
+        assert!(tree.is_resizing());
+        tree.drag_to(20);
+        assert_eq!(tree.width(), 16);
+        tree.drag_to(0);
+        assert_eq!(tree.width(), MIN_WIDTH);
+        tree.drag_to(200);
+        assert_eq!(tree.width(), 80 - MIN_EDITOR_WIDTH);
+
+        tree.end_resize();
+        assert!(!tree.is_resizing());
+        tree.drag_to(20);
+        assert_eq!(tree.width(), 80 - MIN_EDITOR_WIDTH);
     }
 
     #[test]
