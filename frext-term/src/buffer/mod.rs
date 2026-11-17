@@ -396,6 +396,54 @@ impl BufferView {
         self.tabs.get(&tab_id).map(|view| view.cursor.caret())
     }
 
+    /// The view state of `tab` and its layout, when the layout is fresh
+    /// for `tab`'s current text and the last rendered editor width.
+    fn fresh_layout(&self, tab: &Tab) -> Option<(&TabView, &WrapLayout)> {
+        let view = self.tabs.get(&tab.id)?;
+        let (hash, layout) = view.layout.as_ref()?;
+        let fresh = *hash == text_hash(&tab.text) && layout.width() == wrap_width(self.rect);
+        fresh.then_some((view, layout))
+    }
+
+    /// The char of `tab` under the absolute cell (`column`, `row`): the
+    /// char a left click there would put the caret at. Moves nothing.
+    ///
+    /// `None` when the cell is outside the editor rect of the last
+    /// render, or the view has no layout for `tab`'s current text at that
+    /// rect's width (it does not know `tab`, or `tab` changed since).
+    #[must_use]
+    pub fn char_at_cell(&self, tab: &Tab, column: u16, row: u16) -> Option<usize> {
+        if !self.rect.contains(Position { x: column, y: row }) {
+            return None;
+        }
+        let (view, _) = self.fresh_layout(tab)?;
+        Some(char_at_cell(view, &tab.text, self.rect, column, row))
+    }
+
+    /// The screen cell of `tab`'s caret, computed as [`Self::render`]
+    /// does, over the editor rect of the last render.
+    ///
+    /// `None` when the caret's row is scrolled off, its column is past
+    /// the right edge, or the view has no layout for `tab`'s current text
+    /// at that rect's width.
+    #[must_use]
+    pub fn caret_cell(&self, tab: &Tab) -> Option<Position> {
+        let (view, layout) = self.fresh_layout(tab)?;
+        render::caret_cell(
+            layout,
+            &tab.text,
+            top_row(layout, view.top),
+            view.cursor.caret(),
+            self.rect,
+        )
+    }
+
+    /// The editor rect of the last render.
+    #[must_use]
+    pub const fn rect(&self) -> Rect {
+        self.rect
+    }
+
     /// Selects `chars` of `tab` (anchor at the start, caret at the end),
     /// clamped to the text, and keeps the caret visible.
     pub fn set_selection(&mut self, tab: &Tab, chars: Range<usize>) {
@@ -1264,6 +1312,92 @@ mod tests {
         assert_eq!(bg(&buf, GUTTER + 3, 0), other);
         assert_eq!(bg(&buf, GUTTER + 4, 0), Some(theme::selection_bg()));
         assert_eq!(bg(&buf, GUTTER + 5, 0), other);
+    }
+
+    #[test]
+    fn char_at_cell_matches_a_click_without_moving_the_cursor() {
+        let text = "abcdefghijklmnopqrstuvwxyz";
+        let tab = tab(1, text);
+        let mut view = BufferView::default();
+        draw(&mut view, Some(&tab), 12, 4);
+        view.set_selection(&tab, 1..3);
+        // Row 1 is the second wrapped row of the single line.
+        let (column, row) = (GUTTER + 2, 1);
+        let found = view.char_at_cell(&tab, column, row).unwrap();
+        assert!(found > 0, "second-row char {found}");
+        assert_eq!(view.selection(1), Some(1..3));
+        assert_eq!(view.caret(1), Some(3));
+        assert!(!view.is_dragging());
+
+        let mut clicked = BufferView::default();
+        draw(&mut clicked, Some(&tab), 12, 4);
+        clicked.mouse_down(&tab, column, row, Selecting::Move, Instant::now());
+        assert_eq!(clicked.caret(1), Some(found));
+    }
+
+    #[test]
+    fn char_at_cell_is_none_outside_the_editor_or_for_unknown_tabs() {
+        let tab = tab(1, "hello\nworld");
+        let mut view = BufferView::default();
+        assert_eq!(view.char_at_cell(&tab, GUTTER, 0), None);
+        draw(&mut view, Some(&tab), 12, 3);
+        assert_eq!(view.char_at_cell(&tab, GUTTER, 0), Some(0));
+        // In the gutter, left of the editor.
+        assert_eq!(view.char_at_cell(&tab, GUTTER - 1, 0), None);
+        // Below and right of the editor.
+        assert_eq!(view.char_at_cell(&tab, GUTTER, 3), None);
+        assert_eq!(view.char_at_cell(&tab, 12, 0), None);
+        // A tab the view does not know.
+        let mut other = tab.clone();
+        other.id = 2;
+        assert_eq!(view.char_at_cell(&other, GUTTER, 0), None);
+        assert_eq!(view.caret_cell(&other), None);
+        // A tab whose text changed since the last layout.
+        let mut changed = tab.clone();
+        changed.text.push('!');
+        assert_eq!(view.char_at_cell(&changed, GUTTER, 0), None);
+        assert_eq!(view.caret_cell(&changed), None);
+    }
+
+    #[test]
+    fn caret_cell_matches_render_and_follows_a_scroll() {
+        let text = numbered(100);
+        let tab = tab(1, &text);
+        let mut view = BufferView::default();
+        let (_, caret, _) = draw(&mut view, Some(&tab), 12, 10);
+        assert_eq!(caret, Some(Position { x: GUTTER, y: 0 }));
+        assert_eq!(view.caret_cell(&tab), caret);
+
+        let start = line_start(&text, 50);
+        view.set_selection(&tab, start + 1..start + 1);
+        let (_, caret, _) = draw(&mut view, Some(&tab), 12, 10);
+        assert!(caret.is_some());
+        assert_eq!(view.caret_cell(&tab), caret);
+
+        // A wheel scroll moves the caret's cell before the next render.
+        view.wheel(&tab, 2);
+        let scrolled = view.caret_cell(&tab);
+        assert_eq!(scrolled, caret.map(|p| Position { x: p.x, y: p.y - 2 }));
+        let (_, caret, _) = draw(&mut view, Some(&tab), 12, 10);
+        assert_eq!(caret, scrolled);
+
+        // Scrolled off: no cell, as render returns.
+        view.wheel(&tab, 20);
+        assert_eq!(view.caret_cell(&tab), None);
+        let (_, caret, _) = draw(&mut view, Some(&tab), 12, 10);
+        assert_eq!(caret, None);
+        assert_eq!(view.caret_cell(&tab), None);
+    }
+
+    #[test]
+    fn rect_is_the_last_rendered_editor_rect() {
+        let tab = tab(1, "abc");
+        let mut view = BufferView::default();
+        assert_eq!(view.rect(), Rect::default());
+        draw(&mut view, Some(&tab), 12, 3);
+        assert_eq!(view.rect(), Rect::new(GUTTER, 0, 12 - GUTTER, 3));
+        draw(&mut view, None, 20, 5);
+        assert_eq!(view.rect(), Rect::new(GUTTER, 0, 20 - GUTTER, 5));
     }
 
     #[test]

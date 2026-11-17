@@ -94,7 +94,7 @@ pub fn render(
         painter.draw_row(view, row, editor.x, y);
     }
 
-    caret_position(view, editor)
+    caret_cell(view.layout, view.text, view.top_row, view.caret, editor)
 }
 
 /// The diagnostics of `view` whose chars intersect the chars of the
@@ -119,17 +119,26 @@ fn visible_diagnostics<'d>(view: &RowsView<'d>, height: u16) -> Vec<&'d Diagnost
         .collect()
 }
 
-/// The caret's screen position, if it is on screen.
-fn caret_position(view: &RowsView<'_>, editor: Rect) -> Option<Position> {
-    let caret_row = view.layout.row_of_char(view.caret);
-    let offset = caret_row.checked_sub(view.top_row)?;
+/// The screen cell of the char index `caret` in `text`, laid out by
+/// `layout` and drawn into `editor` from visual row `top_row`.
+///
+/// `None` when the caret's row is above `top_row` or at or below the
+/// editor's bottom, or when its column is at or past the editor's right
+/// edge.
+pub(crate) fn caret_cell(
+    layout: &WrapLayout,
+    text: &str,
+    top_row: usize,
+    caret: usize,
+    editor: Rect,
+) -> Option<Position> {
+    let caret_row = layout.row_of_char(caret);
+    let offset = caret_row.checked_sub(top_row)?;
     if offset >= usize::from(editor.height) {
         return None;
     }
     let y = editor.y.saturating_add(u16::try_from(offset).ok()?);
-    let x = editor
-        .x
-        .saturating_add(view.layout.column_of_char(view.text, view.caret));
+    let x = editor.x.saturating_add(layout.column_of_char(text, caret));
     (x < editor.right()).then_some(Position { x, y })
 }
 
