@@ -243,7 +243,7 @@ impl TermApp {
             Action::ToggleFocus => {
                 if self.sidebar_shown() {
                     self.set_focus(match self.focus {
-                        Focus::Editor => Focus::Sidebar,
+                        Focus::Editor | Focus::Find(_) => Focus::Sidebar,
                         Focus::Sidebar => Focus::Editor,
                     });
                 }
@@ -424,7 +424,7 @@ impl TermApp {
     /// that tab, if any.
     fn send(&mut self, command: Command, now: Instant) {
         let selection = match self.focus {
-            Focus::Editor => self
+            Focus::Editor | Focus::Find(_) => self
                 .editor
                 .active_tab()
                 .and_then(|tab| self.buffer.selection(tab.id)),

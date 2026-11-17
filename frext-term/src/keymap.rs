@@ -4,12 +4,18 @@
 //! It covers the tab, search and focus shortcuts, and, while the editor
 //! has focus, the editing keys: typing, deleting, caret motion (Shift
 //! extends the selection), clipboard, and undo/redo.
+//!
+//! While the search bar is open, Alt+C / Alt+W / Alt+R / Alt+L toggle
+//! match case, whole word, regex and in-selection, whatever has focus.
+//! While a find-bar field has focus only the global keys are bound; the
+//! rest are left unbound so the front end can hand them to the field.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use frext_core::editor::{Command, SearchBar, StepDirection};
+use frext_core::editor::{Command, SearchBar, SearchOption, StepDirection};
 
 use crate::buffer::cursor::{Motion, Selecting};
 use crate::buffer::edit::EditAction;
+use crate::find_bar::FindField;
 use crate::terminal::KeyboardMode;
 
 /// Which pane receives keyboard input outside of a prompt.
@@ -19,6 +25,8 @@ pub enum Focus {
     Editor,
     /// The file-tree sidebar.
     Sidebar,
+    /// A field of the find bar.
+    Find(FindField),
 }
 
 /// What a key press asks the terminal front end to do.
@@ -61,6 +69,11 @@ pub fn action_for(key: KeyEvent, ctx: KeyContext) -> Option<Action> {
     }
     if let Some(letter) = ctrl_letter(key) {
         return ctrl_letter_action(letter, key, ctx);
+    }
+    if ctx.search_open
+        && let Some(option) = search_toggle(key)
+    {
+        return Some(Action::Command(Command::ToggleSearchOption(option)));
     }
     let mods = key.modifiers;
     match key.code {
@@ -115,6 +128,23 @@ fn editing_key(code: KeyCode, mods: KeyModifiers) -> Option<EditAction> {
         KeyCode::End => motion(Motion::RowEnd, Motion::DocEnd),
         KeyCode::PageUp => motion(Motion::PageUp, Motion::PageUp),
         KeyCode::PageDown => motion(Motion::PageDown, Motion::PageDown),
+        _ => None,
+    }
+}
+
+/// The search option an exactly-Alt letter toggles, if `key` is one.
+fn search_toggle(key: KeyEvent) -> Option<SearchOption> {
+    let KeyCode::Char(c) = key.code else {
+        return None;
+    };
+    if key.modifiers != KeyModifiers::ALT {
+        return None;
+    }
+    match c.to_ascii_lowercase() {
+        'c' => Some(SearchOption::CaseSensitive),
+        'w' => Some(SearchOption::WholeWord),
+        'r' => Some(SearchOption::Regex),
+        'l' => Some(SearchOption::InSelection),
         _ => None,
     }
 }
@@ -689,5 +719,126 @@ mod tests {
             action_for(ctrl('h'), ctx()),
             cmd(Command::OpenSearch(SearchBar::FindReplace))
         );
+    }
+
+    fn finding() -> KeyContext {
+        KeyContext {
+            focus: Focus::Find(FindField::Pattern),
+            ..searching()
+        }
+    }
+
+    fn alt(c: char) -> KeyEvent {
+        key(KeyCode::Char(c), KeyModifiers::ALT)
+    }
+
+    fn toggle(option: SearchOption) -> Option<Action> {
+        cmd(Command::ToggleSearchOption(option))
+    }
+
+    const TOGGLES: [(char, SearchOption); 4] = [
+        ('c', SearchOption::CaseSensitive),
+        ('w', SearchOption::WholeWord),
+        ('r', SearchOption::Regex),
+        ('l', SearchOption::InSelection),
+    ];
+
+    #[test]
+    fn alt_letters_toggle_search_options_when_search_open() {
+        for (c, option) in TOGGLES {
+            assert_eq!(action_for(alt(c), searching()), toggle(option), "Alt+{c}");
+        }
+    }
+
+    #[test]
+    fn alt_toggles_are_unbound_when_search_closed() {
+        for (c, _) in TOGGLES {
+            assert_eq!(action_for(alt(c), ctx()), None, "Alt+{c}");
+        }
+    }
+
+    #[test]
+    fn alt_toggle_matches_an_upper_case_letter() {
+        assert_eq!(
+            action_for(alt('C'), searching()),
+            toggle(SearchOption::CaseSensitive)
+        );
+    }
+
+    #[test]
+    fn alt_toggle_needs_exactly_alt() {
+        for mods in [
+            KeyModifiers::ALT | KeyModifiers::SHIFT,
+            KeyModifiers::CONTROL | KeyModifiers::ALT,
+        ] {
+            assert_eq!(
+                action_for(key(KeyCode::Char('c'), mods), searching()),
+                None,
+                "{mods:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn alt_toggles_work_in_any_focus() {
+        let sidebar_searching = KeyContext {
+            search_open: true,
+            ..sidebar()
+        };
+        let replacing = KeyContext {
+            focus: Focus::Find(FindField::Replacement),
+            ..searching()
+        };
+        for c in [sidebar_searching, finding(), replacing] {
+            for (letter, option) in TOGGLES {
+                assert_eq!(action_for(alt(letter), c), toggle(option), "Alt+{letter}");
+            }
+        }
+    }
+
+    #[test]
+    fn editing_keys_are_unbound_in_find_focus() {
+        for k in [
+            plain(KeyCode::Char('a')),
+            plain(KeyCode::Enter),
+            plain(KeyCode::Tab),
+            plain(KeyCode::Backspace),
+            plain(KeyCode::Left),
+            ctrl('a'),
+            ctrl('v'),
+            ctrl('z'),
+        ] {
+            assert_eq!(action_for(k, finding()), None, "{k:?}");
+        }
+    }
+
+    #[test]
+    fn global_keys_work_in_find_focus() {
+        assert_eq!(
+            action_for(ctrl('f'), finding()),
+            cmd(Command::OpenSearch(SearchBar::Find))
+        );
+        assert_eq!(action_for(ctrl('s'), finding()), cmd(Command::Save));
+        assert_eq!(
+            action_for(plain(KeyCode::F(3)), finding()),
+            cmd(Command::StepMatch(StepDirection::Forward))
+        );
+        assert_eq!(
+            action_for(key(KeyCode::F(3), KeyModifiers::SHIFT), finding()),
+            cmd(Command::StepMatch(StepDirection::Backward))
+        );
+        assert_eq!(
+            action_for(plain(KeyCode::Esc), finding()),
+            cmd(Command::CloseSearch)
+        );
+    }
+
+    #[test]
+    fn legacy_ctrl_h_is_unbound_in_find_focus() {
+        let legacy_finding = KeyContext {
+            keyboard: KeyboardMode::Legacy,
+            ..finding()
+        };
+        assert_eq!(action_for(ctrl('h'), legacy_finding), None);
     }
 }
