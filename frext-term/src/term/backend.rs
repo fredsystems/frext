@@ -10,6 +10,10 @@
 //! (`CSI 4:3 m`) when the backend's [`UnderlineStyle`] is
 //! [`UnderlineStyle::Curly`]; every other underline is straight. A frame
 //! with no underline colour produces exactly the stock bytes.
+//!
+//! The upstream copyright and licence notice are kept in
+//! `ATTRIBUTIONS.md` and `assets/licenses/ratatui-LICENSE` at the
+//! repository root.
 
 use std::io::{self, Write};
 

@@ -233,7 +233,8 @@ fn to_timespec(duration: Duration) -> Timespec {
 /// Writes [`query`] to `out`, reads the replies from `input` with
 /// [`read_replies`] and parses them. Under tmux the read waits
 /// [`TMUX_SETTLE`] after the DA1 reply for a late kitty graphics reply.
-/// The raw replies are logged at `debug`.
+/// The recognised reply sequences are logged at `debug`; other bytes,
+/// such as text typed during the probe, are left out of the log.
 ///
 /// # Errors
 ///
@@ -251,8 +252,31 @@ pub fn probe(
         Multiplexer::None => Settle::AtDa1,
     };
     let bytes = read_replies(input, timeout, settle)?;
-    log::debug!("terminal probe replies: {}", bytes.escape_ascii());
+    log::debug!(
+        "terminal probe replies: {}",
+        reply_sequences(&bytes).escape_ascii()
+    );
     Ok(parse(&bytes))
+}
+
+/// Returns only the complete escape sequences in `bytes` that the
+/// tokenizer recognises (CSI, DCS, APC, OSC), byte for byte. Stray
+/// bytes and a sequence cut off at the end are dropped.
+fn reply_sequences(bytes: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut input = bytes;
+    loop {
+        match step(input) {
+            Step::End => break,
+            Step::Skip(rest) => input = rest,
+            Step::Token(_, rest) => {
+                let consumed = input.len().saturating_sub(rest.len());
+                out.extend_from_slice(input.get(..consumed).unwrap_or_default());
+                input = rest;
+            }
+        }
+    }
+    out
 }
 
 /// One complete escape sequence.
@@ -727,6 +751,29 @@ mod tests {
         assert_eq!(replies.keyboard_flags, Some(0));
         assert_eq!(replies.end, ReplyEnd::Da1);
         assert_eq!(replies.kitty_graphics, KittyReply::Missing);
+    }
+
+    #[test]
+    fn reply_sequences_keeps_a_fixture_unchanged() {
+        assert_eq!(reply_sequences(KITTY), KITTY);
+    }
+
+    #[test]
+    fn reply_sequences_drops_typed_text() {
+        let first = b"\x1b_Gi=31;OK\x1b\\";
+        assert!(KITTY.starts_with(first));
+        let mut input = b"hello".to_vec();
+        input.extend_from_slice(first);
+        input.push(b'x');
+        input.extend_from_slice(KITTY.get(first.len()..).unwrap());
+        assert_eq!(reply_sequences(&input), KITTY);
+    }
+
+    #[test]
+    fn reply_sequences_drops_a_cut_off_sequence() {
+        let mut input = KITTY.to_vec();
+        input.extend_from_slice(b"\x1bP>|cut");
+        assert_eq!(reply_sequences(&input), KITTY);
     }
 
     #[test]
