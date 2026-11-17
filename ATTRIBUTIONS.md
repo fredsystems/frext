@@ -1,8 +1,8 @@
 # Attributions
 
 frext is licensed under the [MIT License](LICENSE). It also bundles a font
-asset from a third party whose license requires attribution. That component and
-its license are listed below.
+asset and contains source code adapted from third parties whose licenses require
+attribution. Those components and their licenses are listed below.
 
 This document is the single source of truth for attribution: the README points
 here rather than duplicating license text.
@@ -29,3 +29,18 @@ synthesises slant and weight, so dedicated bold/italic faces are not embedded.
 The `Cove`/Code variant is used because it carries the coding ligatures
 (`->`, `=>`, `!=`, …) that frext's editor relies on; the `CaskaydiaMono` variant
 strips them.
+
+## Adapted source code
+
+The following source code is adapted from a third-party project. The full
+upstream license text is bundled under [`assets/licenses/`](assets/licenses/).
+
+### ratatui-crossterm
+
+- **Upstream:** ratatui — <https://github.com/ratatui/ratatui> (crate
+  `ratatui-crossterm` 0.1.2)
+- **License:** MIT License; copyright Florian Dehau and The Ratatui Developers.
+- **License text:**
+  [`assets/licenses/ratatui-LICENSE`](assets/licenses/ratatui-LICENSE)
+- **Files:** `frext-term/src/term/backend.rs` — its `FrextBackend` draw loop,
+  `Backend` methods and `ModifierDiff` are adapted from `CrosstermBackend`.

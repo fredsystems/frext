@@ -1,13 +1,22 @@
 //! Terminal lifecycle: raw mode, the alternate screen, mouse capture,
 //! bracketed paste and the keyboard enhancement flags.
 //!
-//! [`TerminalGuard::enter`] sets everything up and [`restore`] undoes
-//! it. Restoring runs on drop and from a panic hook, so the user's
+//! [`TerminalGuard::enter`] probes the terminal's capabilities and sets
+//! everything up, and [`restore`] undoes it. The unified probe
+//! ([`crate::term::probe`]) replaces crossterm's keyboard enhancement
+//! check. It runs inside the alternate screen, which the setup
+//! sequences then clear, so a terminal that prints the queries leaves no
+//! trace. It runs before any event reader exists, so no other reader
+//! can swallow its replies. It reads the same tty crossterm reads:
+//! stdin when that is a terminal, `/dev/tty` otherwise.
+//!
+//! Restoring runs on drop and from a panic hook, so the user's
 //! terminal is left usable however the editor exits. The hook only
 //! restores for a panic on the UI thread; a panic on a worker thread
 //! (which may be caught and recovered from) is just logged.
 
-use std::io::{self, Stdout, Write};
+use std::fs::File;
+use std::io::{self, IsTerminal, Stdout, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Once, OnceLock};
 use std::thread::ThreadId;
@@ -17,12 +26,17 @@ use crossterm::event::{
     KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use crossterm::terminal::{
-    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
-    supports_keyboard_enhancement,
+    Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
 use crossterm::{cursor, queue};
+use frext_core::config::TermConfig;
 use ratatui::Terminal;
-use ratatui::backend::CrosstermBackend;
+
+use crate::term::backend::FrextBackend;
+use crate::term::caps::{
+    KeyboardProtocol, Multiplexer, TermEnv, TerminalCaps, detect_multiplexer, resolve,
+};
+use crate::term::probe::{PROBE_TIMEOUT, Replies, ReplyEnd, probe};
 
 /// Whether the terminal is currently set up and needs restoring.
 static ACTIVE: AtomicBool = AtomicBool::new(false);
@@ -43,11 +57,37 @@ pub enum KeyboardMode {
     Legacy,
 }
 
+impl KeyboardMode {
+    /// The keyboard mode for a detected keyboard `protocol`: the kitty
+    /// protocol (with any flags) is [`KeyboardMode::Enhanced`], legacy
+    /// input is [`KeyboardMode::Legacy`].
+    #[must_use]
+    pub const fn from_protocol(protocol: KeyboardProtocol) -> Self {
+        match protocol {
+            KeyboardProtocol::Kitty { .. } => Self::Enhanced,
+            KeyboardProtocol::Legacy => Self::Legacy,
+        }
+    }
+}
+
+/// Write the sequence entering the alternate screen to `out` and flush
+/// it. [`write_restore`] leaves the alternate screen again.
+///
+/// # Errors
+///
+/// Returns any I/O error from writing or flushing `out`.
+pub fn write_enter(out: &mut impl Write) -> io::Result<()> {
+    queue!(out, EnterAlternateScreen)?;
+    out.flush()
+}
+
 /// Write the setup sequences for `mode` to `out` and flush it.
 ///
-/// Enters the alternate screen and enables mouse capture and bracketed
+/// Clears the screen (wiping anything a terminal printed in response to
+/// the probe's queries), then enables mouse capture and bracketed
 /// paste; in [`KeyboardMode::Enhanced`] it also pushes the
-/// disambiguate-escape-codes keyboard flag.
+/// disambiguate-escape-codes keyboard flag. The alternate screen is
+/// entered separately, by [`write_enter`].
 ///
 /// # Errors
 ///
@@ -55,7 +95,7 @@ pub enum KeyboardMode {
 pub fn write_setup(out: &mut impl Write, mode: KeyboardMode) -> io::Result<()> {
     queue!(
         out,
-        EnterAlternateScreen,
+        Clear(ClearType::All),
         EnableMouseCapture,
         EnableBracketedPaste
     )?;
@@ -68,8 +108,9 @@ pub fn write_setup(out: &mut impl Write, mode: KeyboardMode) -> io::Result<()> {
     out.flush()
 }
 
-/// Write the inverse of [`write_setup`] for `mode` to `out`, in reverse
-/// order, then show the cursor and flush.
+/// Write the inverse of [`write_enter`] followed by [`write_setup`] for
+/// `mode` to `out`, in reverse order (leaving the alternate screen
+/// last), then show the cursor and flush.
 ///
 /// # Errors
 ///
@@ -92,37 +133,52 @@ pub fn write_restore(out: &mut impl Write, mode: KeyboardMode) -> io::Result<()>
 #[derive(Debug)]
 pub struct TerminalGuard {
     mode: KeyboardMode,
+    caps: TerminalCaps,
+    probe_end: ReplyEnd,
 }
 
 impl TerminalGuard {
     /// Put the terminal into editor mode and build the ratatui
     /// [`Terminal`].
     ///
-    /// Enables raw mode, detects keyboard enhancement support, writes the
-    /// setup sequences, records the calling thread as the UI thread, and
+    /// Enables raw mode and enters the alternate screen, then runs the
+    /// unified terminal probe and resolves the [`TerminalCaps`] from its
+    /// replies, the environment and `settings`; the probe replaces
+    /// crossterm's keyboard enhancement check, and the keyboard mode
+    /// follows the detected protocol. The probe reads the tty crossterm
+    /// reads (stdin when it is a terminal, `/dev/tty` otherwise) before
+    /// any event reader exists, so its replies are not swallowed by
+    /// another reader; a probe I/O error is logged and treated as no
+    /// replies. It then writes the setup sequences (which first clear the
+    /// screen, wiping anything a terminal printed in response to the
+    /// queries), records the calling thread as the UI thread, and
     /// installs a panic hook that restores the terminal when the UI
-    /// thread panics. If any step fails, what was done is undone.
+    /// thread panics. If any setup step fails, what was done is undone.
     ///
     /// # Errors
     ///
     /// Returns any I/O error from enabling raw mode, writing the setup
     /// sequences, or creating the terminal.
-    pub fn enter() -> io::Result<(Self, Terminal<CrosstermBackend<Stdout>>)> {
+    pub fn enter(settings: TermConfig) -> io::Result<(Self, Terminal<FrextBackend<Stdout>>)> {
         enable_raw_mode()?;
-        // Queried before any event reader exists, so the reply is not
-        // swallowed by another reader.
-        let mode = if matches!(supports_keyboard_enhancement(), Ok(true)) {
-            KeyboardMode::Enhanced
-        } else {
-            KeyboardMode::Legacy
+        if let Err(err) = write_enter(&mut io::stdout()) {
+            undo_setup(KeyboardMode::Legacy);
+            return Err(err);
+        }
+        let env = TermEnv::from_process();
+        let multiplexer = detect_multiplexer(&env);
+        let replies = match run_probe(multiplexer) {
+            Ok(replies) => replies,
+            Err(err) => {
+                log::warn!("terminal probe failed: {err}");
+                Replies::default()
+            }
         };
+        let caps = resolve(&replies, &env, settings);
+        log::info!("terminal caps: {caps:?}");
+        let mode = KeyboardMode::from_protocol(caps.keyboard);
         if let Err(err) = write_setup(&mut io::stdout(), mode) {
-            if let Err(undo) = write_restore(&mut io::stdout(), mode) {
-                log::error!("failed to undo terminal setup: {undo}");
-            }
-            if let Err(undo) = disable_raw_mode() {
-                log::error!("failed to disable raw mode: {undo}");
-            }
+            undo_setup(mode);
             return Err(err);
         }
         ENHANCED.store(mode == KeyboardMode::Enhanced, Ordering::SeqCst);
@@ -131,8 +187,13 @@ impl TerminalGuard {
         let _ = UI_THREAD.set(std::thread::current().id());
         install_panic_hook();
         // From here on, an early return drops the guard, which restores.
-        let guard = Self { mode };
-        let terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
+        let underline = caps.underline;
+        let guard = Self {
+            mode,
+            caps,
+            probe_end: replies.end,
+        };
+        let terminal = Terminal::new(FrextBackend::new(io::stdout(), underline))?;
         Ok((guard, terminal))
     }
 
@@ -140,6 +201,51 @@ impl TerminalGuard {
     #[must_use]
     pub const fn mode(&self) -> KeyboardMode {
         self.mode
+    }
+
+    /// The terminal capabilities resolved by [`TerminalGuard::enter`].
+    #[must_use]
+    pub const fn caps(&self) -> &TerminalCaps {
+        &self.caps
+    }
+
+    /// How the startup probe's replies ended; [`ReplyEnd::Incomplete`]
+    /// after a probe error.
+    #[must_use]
+    pub const fn probe_end(&self) -> ReplyEnd {
+        self.probe_end
+    }
+}
+
+/// Undo a partial setup for `mode` after a setup step failed: write the
+/// restore sequences and disable raw mode, logging any error.
+fn undo_setup(mode: KeyboardMode) {
+    if let Err(undo) = write_restore(&mut io::stdout(), mode) {
+        log::error!("failed to undo terminal setup: {undo}");
+    }
+    if let Err(undo) = disable_raw_mode() {
+        log::error!("failed to disable raw mode: {undo}");
+    }
+}
+
+/// Probe the terminal on the tty crossterm reads: stdin when it is a
+/// terminal, `/dev/tty` otherwise. The queries go to stdout, which
+/// crossterm and ratatui write to.
+///
+/// # Errors
+///
+/// Returns the error from opening `/dev/tty` or from the probe.
+fn run_probe(multiplexer: Multiplexer) -> io::Result<Replies> {
+    if io::stdin().is_terminal() {
+        probe(
+            &mut io::stdout(),
+            rustix::stdio::stdin(),
+            multiplexer,
+            PROBE_TIMEOUT,
+        )
+    } else {
+        let tty = File::open("/dev/tty")?;
+        probe(&mut io::stdout(), &tty, multiplexer, PROBE_TIMEOUT)
     }
 }
 
@@ -229,6 +335,7 @@ mod tests {
     #![allow(clippy::unwrap_used)]
 
     use super::*;
+    use crate::term::caps::UnderlineStyle;
 
     const MOUSE_ON: &str = "\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1015h\x1b[?1006h";
     const MOUSE_OFF: &str = "\x1b[?1006l\x1b[?1015l\x1b[?1003l\x1b[?1002l\x1b[?1000l";
@@ -245,17 +352,42 @@ mod tests {
         String::from_utf8(out).unwrap()
     }
 
+    fn entered() -> String {
+        let mut out = Vec::new();
+        write_enter(&mut out).unwrap();
+        String::from_utf8(out).unwrap()
+    }
+
+    #[test]
+    fn enter_bytes_enter_the_alternate_screen() {
+        assert_eq!(entered(), "\x1b[?1049h");
+    }
+
     #[test]
     fn setup_bytes_enhanced() {
-        let expected = format!("\x1b[?1049h{MOUSE_ON}\x1b[?2004h\x1b[>1u");
-        assert_eq!(setup(KeyboardMode::Enhanced), expected);
+        let bytes = setup(KeyboardMode::Enhanced);
+        assert_eq!(bytes, format!("\x1b[2J{MOUSE_ON}\x1b[?2004h\x1b[>1u"));
+        assert!(!bytes.contains("\x1b[?1049h"));
     }
 
     #[test]
     fn setup_bytes_legacy() {
         let bytes = setup(KeyboardMode::Legacy);
-        assert_eq!(bytes, format!("\x1b[?1049h{MOUSE_ON}\x1b[?2004h"));
+        assert_eq!(bytes, format!("\x1b[2J{MOUSE_ON}\x1b[?2004h"));
         assert!(!bytes.contains("\x1b[>"));
+        assert!(!bytes.contains("\x1b[?1049h"));
+    }
+
+    #[test]
+    fn enter_then_setup_is_the_full_setup() {
+        assert_eq!(
+            entered() + &setup(KeyboardMode::Enhanced),
+            format!("\x1b[?1049h\x1b[2J{MOUSE_ON}\x1b[?2004h\x1b[>1u")
+        );
+        assert_eq!(
+            entered() + &setup(KeyboardMode::Legacy),
+            format!("\x1b[?1049h\x1b[2J{MOUSE_ON}\x1b[?2004h")
+        );
     }
 
     #[test]
@@ -287,10 +419,52 @@ mod tests {
     fn mode_reports_the_detected_mode() {
         // Built directly: entering for real would touch the test
         // runner's terminal. ACTIVE stays false, so the drop is a no-op.
+        let caps = TerminalCaps {
+            underline: UnderlineStyle::Curly,
+            keyboard: KeyboardProtocol::Legacy,
+            version: Some("test".to_owned()),
+            ..TerminalCaps::default()
+        };
         let guard = TerminalGuard {
             mode: KeyboardMode::Legacy,
+            caps: caps.clone(),
+            probe_end: ReplyEnd::Da1,
         };
         assert_eq!(guard.mode(), KeyboardMode::Legacy);
+        assert_eq!(guard.caps(), &caps);
+    }
+
+    #[test]
+    fn probe_end_reports_what_the_guard_was_built_with() {
+        // Built directly, as above: ACTIVE stays false.
+        for end in [ReplyEnd::Da1, ReplyEnd::Incomplete] {
+            let guard = TerminalGuard {
+                mode: KeyboardMode::Legacy,
+                caps: TerminalCaps::default(),
+                probe_end: end,
+            };
+            assert_eq!(guard.probe_end(), end);
+        }
+    }
+
+    #[test]
+    fn from_protocol_maps_kitty_to_enhanced() {
+        assert_eq!(
+            KeyboardMode::from_protocol(KeyboardProtocol::Kitty { flags: 0 }),
+            KeyboardMode::Enhanced
+        );
+        assert_eq!(
+            KeyboardMode::from_protocol(KeyboardProtocol::Kitty { flags: 31 }),
+            KeyboardMode::Enhanced
+        );
+    }
+
+    #[test]
+    fn from_protocol_maps_legacy_to_legacy() {
+        assert_eq!(
+            KeyboardMode::from_protocol(KeyboardProtocol::Legacy),
+            KeyboardMode::Legacy
+        );
     }
 
     fn other_thread_id() -> ThreadId {

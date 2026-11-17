@@ -1,6 +1,6 @@
 # 05 -- TUI file-tree sidebar
 
-- **Status:** pending merge
+- **Status:** complete
 - **Depends on:** 02
 - **Branch:** `feat/frext-term-file-tree` (one branch, one commit per
   subtask, one PR)

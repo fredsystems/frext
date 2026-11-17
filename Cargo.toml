@@ -32,9 +32,11 @@ log = "0.4.35"
 ratatui = { version = "0.30.2", default-features = false, features = ["crossterm", "layout-cache", "underline-color"] }
 regex = "1.13.1"
 rfd = "0.18.0"
+rustix = { version = "1.1.6", features = ["event", "stdio"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 thiserror = "2.0.21"
+toml = { version = "1.2.1", default-features = false, features = ["parse", "serde"] }
 trash = { version = "5.3.0", default-features = false, features = ["freedesktop"] }
 ttf-parser = "0.25.1"
 two-face = "0.5.2"

@@ -4,3 +4,4 @@ egui
 eframe
 flate
 ratatui
+iterm

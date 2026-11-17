@@ -4,16 +4,25 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Instant;
 
+use frext_core::config::Config;
 use frext_core::editor::Editor;
 use frext_core::persistence::{Profile, Store};
 use frext_term::app::TermApp;
 use frext_term::clipboard::{ClipboardChoice, make_clipboard};
 use frext_term::events::{EventLoop, TICK};
+use frext_term::term::caps::IconChoice;
+use frext_term::term::late_replies::{self, LateReplyFilter};
 use frext_term::terminal::TerminalGuard;
 use frext_term::{cli, logging, run};
 
 fn main() -> ExitCode {
-    let args = cli::parse(std::env::args_os().skip(1));
+    let args = match cli::parse(std::env::args_os().skip(1)) {
+        Ok(args) => args,
+        Err(err) => {
+            eprintln!("frext-term: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
 
     let store = match Store::new(Profile::Term) {
         Ok(store) => store,
@@ -31,6 +40,8 @@ fn main() -> ExitCode {
             log_path.display()
         );
     }
+
+    let settings = args.apply_to(Config::load().term);
 
     let choice = ClipboardChoice::from_env(
         std::env::var_os("WAYLAND_DISPLAY").as_deref(),
@@ -51,7 +62,7 @@ fn main() -> ExitCode {
     };
     let home = std::env::var_os("HOME").map(PathBuf::from);
 
-    let (guard, mut terminal) = match TerminalGuard::enter() {
+    let (guard, mut terminal) = match TerminalGuard::enter(settings) {
         Ok(entered) => entered,
         Err(err) => {
             log::error!("failed to set up the terminal: {err}");
@@ -60,14 +71,22 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    log::info!(
+        "icons: {:?}",
+        IconChoice::select(settings.icons, guard.caps())
+    );
 
     let mut app = TermApp::new(editor, guard.mode(), base, home);
 
-    // Spawned after `enter`, so the keyboard-enhancement query is not
-    // raced by the input reader.
+    // Spawned after `enter`, so the terminal probe is not raced by the
+    // input reader.
     let events = EventLoop::new();
     let spawned = events
-        .spawn_input(crossterm::event::read)
+        .spawn_input(late_replies::filtered(
+            crossterm::event::read,
+            LateReplyFilter::new(guard.probe_end(), guard.caps().multiplexer, Instant::now()),
+            Instant::now,
+        ))
         .and_then(|()| events.spawn_tick(TICK));
     if let Err(err) = spawned {
         log::error!("failed to start the event threads: {err}");
