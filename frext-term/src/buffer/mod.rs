@@ -68,9 +68,11 @@ struct Press {
     granularity: Granularity,
 }
 
-/// A drag in progress: its granularity and the range the press selected.
+/// A drag in progress: the tab it started on, its granularity and the
+/// range the press selected.
 #[derive(Debug, Clone)]
 struct Drag {
+    tab_id: u64,
     granularity: Granularity,
     origin: Range<usize>,
 }
@@ -463,6 +465,7 @@ impl BufferView {
             granularity,
         });
         self.drag = Some(Drag {
+            tab_id: tab.id,
             granularity,
             origin,
         });
@@ -470,11 +473,15 @@ impl BufferView {
 
     /// Extends a drag to the absolute cell (`column`, `row`) by the
     /// press's granularity. Above or below the editor it scrolls one row
-    /// and uses the edge row. Does nothing with no drag in progress.
+    /// and uses the edge row. Does nothing with no drag in progress, or
+    /// when `tab` is not the tab the drag started on.
     pub fn mouse_drag(&mut self, tab: &Tab, column: u16, row: u16) {
         let Some(drag) = self.drag.clone() else {
             return;
         };
+        if drag.tab_id != tab.id {
+            return;
+        }
         let rect = self.rect;
         if rect.height == 0 {
             return;
@@ -916,6 +923,25 @@ mod tests {
         // A different cell is a single click too.
         view.mouse_down(&tab, x + 1, 0, Selecting::Move, ms(base, 850));
         assert_eq!(view.selection(1), Some(8..8));
+    }
+
+    #[test]
+    fn a_drag_does_not_continue_on_another_tab() {
+        let first = tab(1, "hello world");
+        let second = tab(2, "other text here");
+        let mut view = BufferView::default();
+        draw(&mut view, Some(&first), 20, 3);
+        view.mouse_down(&first, GUTTER + 2, 0, Selecting::Move, Instant::now());
+        assert_eq!(view.selection(1), Some(2..2));
+
+        // Below the editor, so a drag on the wrong tab would also scroll.
+        view.mouse_drag(&second, GUTTER + 8, 5);
+        assert_eq!(view.selection(2), None);
+        assert_eq!(view.selection(1), Some(2..2));
+        assert!(view.is_dragging());
+
+        view.mouse_drag(&first, GUTTER + 8, 0);
+        assert_eq!(view.selection(1), Some(2..8));
     }
 
     #[test]
