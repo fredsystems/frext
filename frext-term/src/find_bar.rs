@@ -1,4 +1,5 @@
-//! The find/replace bar under the tab bar.
+//! The find bar under the tab bar: a find row, any regex-error rows,
+//! and an optional replace row.
 //!
 //! The core owns the text of both fields
 //! ([`Editor::search_pattern_mut`] / [`Editor::search_replacement_mut`]);
@@ -6,21 +7,21 @@
 //! rects they were last drawn at.
 //!
 //! Input reaches a field through [`FindBar::handle_key`],
-//! [`FindBar::click`] and [`FindBar::paste`]; each answers with a
-//! [`FindReply`] saying what the app should do next.
+//! [`FindBar::handle_click`] and [`FindBar::handle_paste`]; each key or
+//! paste answers with a [`FindReply`] saying what the app should do next.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use frext_core::editor::{Command, Editor, SearchOption, SearchState, StepDirection};
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Position, Rect};
-use ratatui::style::Style;
 use unicode_width::UnicodeWidthStr;
 
 use crate::hit::{HitMap, Target};
+use crate::paint;
 use crate::text_input::{InputOutcome, TextInput};
 use crate::theme;
 
-/// One of the bar's two text fields.
+/// One of the find bar's two text fields.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FindField {
     /// The find field.
@@ -37,9 +38,25 @@ impl FindField {
             Self::Replacement => Self::Pattern,
         }
     }
+
+    /// The text of this field, which core owns.
+    fn text(self, editor: &Editor) -> &str {
+        match self {
+            Self::Pattern => &editor.search().query().pattern,
+            Self::Replacement => editor.search().replacement(),
+        }
+    }
+
+    /// The text of this field, for editing.
+    fn text_mut(self, editor: &mut Editor) -> &mut String {
+        match self {
+            Self::Pattern => editor.search_pattern_mut(),
+            Self::Replacement => editor.search_replacement_mut(),
+        }
+    }
 }
 
-/// What the bar made of a key or a paste.
+/// What the find bar made of a key or a paste.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FindReply {
     /// A command for the app to send.
@@ -48,43 +65,73 @@ pub enum FindReply {
     Focus(FindField),
     /// The input was consumed; nothing else to do.
     Handled,
-    /// The input is not for the bar.
+    /// The input is not for the find bar.
     Ignored,
 }
 
-/// Whether `key` switches between the fields: Tab without modifiers,
-/// `BackTab`, or Shift+Tab.
-fn is_field_switch(key: KeyEvent) -> bool {
-    match key.code {
-        KeyCode::Tab => key.modifiers == KeyModifiers::NONE || key.modifiers == KeyModifiers::SHIFT,
-        KeyCode::BackTab => true,
-        _ => false,
+/// Whether a toggle button is on or off.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Toggle {
+    On,
+    Off,
+}
+
+impl Toggle {
+    /// The toggle for a state core reports as a `bool`.
+    const fn from_state(on: bool) -> Self {
+        if on { Self::On } else { Self::Off }
     }
 }
 
-/// The most regex-error rows the bar shows.
-pub const MAX_ERROR_ROWS: u16 = 4;
+/// The kind of a find-bar button.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ButtonKind {
+    /// A button that acts when pushed.
+    Push,
+    /// A button that shows an on/off state.
+    Toggle(Toggle),
+}
 
-/// The width of the match-count slot on the find row.
-pub const COUNT_WIDTH: u16 = 11;
+/// Whether `key` switches between the fields: Tab or `BackTab`, each
+/// without modifiers or with only Shift.
+fn is_field_switch(key: KeyEvent) -> bool {
+    matches!(key.code, KeyCode::Tab | KeyCode::BackTab)
+        && (key.modifiers == KeyModifiers::NONE || key.modifiers == KeyModifiers::SHIFT)
+}
+
+/// Whether `key` is Enter with Ctrl or Alt held, which the find bar
+/// reserves.
+fn is_modified_enter(key: KeyEvent) -> bool {
+    key.code == KeyCode::Enter
+        && key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+}
+
+/// The most regex-error rows the find bar shows.
+const MAX_ERROR_ROWS: u16 = 4;
+
+/// The width of the match-count slot on the find row. A longer count
+/// label is cut to it.
+const COUNT_WIDTH: u16 = 11;
 
 /// Every cell of the find row except the find field.
-pub const FIXED_WIDTH: u16 = 66;
+const FIXED_WIDTH: u16 = 66;
 
 /// The narrowest the fields get (before clipping to the row).
-pub const MIN_FIELD_WIDTH: u16 = 10;
+const MIN_FIELD_WIDTH: u16 = 10;
 
 /// The widest the fields get.
-pub const MAX_FIELD_WIDTH: u16 = 40;
+const MAX_FIELD_WIDTH: u16 = 40;
 
 /// The placeholder drawn over an empty find field.
-pub const PATTERN_HINT: &str = "search…";
+const PATTERN_HINT: &str = "search...";
 
 /// The placeholder drawn over an empty "With" field.
-pub const REPLACEMENT_HINT: &str = "replacement…";
+const REPLACEMENT_HINT: &str = "replacement...";
 
 /// The placeholder drawn over an empty "With" field while regex is on.
-pub const REGEX_REPLACEMENT_HINT: &str = "replacement ($1 for groups)…";
+const REGEX_REPLACEMENT_HINT: &str = "replacement ($1 for groups)...";
 
 /// The label in front of the find field.
 const FIND_LABEL: &str = " Find ";
@@ -92,9 +139,25 @@ const FIND_LABEL: &str = " Find ";
 /// The label in front of the "With" field.
 const WITH_LABEL: &str = " With ";
 
-/// The width of both fields on a bar `width` columns wide.
-#[must_use]
-pub fn field_width(width: u16) -> u16 {
+/// The find-row buttons between the find field and the match count, in
+/// row order.
+const FIND_BUTTONS_BEFORE_COUNT: [(&str, Target); 6] = [
+    ("[Aa]", Target::FindOption(SearchOption::CaseSensitive)),
+    ("[W]", Target::FindOption(SearchOption::WholeWord)),
+    ("[.*]", Target::FindOption(SearchOption::Regex)),
+    ("[sel]", Target::FindOption(SearchOption::InSelection)),
+    ("[Prev]", Target::FindPrev),
+    ("[Next]", Target::FindNext),
+];
+
+/// The find-row buttons after the match count, in row order.
+const FIND_BUTTONS_AFTER_COUNT: [(&str, Target); 2] = [
+    ("[Replace]", Target::FindReplaceRow),
+    ("[x]", Target::FindClose),
+];
+
+/// The width of both fields on a find bar `width` columns wide.
+fn field_width(width: u16) -> u16 {
     width
         .saturating_sub(FIXED_WIDTH)
         .clamp(MIN_FIELD_WIDTH, MAX_FIELD_WIDTH)
@@ -111,16 +174,17 @@ fn cap_lines(mut lines: Vec<String>) -> Vec<String> {
     lines
 }
 
-/// The regex-error rows of the bar (none without an error).
+/// The regex-error rows of the find bar (none without an error).
 #[must_use]
-pub fn error_lines(search: &SearchState) -> Vec<String> {
+pub(crate) fn error_lines(search: &SearchState) -> Vec<String> {
     search.error().map_or_else(Vec::new, |err| {
         cap_lines(format!("regex: {err}").lines().map(str::to_owned).collect())
     })
 }
 
-/// The number of rows the bar takes: 0 while it is closed, otherwise the
-/// find row, the error rows and the replace row (when shown).
+/// The number of rows the find bar takes: 0 while it is closed,
+/// otherwise the find row, the error rows and the replace row (when
+/// shown).
 #[must_use]
 pub fn height(search: &SearchState) -> u16 {
     if !search.is_open() {
@@ -136,34 +200,14 @@ fn text_width(text: &str) -> u16 {
     u16::try_from(UnicodeWidthStr::width(text)).unwrap_or(u16::MAX)
 }
 
-/// Resets every cell of `area` and gives it `style`.
-fn fill(buf: &mut Buffer, area: Rect, style: Style) {
-    for position in area.positions() {
-        buf[position].reset();
-        buf[position].set_style(style);
-    }
-}
-
-/// The style of a button: `on` toggles use [`theme::toggle_on`], the
-/// rest use the chrome, with the hover background while `hovered`.
-fn button_style(on: bool, hovered: bool) -> Style {
-    if on {
-        theme::toggle_on()
-    } else if hovered {
-        theme::chrome().bg(theme::hover_bg())
-    } else {
-        theme::chrome()
-    }
-}
-
-/// Whether the search option `option` is on.
-fn option_on(search: &SearchState, option: SearchOption) -> bool {
-    let query = search.query();
-    match option {
-        SearchOption::CaseSensitive => query.case_sensitive,
-        SearchOption::WholeWord => query.whole_word,
-        SearchOption::Regex => query.regex,
-        SearchOption::InSelection => search.in_selection(),
+/// The kind of the find-row button that pushes `target`: the option
+/// toggles and the replace-row toggle show their state, the rest are
+/// push buttons.
+fn find_button_kind(search: &SearchState, target: Target) -> ButtonKind {
+    match target {
+        Target::FindOption(option) => ButtonKind::Toggle(Toggle::from_state(search.option(option))),
+        Target::FindReplaceRow => ButtonKind::Toggle(Toggle::from_state(search.replace_open())),
+        _ => ButtonKind::Push,
     }
 }
 
@@ -173,7 +217,7 @@ struct DrawnField {
     cursor: Option<Position>,
 }
 
-/// One row of the bar, laid out left to right.
+/// One row of the find bar, laid out left to right.
 ///
 /// Once an item does not fit, the row is clipped: nothing after it is
 /// drawn.
@@ -188,7 +232,7 @@ struct Row<'a> {
 }
 
 impl<'a> Row<'a> {
-    fn new(
+    const fn new(
         area: Rect,
         y: u16,
         hovered: Option<Target>,
@@ -222,33 +266,50 @@ impl<'a> Row<'a> {
 
     /// Takes a `width`-cell slot after a one-cell gap, or clips the row
     /// if the slot does not fit whole.
-    fn slot(&mut self, width: u16) -> Option<Rect> {
+    const fn slot(&mut self, width: u16) -> Option<Rect> {
         if self.clipped {
             return None;
         }
-        let start = self.x.saturating_add(1);
-        let end = start.saturating_add(width);
-        if end > self.right || end == u16::MAX {
+        let Some(start) = self.x.checked_add(1) else {
             self.clipped = true;
             return None;
+        };
+        match start.checked_add(width) {
+            Some(end) if end <= self.right => {
+                self.x = end;
+                Some(Rect::new(start, self.y, width, 1))
+            }
+            _ => {
+                self.clipped = true;
+                None
+            }
         }
-        self.x = end;
-        Some(Rect::new(start, self.y, width, 1))
     }
 
-    /// Draws a button labelled `label` that pushes `target`.
-    fn button(&mut self, label: &str, target: Target, on: bool) {
+    /// Draws a button labelled `label` that pushes `target`. An on toggle
+    /// uses [`theme::toggle_on`]; any other button uses the chrome, with
+    /// the hover background while `target` is hovered.
+    fn button(&mut self, label: &str, target: Target, kind: ButtonKind) {
         let Some(rect) = self.slot(text_width(label)) else {
             return;
         };
-        let style = button_style(on, self.hovered == Some(target));
+        let style = match kind {
+            ButtonKind::Toggle(Toggle::On) => theme::toggle_on(),
+            ButtonKind::Push | ButtonKind::Toggle(Toggle::Off) => {
+                if self.hovered == Some(target) {
+                    theme::chrome().bg(theme::hover_bg())
+                } else {
+                    theme::chrome()
+                }
+            }
+        };
         self.buf
             .set_stringn(rect.x, rect.y, label, usize::from(rect.width), style);
         self.hits.push(rect, target);
     }
 
     /// Draws the match count in its slot.
-    fn count(&mut self, label: &str) {
+    fn match_count(&mut self, label: &str) {
         let Some(rect) = self.slot(COUNT_WIDTH) else {
             return;
         };
@@ -294,7 +355,7 @@ impl<'a> Row<'a> {
     }
 }
 
-/// The view state of the find/replace bar.
+/// The view state of the find bar.
 #[derive(Debug, Default)]
 pub struct FindBar {
     pattern: TextInput,
@@ -304,7 +365,7 @@ pub struct FindBar {
 }
 
 impl FindBar {
-    /// A bar with both cursors at the start.
+    /// A find bar with both cursors at the start.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
@@ -318,29 +379,25 @@ impl FindBar {
         }
     }
 
-    /// The text of `field`, which core owns.
-    fn text(editor: &Editor, field: FindField) -> &str {
+    /// Where `field` was last drawn, if it was.
+    const fn rect(&self, field: FindField) -> Option<Rect> {
         match field {
-            FindField::Pattern => &editor.search().query().pattern,
-            FindField::Replacement => editor.search().replacement(),
-        }
-    }
-
-    /// The text of `field`, for editing.
-    fn text_mut(editor: &mut Editor, field: FindField) -> &mut String {
-        match field {
-            FindField::Pattern => editor.search_pattern_mut(),
-            FindField::Replacement => editor.search_replacement_mut(),
+            FindField::Pattern => self.pattern_rect,
+            FindField::Replacement => self.replacement_rect,
         }
     }
 
     /// Handles one key event in the focused `field`.
     ///
-    /// Tab, `BackTab` and Shift+Tab switch fields while the replace row is
-    /// shown. Every other key goes to the field's [`TextInput`]: an edit
-    /// of the find field recomputes the matches, Enter in the find field
-    /// steps to the next match (the previous one with Shift), and Enter
-    /// in the "With" field replaces the current match.
+    /// Releases are [`FindReply::Ignored`]. Tab, `BackTab` and Shift+Tab
+    /// switch fields while the replace row is shown, and are
+    /// [`FindReply::Handled`] without it. Enter with Ctrl or Alt held is
+    /// reserved: [`FindReply::Handled`] in either field. Every other key
+    /// goes to the field's [`TextInput`]: an edit of the find field
+    /// recomputes the matches, Enter in the find field steps to the next
+    /// match (the previous one with Shift), Enter in the "With" field
+    /// replaces the current match, and Shift+Enter there is
+    /// [`FindReply::Handled`].
     pub fn handle_key(
         &mut self,
         editor: &mut Editor,
@@ -357,9 +414,12 @@ impl FindBar {
                 FindReply::Handled
             };
         }
+        if is_modified_enter(key) {
+            return FindReply::Handled;
+        }
         let outcome = self
             .input_mut(field)
-            .handle_key(Self::text_mut(editor, field), key);
+            .handle_key(field.text_mut(editor), key);
         let shift = key.modifiers.contains(KeyModifiers::SHIFT);
         match (field, outcome) {
             (FindField::Pattern, InputOutcome::Edited) => {
@@ -378,6 +438,9 @@ impl FindBar {
             }
             (FindField::Replacement, InputOutcome::Edited | InputOutcome::Submit)
             | (_, InputOutcome::Moved) => FindReply::Handled,
+            // Unreachable through the app: while the search is open the
+            // keymap binds Esc to `CloseSearch` before the find bar sees
+            // it. Kept for direct callers.
             (_, InputOutcome::Cancel) => FindReply::Send(Command::CloseSearch),
             (_, InputOutcome::Ignored) => FindReply::Ignored,
         }
@@ -386,39 +449,37 @@ impl FindBar {
     /// Moves `field`'s cursor to the end of its text, for when it takes
     /// the focus.
     pub fn focus_field(&mut self, editor: &Editor, field: FindField) {
-        self.input_mut(field).move_to_end(Self::text(editor, field));
+        self.input_mut(field).move_to_end(field.text(editor));
     }
 
     /// Places `field`'s cursor for a click at terminal `column`, relative
     /// to where the field was last drawn. Does nothing if it was not
     /// drawn.
-    pub fn click(&mut self, editor: &Editor, field: FindField, column: u16) {
-        let rect = match field {
-            FindField::Pattern => self.pattern_rect,
-            FindField::Replacement => self.replacement_rect,
-        };
-        if let Some(rect) = rect {
+    pub fn handle_click(&mut self, editor: &Editor, field: FindField, column: u16) {
+        if let Some(rect) = self.rect(field) {
             self.input_mut(field)
-                .click(Self::text(editor, field), column.saturating_sub(rect.x));
+                .click(field.text(editor), column.saturating_sub(rect.x));
         }
     }
 
     /// Inserts pasted `text` at `field`'s cursor, with line breaks turned
     /// into spaces. A paste into the find field recomputes the matches.
-    pub fn paste(&mut self, editor: &mut Editor, field: FindField, text: &str) -> FindReply {
+    pub fn handle_paste(&mut self, editor: &mut Editor, field: FindField, text: &str) -> FindReply {
         self.input_mut(field)
-            .insert_str(Self::text_mut(editor, field), text);
+            .insert_str(field.text_mut(editor), text);
         match field {
             FindField::Pattern => FindReply::Send(Command::RecomputeMatches),
             FindField::Replacement => FindReply::Handled,
         }
     }
 
-    /// Draws the bar into `area` and records its hit regions.
+    /// Draws the find bar into `area` and records its hit regions.
     ///
     /// Draws nothing while the search is closed. `focus` names the field
-    /// whose cursor is returned, and the item whose target is `hovered`
-    /// gets the hover background.
+    /// whose cursor is returned, and an off button whose target is
+    /// `hovered` gets the hover background. When `area` has fewer rows
+    /// than [`height`] asks for, error rows are cut first, so the replace
+    /// row stays drawn as long as there is a row for it.
     pub fn render(
         &mut self,
         editor: &Editor,
@@ -435,21 +496,22 @@ impl FindBar {
         if !search.is_open() || area.is_empty() {
             return None;
         }
-        fill(buf, area, theme::chrome());
+        paint::fill(buf, area, theme::chrome());
 
         let mut y = area.y;
         let pattern_cursor = self.render_find_row(search, hovered, area, y, buf, hits);
-        for line in error_lines(search) {
+        let error_room = area
+            .height
+            .saturating_sub(1)
+            .saturating_sub(u16::from(search.replace_open()));
+        for line in error_lines(search).iter().take(usize::from(error_room)) {
             y = y.saturating_add(1);
-            if y >= area.bottom() {
-                break;
-            }
             let room = area.width.saturating_sub(2);
             if room > 0 {
                 buf.set_stringn(
-                    area.x + 1,
+                    area.x.saturating_add(1),
                     y,
-                    &line,
+                    line,
                     usize::from(room),
                     theme::status_error(),
                 );
@@ -485,21 +547,15 @@ impl FindBar {
             &mut self.pattern,
             &search.query().pattern,
             PATTERN_HINT,
-            Target::FindInput,
+            Target::FindPattern,
         );
-        for (label, option) in [
-            ("[Aa]", SearchOption::CaseSensitive),
-            ("[W]", SearchOption::WholeWord),
-            ("[.*]", SearchOption::Regex),
-            ("[sel]", SearchOption::InSelection),
-        ] {
-            row.button(label, Target::FindOption(option), option_on(search, option));
+        for (label, target) in FIND_BUTTONS_BEFORE_COUNT {
+            row.button(label, target, find_button_kind(search, target));
         }
-        row.button("[Prev]", Target::FindPrev, false);
-        row.button("[Next]", Target::FindNext, false);
-        row.count(&search.count_label());
-        row.button("[Replace]", Target::FindReplaceRow, search.replace_open());
-        row.button("[\u{d7}]", Target::FindClose, false);
+        row.match_count(&search.count_label());
+        for (label, target) in FIND_BUTTONS_AFTER_COUNT {
+            row.button(label, target, find_button_kind(search, target));
+        }
 
         let field = field?;
         self.pattern_rect = Some(field.rect);
@@ -529,10 +585,10 @@ impl FindBar {
             &mut self.replacement,
             search.replacement(),
             hint,
-            Target::ReplaceInput,
+            Target::FindReplacement,
         );
-        row.button("[Replace]", Target::ReplaceCurrent, false);
-        row.button("[Replace all]", Target::ReplaceAll, false);
+        row.button("[Replace]", Target::FindReplaceCurrent, ButtonKind::Push);
+        row.button("[Replace all]", Target::FindReplaceAll, ButtonKind::Push);
 
         let field = field?;
         self.replacement_rect = Some(field.rect);
@@ -547,11 +603,12 @@ mod tests {
     #![allow(clippy::unwrap_used)]
 
     use std::fs;
-    use std::path::{Path, PathBuf};
+    use std::path::PathBuf;
 
     use frext_core::clipboard::MemoryClipboard;
     use frext_core::editor::{Command, SearchBar};
     use frext_core::persistence::Store;
+    use ratatui::style::Style;
 
     use super::*;
 
@@ -567,21 +624,17 @@ mod tests {
         dir
     }
 
-    fn open_editor(dir: &Path, files: &[PathBuf], workspace: Option<&Path>) -> Editor {
-        Editor::open(
-            Store::at(dir.join("state")).unwrap(),
-            Box::new(MemoryClipboard::default()),
-            files,
-            workspace,
-        )
-    }
-
     /// An editor over a file holding `text`, with the search closed.
     fn fixture(tag: &str, text: &str) -> (PathBuf, Editor) {
         let dir = temp_dir(tag);
         let file = dir.join("notes.txt");
         fs::write(&file, text).unwrap();
-        let editor = open_editor(&dir, &[file], None);
+        let editor = Editor::open(
+            Store::at(dir.join("state")).unwrap(),
+            Box::new(MemoryClipboard::default()),
+            &[file],
+            None,
+        );
         (dir, editor)
     }
 
@@ -621,19 +674,84 @@ mod tests {
         (style.fg, style.bg, style.add_modifier)
     }
 
-    /// Every find-row item at 80 columns: (column, width, target).
-    const FIND_ROW_80: [(u16, u16, Option<Target>); 10] = [
-        (21, 4, Some(Target::FindOption(SearchOption::CaseSensitive))),
-        (26, 3, Some(Target::FindOption(SearchOption::WholeWord))),
-        (30, 4, Some(Target::FindOption(SearchOption::Regex))),
-        (35, 5, Some(Target::FindOption(SearchOption::InSelection))),
-        (41, 6, Some(Target::FindPrev)),
-        (48, 6, Some(Target::FindNext)),
-        (55, COUNT_WIDTH, None),
-        (67, 9, Some(Target::FindReplaceRow)),
-        (77, 3, Some(Target::FindClose)),
-        (6, 14, Some(Target::FindInput)),
-    ];
+    /// One item of the find row as drawn at 80 columns.
+    struct Item {
+        x: u16,
+        width: u16,
+        /// The hit target; `None` for the match count.
+        target: Option<Target>,
+        /// The button label; `None` for the field and the match count.
+        label: Option<&'static str>,
+    }
+
+    /// Every find-row item at 80 columns, in row order: the find field
+    /// after the label, then the buttons and the match count, each after
+    /// a one-cell gap, with widths taken from the labels.
+    fn find_row_80() -> Vec<Item> {
+        let mut items = vec![Item {
+            x: text_width(FIND_LABEL),
+            width: field_width(80),
+            target: Some(Target::FindPattern),
+            label: None,
+        }];
+        let mut push = |width: u16, target: Option<Target>, label: Option<&'static str>| {
+            let last = items.last().unwrap();
+            let x = last.x + last.width + 1;
+            items.push(Item {
+                x,
+                width,
+                target,
+                label,
+            });
+        };
+        for (label, target) in FIND_BUTTONS_BEFORE_COUNT {
+            push(text_width(label), Some(target), Some(label));
+        }
+        push(COUNT_WIDTH, None, None);
+        for (label, target) in FIND_BUTTONS_AFTER_COUNT {
+            push(text_width(label), Some(target), Some(label));
+        }
+        items
+    }
+
+    /// The column of the match count at 80 columns.
+    fn count_column_80() -> u16 {
+        find_row_80()
+            .iter()
+            .find(|item| item.target.is_none())
+            .unwrap()
+            .x
+    }
+
+    /// The column of the find-row item for `target` at 80 columns.
+    fn column_80(target: Target) -> u16 {
+        find_row_80()
+            .iter()
+            .find(|item| item.target == Some(target))
+            .unwrap()
+            .x
+    }
+
+    #[test]
+    fn fixed_width_is_the_labels_and_the_count() {
+        let buttons: u16 = FIND_BUTTONS_BEFORE_COUNT
+            .iter()
+            .chain(&FIND_BUTTONS_AFTER_COUNT)
+            .map(|(label, _)| 1 + text_width(label))
+            .sum();
+        assert_eq!(
+            text_width(FIND_LABEL) + buttons + 1 + COUNT_WIDTH,
+            FIXED_WIDTH
+        );
+    }
+
+    #[test]
+    fn find_row_80_fills_the_row() {
+        let items = find_row_80();
+        let last = items.last().unwrap();
+        assert_eq!(last.x + last.width, 80);
+        assert_eq!(items.first().unwrap().width, 14);
+    }
 
     #[test]
     fn field_width_clamps() {
@@ -673,7 +791,9 @@ mod tests {
         find(&mut editor, "(");
         let lines = error_lines(editor.search());
         assert!(
-            lines[0].starts_with("regex: invalid regular expression:"),
+            lines
+                .first()
+                .is_some_and(|line| line.starts_with("regex: invalid regular expression:")),
             "{lines:?}"
         );
         assert!(lines.len() <= usize::from(MAX_ERROR_ROWS));
@@ -681,10 +801,18 @@ mod tests {
     }
 
     #[test]
-    fn cap_lines_keeps_the_first_three_and_the_last() {
+    fn cap_lines_keeps_the_first_ones_and_the_last() {
         let lines = |n: usize| (0..n).map(|i| i.to_string()).collect::<Vec<_>>();
-        assert_eq!(cap_lines(lines(6)), vec!["0", "1", "2", "5"]);
-        assert_eq!(cap_lines(lines(4)), lines(4));
+        let max = usize::from(MAX_ERROR_ROWS);
+        let capped = |n: usize| {
+            let mut expected = lines(max - 1);
+            expected.push((n - 1).to_string());
+            expected
+        };
+        assert_eq!(cap_lines(lines(max + 2)), capped(max + 2));
+        assert_eq!(cap_lines(lines(max + 1)), capped(max + 1));
+        assert_eq!(cap_lines(lines(5)), capped(5));
+        assert_eq!(cap_lines(lines(max)), lines(max));
         assert_eq!(cap_lines(lines(0)), lines(0));
     }
 
@@ -696,27 +824,22 @@ mod tests {
         let (buf, _, _) = draw(&mut FindBar::new(), &editor, None, None, 80, 1);
         let row = row_text(&buf, 0);
         let expected = format!(
-            " Find {:<14} [Aa] [W] [.*] [sel] [Prev] [Next] {:<11} [Replace] [\u{d7}]",
+            " Find {:<14} [Aa] [W] [.*] [sel] [Prev] [Next] {:<11} [Replace] [x]",
             "hello", "1/2"
         );
         assert_eq!(row, expected);
         assert_eq!(row.chars().count(), 80);
-        let labels = [
-            (21, "[Aa]"),
-            (26, "[W]"),
-            (30, "[.*]"),
-            (35, "[sel]"),
-            (41, "[Prev]"),
-            (48, "[Next]"),
-            (55, "1/2"),
-            (67, "[Replace]"),
-            (77, "[\u{d7}]"),
-        ];
-        for (x, label) in labels {
-            let at: String = row.chars().skip(x).take(label.chars().count()).collect();
-            assert_eq!(at, label, "at {x}");
+        let at =
+            |x: u16, len: usize| -> String { row.chars().skip(usize::from(x)).take(len).collect() };
+        for item in find_row_80() {
+            let text = at(item.x, usize::from(item.width));
+            match (item.target, item.label) {
+                (Some(_), Some(label)) => assert_eq!(text, label, "at {}", item.x),
+                (Some(_), None) => assert_eq!(text.trim_end(), "hello", "at {}", item.x),
+                (None, _) => assert_eq!(text.trim_end(), "1/2", "at {}", item.x),
+            }
         }
-        assert_eq!(buf[(55, 0)].style().fg, theme::status().fg);
+        assert_eq!(buf[(count_column_80(), 0)].style().fg, theme::status().fg);
         assert_eq!(buf[(0, 0)].style().bg, theme::chrome().bg);
         fs::remove_dir_all(&dir).unwrap();
     }
@@ -727,7 +850,7 @@ mod tests {
         editor.apply(Command::OpenSearch(SearchBar::Find));
         let mut bar = FindBar::new();
         let (buf, _, _) = draw(&mut bar, &editor, None, None, 80, 1);
-        assert!(row_text(&buf, 0).starts_with(" Find search…"));
+        assert!(row_text(&buf, 0).starts_with(" Find search..."));
         assert_eq!(buf[(6, 0)].style().fg, theme::input_hint().fg);
         assert_eq!(buf[(6, 0)].style().bg, theme::input_hint().bg);
 
@@ -743,16 +866,22 @@ mod tests {
         let (dir, mut editor) = fixture("toggle", "hello");
         editor.apply(Command::OpenSearch(SearchBar::Find));
         let mut bar = FindBar::new();
+        let case = Target::FindOption(SearchOption::CaseSensitive);
+        let x = column_80(case);
         let (buf, _, _) = draw(&mut bar, &editor, None, None, 80, 1);
-        assert_eq!(look(buf[(21, 0)].style()), look(theme::chrome()));
+        assert_eq!(look(buf[(x, 0)].style()), look(theme::chrome()));
+        // An off toggle gets the hover background, which differs from on.
+        let (buf, _, _) = draw(&mut bar, &editor, None, Some(case), 80, 1);
+        let hovered = theme::chrome().bg(theme::hover_bg());
+        assert_eq!(look(buf[(x, 0)].style()), look(hovered));
+        assert_ne!(look(hovered), look(theme::toggle_on()));
         editor.apply(Command::ToggleSearchOption(SearchOption::CaseSensitive));
         let (buf, _, _) = draw(&mut bar, &editor, None, None, 80, 1);
-        assert_eq!(look(buf[(21, 0)].style()), look(theme::toggle_on()));
-        assert_eq!(look(buf[(24, 0)].style()), look(theme::toggle_on()));
+        assert_eq!(look(buf[(x, 0)].style()), look(theme::toggle_on()));
+        assert_eq!(look(buf[(x + 3, 0)].style()), look(theme::toggle_on()));
         // An on toggle keeps its style while hovered.
-        let hovered = Some(Target::FindOption(SearchOption::CaseSensitive));
-        let (buf, _, _) = draw(&mut bar, &editor, None, hovered, 80, 1);
-        assert_eq!(look(buf[(21, 0)].style()), look(theme::toggle_on()));
+        let (buf, _, _) = draw(&mut bar, &editor, None, Some(case), 80, 1);
+        assert_eq!(look(buf[(x, 0)].style()), look(theme::toggle_on()));
         fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -761,11 +890,12 @@ mod tests {
         let (dir, mut editor) = fixture("replace-toggle", "hello");
         editor.apply(Command::OpenSearch(SearchBar::Find));
         let mut bar = FindBar::new();
+        let x = column_80(Target::FindReplaceRow);
         let (buf, _, _) = draw(&mut bar, &editor, None, None, 80, 2);
-        assert_eq!(look(buf[(67, 0)].style()), look(theme::chrome()));
+        assert_eq!(look(buf[(x, 0)].style()), look(theme::chrome()));
         editor.apply(Command::ToggleReplaceRow);
         let (buf, _, _) = draw(&mut bar, &editor, None, None, 80, 2);
-        assert_eq!(look(buf[(67, 0)].style()), look(theme::toggle_on()));
+        assert_eq!(look(buf[(x, 0)].style()), look(theme::toggle_on()));
         fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -782,10 +912,12 @@ mod tests {
             1,
         );
         let hovered = theme::chrome().bg(theme::hover_bg());
-        assert_eq!(look(buf[(48, 0)].style()), look(hovered));
-        assert_eq!(look(buf[(53, 0)].style()), look(hovered));
-        assert_eq!(look(buf[(54, 0)].style()), look(theme::chrome()));
-        assert_eq!(look(buf[(41, 0)].style()), look(theme::chrome()));
+        let next = column_80(Target::FindNext);
+        let prev = column_80(Target::FindPrev);
+        assert_eq!(look(buf[(next, 0)].style()), look(hovered));
+        assert_eq!(look(buf[(next + 5, 0)].style()), look(hovered));
+        assert_eq!(look(buf[(next + 6, 0)].style()), look(theme::chrome()));
+        assert_eq!(look(buf[(prev, 0)].style()), look(theme::chrome()));
         fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -804,14 +936,14 @@ mod tests {
         );
         assert_eq!(bar.pattern_rect, Some(Rect::new(6, 0, 14, 1)));
         assert_eq!(bar.replacement_rect, Some(Rect::new(6, 1, 14, 1)));
-        assert_eq!(hits.hit(6, 1), Some(Target::ReplaceInput));
-        assert_eq!(hits.hit(19, 1), Some(Target::ReplaceInput));
+        assert_eq!(hits.hit(6, 1), Some(Target::FindReplacement));
+        assert_eq!(hits.hit(19, 1), Some(Target::FindReplacement));
         assert_eq!(hits.hit(20, 1), None);
-        assert_eq!(hits.hit(21, 1), Some(Target::ReplaceCurrent));
-        assert_eq!(hits.hit(29, 1), Some(Target::ReplaceCurrent));
+        assert_eq!(hits.hit(21, 1), Some(Target::FindReplaceCurrent));
+        assert_eq!(hits.hit(29, 1), Some(Target::FindReplaceCurrent));
         assert_eq!(hits.hit(30, 1), None);
-        assert_eq!(hits.hit(31, 1), Some(Target::ReplaceAll));
-        assert_eq!(hits.hit(43, 1), Some(Target::ReplaceAll));
+        assert_eq!(hits.hit(31, 1), Some(Target::FindReplaceAll));
+        assert_eq!(hits.hit(43, 1), Some(Target::FindReplaceAll));
         assert_eq!(hits.hit(44, 1), None);
 
         editor.apply(Command::ToggleSearchOption(SearchOption::Regex));
@@ -850,8 +982,32 @@ mod tests {
             assert_eq!(buf[(1, y)].style().fg, theme::status_error().fg);
         }
         assert!(row_text(&buf, count + 1).starts_with(" With "));
-        assert_eq!(hits.hit(6, count + 1), Some(Target::ReplaceInput));
+        assert_eq!(hits.hit(6, count + 1), Some(Target::FindReplacement));
         assert!(row_text(&buf, count + 2).trim().is_empty());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_short_bar_cuts_error_rows_before_the_replace_row() {
+        let (dir, mut editor) = fixture("short", "hello");
+        editor.apply(Command::OpenSearch(SearchBar::FindReplace));
+        editor.apply(Command::ToggleSearchOption(SearchOption::Regex));
+        find(&mut editor, "(");
+        assert!(!error_lines(editor.search()).is_empty());
+        let mut bar = FindBar::new();
+        let (buf, hits, cursor) =
+            draw(&mut bar, &editor, Some(FindField::Replacement), None, 80, 2);
+        assert!(row_text(&buf, 0).starts_with(" Find ("));
+        assert!(row_text(&buf, 1).starts_with(" With "));
+        assert_eq!(hits.hit(6, 1), Some(Target::FindReplacement));
+        assert!(bar.replacement_rect.unwrap().contains(cursor.unwrap()));
+
+        let (buf, hits, cursor) =
+            draw(&mut bar, &editor, Some(FindField::Replacement), None, 80, 1);
+        assert!(row_text(&buf, 0).starts_with(" Find ("));
+        assert_eq!(hits.hit(6, 0), Some(Target::FindPattern));
+        assert_eq!(cursor, None);
+        assert_eq!(bar.replacement_rect, None);
         fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -860,14 +1016,24 @@ mod tests {
         let (dir, mut editor) = fixture("hits", "hello");
         editor.apply(Command::OpenSearch(SearchBar::Find));
         let (_, hits, _) = draw(&mut FindBar::new(), &editor, None, None, 80, 1);
-        for (x, width, target) in FIND_ROW_80 {
-            assert_eq!(hits.hit(x, 0), target, "first cell at {x}");
-            assert_eq!(hits.hit(x + width - 1, 0), target, "last cell at {x}");
+        let items = find_row_80();
+        for item in &items {
+            let x = item.x;
+            assert_eq!(hits.hit(x, 0), item.target, "first cell at {x}");
+            assert_eq!(
+                hits.hit(x + item.width - 1, 0),
+                item.target,
+                "last cell at {x}"
+            );
         }
-        for gap in [20, 25, 29, 34, 40, 47, 54, 66, 76] {
-            assert_eq!(hits.hit(gap, 0), None, "gap at {gap}");
+        for pair in items.windows(2) {
+            if let [before, after] = pair {
+                for gap in before.x + before.width..after.x {
+                    assert_eq!(hits.hit(gap, 0), None, "gap at {gap}");
+                }
+            }
         }
-        for label in 0..6 {
+        for label in 0..text_width(FIND_LABEL) {
             assert_eq!(hits.hit(label, 0), None);
         }
         fs::remove_dir_all(&dir).unwrap();
@@ -894,7 +1060,7 @@ mod tests {
         }
         assert!(targets.contains(&Target::FindOption(SearchOption::InSelection)));
         // The replace row's buttons still fit at 40.
-        assert_eq!(hits.hit(27, 1), Some(Target::ReplaceAll));
+        assert_eq!(hits.hit(27, 1), Some(Target::FindReplaceAll));
 
         for width in [0, 1, 3, 6, 7, 17] {
             for height in [0, 1, 3] {
@@ -910,6 +1076,11 @@ mod tests {
                     assert_eq!(cursor, None);
                     assert_eq!(bar.pattern_rect, None);
                     assert_eq!(hits.hit(0, 0), None);
+                } else if height >= 1 {
+                    let rect = Rect::new(6, 0, (width - 6).min(MIN_FIELD_WIDTH), 1);
+                    assert_eq!(bar.pattern_rect, Some(rect), "{width}x{height}");
+                    let cursor = cursor.unwrap();
+                    assert!(rect.contains(cursor), "{cursor:?} in {width}x{height}");
                 }
             }
         }
@@ -1076,6 +1247,55 @@ mod tests {
     }
 
     #[test]
+    fn modified_tabs_do_not_switch_fields() {
+        let (dir, mut editor) = fixture("ctrl-tab", "hello");
+        editor.apply(Command::OpenSearch(SearchBar::FindReplace));
+        let mut bar = FindBar::new();
+        for code in [KeyCode::Tab, KeyCode::BackTab] {
+            for modifiers in [
+                KeyModifiers::CONTROL,
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+                KeyModifiers::ALT,
+            ] {
+                let key = KeyEvent::new(code, modifiers);
+                for field in [FindField::Pattern, FindField::Replacement] {
+                    let reply = bar.handle_key(&mut editor, field, key);
+                    assert!(
+                        !matches!(reply, FindReply::Focus(_)),
+                        "{key:?} in {field:?}: {reply:?}"
+                    );
+                }
+            }
+        }
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn ctrl_and_alt_enter_are_reserved() {
+        let (dir, mut editor) = fixture("ctrl-enter", "hello hello");
+        editor.apply(Command::OpenSearch(SearchBar::FindReplace));
+        find(&mut editor, "hello");
+        let mut bar = FindBar::new();
+        for modifiers in [
+            KeyModifiers::CONTROL,
+            KeyModifiers::ALT,
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        ] {
+            let key = KeyEvent::new(KeyCode::Enter, modifiers);
+            for field in [FindField::Pattern, FindField::Replacement] {
+                assert_eq!(
+                    bar.handle_key(&mut editor, field, key),
+                    FindReply::Handled,
+                    "{key:?} in {field:?}"
+                );
+            }
+        }
+        assert_eq!(editor.search().query().pattern, "hello");
+        assert_eq!(editor.search().replacement(), "");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn esc_closes_the_search() {
         let (dir, mut editor) = fixture("esc", "hello");
         editor.apply(Command::OpenSearch(SearchBar::FindReplace));
@@ -1135,10 +1355,10 @@ mod tests {
         find(&mut editor, "hello");
         let mut bar = FindBar::new();
         // Without a rect the click does nothing.
-        bar.click(&editor, FindField::Pattern, 6 + 2);
+        bar.handle_click(&editor, FindField::Pattern, 6 + 2);
         assert_eq!(bar.pattern.cursor(), 0);
         draw(&mut bar, &editor, None, None, 80, 1);
-        bar.click(&editor, FindField::Pattern, 6 + 2);
+        bar.handle_click(&editor, FindField::Pattern, 6 + 2);
         let (_, _, cursor) = draw(&mut bar, &editor, Some(FindField::Pattern), None, 80, 1);
         assert_eq!(cursor.map(|c| c.x), Some(8));
         fs::remove_dir_all(&dir).unwrap();
@@ -1150,12 +1370,12 @@ mod tests {
         editor.apply(Command::OpenSearch(SearchBar::FindReplace));
         let mut bar = FindBar::new();
         assert_eq!(
-            bar.paste(&mut editor, FindField::Pattern, "a\nb"),
+            bar.handle_paste(&mut editor, FindField::Pattern, "a\nb"),
             RECOMPUTE
         );
         assert_eq!(editor.search().query().pattern, "a b");
         assert_eq!(
-            bar.paste(&mut editor, FindField::Replacement, "x\r\ny"),
+            bar.handle_paste(&mut editor, FindField::Replacement, "x\r\ny"),
             FindReply::Handled
         );
         assert_eq!(editor.search().replacement(), "x y");

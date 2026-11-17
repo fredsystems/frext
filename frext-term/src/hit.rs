@@ -35,24 +35,24 @@ pub enum Target {
     MenuPopup,
     /// The context-menu entry at this index.
     MenuItem(usize),
-    /// The find field of the search bar.
-    FindInput,
-    /// The replace field of the search bar.
-    ReplaceInput,
-    /// A search-option toggle on the search bar.
+    /// The find field of the find bar.
+    FindPattern,
+    /// The "With" field of the find bar.
+    FindReplacement,
+    /// A search-option toggle on the find bar.
     FindOption(SearchOption),
-    /// The search bar's "previous match" button.
+    /// The find bar's "previous match" button.
     FindPrev,
-    /// The search bar's "next match" button.
+    /// The find bar's "next match" button.
     FindNext,
-    /// The search bar's replace-row toggle.
+    /// The find bar's replace-row toggle.
     FindReplaceRow,
-    /// The search bar's close button.
+    /// The find bar's close button.
     FindClose,
-    /// The "replace the current match" button.
-    ReplaceCurrent,
-    /// The "replace all matches" button.
-    ReplaceAll,
+    /// The find bar's "replace the current match" button.
+    FindReplaceCurrent,
+    /// The find bar's "replace all matches" button.
+    FindReplaceAll,
 }
 
 impl Target {
@@ -74,8 +74,8 @@ impl Target {
             Self::FindNext => Some("Next match (F3 / Enter)"),
             Self::FindReplaceRow => Some("Toggle replace"),
             Self::FindClose => Some("Close (Esc)"),
-            Self::ReplaceCurrent => Some("Replace the current match (Enter in With)"),
-            Self::ReplaceAll => Some("Replace all matches"),
+            Self::FindReplaceCurrent => Some("Replace the current match (Enter in With)"),
+            Self::FindReplaceAll => Some("Replace all matches"),
             Self::SelectTab(_)
             | Self::PromptPopup
             | Self::PromptInput
@@ -84,8 +84,8 @@ impl Target {
             | Self::Editor
             | Self::MenuPopup
             | Self::MenuItem(_)
-            | Self::FindInput
-            | Self::ReplaceInput => None,
+            | Self::FindPattern
+            | Self::FindReplacement => None,
         }
     }
 }
@@ -181,8 +181,8 @@ mod tests {
 
     #[test]
     fn find_bar_hints() {
-        assert_eq!(Target::FindInput.hint(), None);
-        assert_eq!(Target::ReplaceInput.hint(), None);
+        assert_eq!(Target::FindPattern.hint(), None);
+        assert_eq!(Target::FindReplacement.hint(), None);
         assert_eq!(
             Target::FindOption(SearchOption::CaseSensitive).hint(),
             Some("Match case (Alt+C)")
@@ -204,10 +204,10 @@ mod tests {
         assert_eq!(Target::FindReplaceRow.hint(), Some("Toggle replace"));
         assert_eq!(Target::FindClose.hint(), Some("Close (Esc)"));
         assert_eq!(
-            Target::ReplaceCurrent.hint(),
+            Target::FindReplaceCurrent.hint(),
             Some("Replace the current match (Enter in With)")
         );
-        assert_eq!(Target::ReplaceAll.hint(), Some("Replace all matches"));
+        assert_eq!(Target::FindReplaceAll.hint(), Some("Replace all matches"));
     }
 
     #[test]

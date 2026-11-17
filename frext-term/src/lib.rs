@@ -17,6 +17,7 @@ pub mod keymap;
 pub mod layout;
 pub mod logging;
 pub mod menu;
+pub mod paint;
 pub mod popup;
 pub mod prompt;
 pub mod run;

@@ -86,6 +86,18 @@ impl SearchState {
         self.in_selection
     }
 
+    /// Whether the search option `option` is on: the case, whole-word and
+    /// regex toggles of the query, or search-within-selection.
+    #[must_use]
+    pub fn option(&self, option: SearchOption) -> bool {
+        match option {
+            SearchOption::CaseSensitive => self.query.case_sensitive,
+            SearchOption::WholeWord => self.query.whole_word,
+            SearchOption::Regex => self.query.regex,
+            SearchOption::InSelection => self.in_selection,
+        }
+    }
+
     /// The search query and its toggles.
     #[must_use]
     pub fn query(&self) -> &SearchQuery {
@@ -509,6 +521,41 @@ mod tests {
         assert_eq!(editor.search().replacement(), "");
         "bye".clone_into(editor.search_replacement_mut());
         assert_eq!(editor.search().replacement(), "bye");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn option_reads_each_toggle() {
+        let dir = temp_dir("option-getter");
+        let mut editor = editor_with_files(&dir, &[]);
+        let options = [
+            SearchOption::CaseSensitive,
+            SearchOption::WholeWord,
+            SearchOption::Regex,
+            SearchOption::InSelection,
+        ];
+        for option in options {
+            assert!(!editor.search().option(option), "{option:?}");
+        }
+        for (turned_on, option) in options.into_iter().enumerate() {
+            editor.apply(Command::ToggleSearchOption(option));
+            for (index, other) in options.into_iter().enumerate() {
+                assert_eq!(
+                    editor.search().option(other),
+                    index <= turned_on,
+                    "{other:?} after turning on {option:?}"
+                );
+            }
+        }
+        let search = editor.search();
+        assert_eq!(
+            search.option(SearchOption::CaseSensitive),
+            search.query().case_sensitive
+        );
+        assert_eq!(
+            search.option(SearchOption::InSelection),
+            search.in_selection()
+        );
         fs::remove_dir_all(&dir).unwrap();
     }
 

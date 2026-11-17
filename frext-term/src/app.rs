@@ -15,9 +15,7 @@ use frext_core::editor::{BufferChange, Command, Editor, EditorFocus, Effect, Ste
 use frext_core::lines::line_count;
 use frext_core::syntax::language_from_path;
 use ratatui::Frame;
-use ratatui::buffer::Buffer;
-use ratatui::layout::{Position, Rect};
-use ratatui::style::Style;
+use ratatui::layout::Position;
 
 use crate::buffer::cursor::Selecting;
 use crate::buffer::edit::{Applied, EditAction};
@@ -29,6 +27,7 @@ use crate::hit::{HitMap, Target};
 use crate::keymap::{self, Action, Focus, KeyContext};
 use crate::layout;
 use crate::menu::{ContextMenu, Enablement, MenuReply};
+use crate::paint;
 use crate::prompt::{PromptReply, PromptUi};
 use crate::status::{MessageKind, StatusLine};
 use crate::tab_bar;
@@ -180,7 +179,7 @@ impl TermApp {
                     self.prompt.handle_paste(&mut self.editor, &text);
                 } else if let Focus::Find(field) = self.focus {
                     if let FindReply::Send(command) =
-                        self.find.paste(&mut self.editor, field, &text)
+                        self.find.handle_paste(&mut self.editor, field, &text)
                     {
                         self.send(command, now);
                     }
@@ -368,14 +367,14 @@ impl TermApp {
                         }
                         self.set_focus(Focus::Editor);
                     }
-                    Some(Target::FindInput) => {
+                    Some(Target::FindPattern) => {
                         self.find
-                            .click(&self.editor, FindField::Pattern, mouse.column);
+                            .handle_click(&self.editor, FindField::Pattern, mouse.column);
                         self.set_focus(Focus::Find(FindField::Pattern));
                     }
-                    Some(Target::ReplaceInput) => {
+                    Some(Target::FindReplacement) => {
                         self.find
-                            .click(&self.editor, FindField::Replacement, mouse.column);
+                            .handle_click(&self.editor, FindField::Replacement, mouse.column);
                         self.set_focus(Focus::Find(FindField::Replacement));
                     }
                     Some(Target::FindOption(option)) => {
@@ -389,8 +388,8 @@ impl TermApp {
                     }
                     Some(Target::FindReplaceRow) => self.send(Command::ToggleReplaceRow, now),
                     Some(Target::FindClose) => self.send(Command::CloseSearch, now),
-                    Some(Target::ReplaceCurrent) => self.send(Command::ReplaceCurrent, now),
-                    Some(Target::ReplaceAll) => self.send(Command::ReplaceAll, now),
+                    Some(Target::FindReplaceCurrent) => self.send(Command::ReplaceCurrent, now),
+                    Some(Target::FindReplaceAll) => self.send(Command::ReplaceAll, now),
                     Some(
                         Target::PromptPopup
                         | Target::PromptInput
@@ -575,7 +574,7 @@ impl TermApp {
             buf,
             &mut self.hits,
         );
-        fill(buf, areas.sidebar, theme::chrome());
+        paint::fill(buf, areas.sidebar, theme::chrome());
         let caret = self.buffer.render(
             tab,
             areas.gutter,
@@ -627,15 +626,6 @@ fn line_count_label(n: usize) -> String {
     }
 }
 
-/// Blanks every cell of `area` with `style`.
-fn fill(buf: &mut Buffer, area: Rect, style: Style) {
-    let area = area.intersection(buf.area);
-    for position in area.positions() {
-        buf[position].reset();
-        buf[position].set_style(style);
-    }
-}
-
 #[cfg(test)]
 mod tests {
     // Tests unwrap freely: a panic is a test failure.
@@ -651,6 +641,7 @@ mod tests {
     use frext_core::persistence::Store;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
+    use ratatui::buffer::Buffer;
 
     use super::*;
 
@@ -2479,7 +2470,7 @@ mod tests {
         let dir = temp_dir("find-click-close");
         let mut app = app_with_text(&dir, "hello world", KeyboardMode::Enhanced);
         app.handle(ctrl('f'), Instant::now());
-        let x = drawn_column(&mut app, 1, "[\u{d7}]");
+        let x = drawn_column(&mut app, 1, "[x]");
         assert_eq!(x, 77);
         left_click(&mut app, x, 1);
         assert!(!app.editor().search().is_open());

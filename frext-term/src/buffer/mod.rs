@@ -35,7 +35,6 @@ use frext_core::syntax::language_from_path;
 use frext_core::tab::Tab;
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Position, Rect};
-use ratatui::style::Style;
 
 use crate::buffer::cursor::{Cursor, Selecting};
 use crate::buffer::edit::{Applied, EditAction, EditTarget};
@@ -43,6 +42,7 @@ use crate::buffer::history::{Edit, EditHistory};
 use crate::buffer::render::RowsView;
 use crate::buffer::wrap::WrapLayout;
 use crate::hit::{HitMap, Target};
+use crate::paint;
 use crate::theme;
 
 /// The longest pause between two presses on the same cell that still
@@ -255,19 +255,6 @@ fn common_affixes(before: &str, after: &str) -> (usize, usize, usize) {
         .map(|(a, _)| a.len_utf8())
         .sum();
     (prefix_bytes, prefix_chars, suffix_bytes)
-}
-
-/// Blanks every cell of `area` with `style`.
-fn fill(buf: &mut Buffer, area: Rect, style: Style) {
-    let area = area.intersection(buf.area);
-    for y in area.top()..area.bottom() {
-        for x in area.left()..area.right() {
-            if let Some(cell) = buf.cell_mut((x, y)) {
-                cell.reset();
-                cell.set_symbol(" ").set_style(style);
-            }
-        }
-    }
 }
 
 impl BufferView {
@@ -550,8 +537,8 @@ impl BufferView {
         self.rect = editor;
         hits.push(editor, Target::Editor);
         let Some(tab) = tab else {
-            fill(buf, gutter, theme::base());
-            fill(buf, editor, theme::base());
+            paint::fill(buf, gutter, theme::base());
+            paint::fill(buf, editor, theme::base());
             return None;
         };
         let view = prepare(&mut self.tabs, editor, tab);

@@ -92,12 +92,13 @@ pub const fn input_hint() -> Style {
     Style::new().fg(color(OVERLAY0)).bg(color(SURFACE1))
 }
 
-/// A search-bar toggle that is on.
+/// A find-bar toggle that is on: distinct from [`hover_bg`], so an off
+/// toggle under the mouse does not look on.
 #[must_use]
 pub fn toggle_on() -> Style {
     Style::new()
         .fg(color(palette::accent()))
-        .bg(color(palette::selection().over(MANTLE)))
+        .bg(color(palette::selection().over(SURFACE0)))
         .add_modifier(Modifier::BOLD)
 }
 
@@ -250,16 +251,21 @@ mod tests {
     }
 
     #[test]
-    fn toggle_on_is_bold_accent_on_selection_over_mantle() {
+    fn toggle_on_is_bold_accent_on_selection_over_surface0() {
         let style = toggle_on();
         assert_eq!(
             colours(style),
             (
                 Some(color(palette::accent())),
-                Some(color(palette::selection().over(MANTLE)))
+                Some(color(palette::selection().over(SURFACE0)))
             )
         );
         assert!(style.add_modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn toggle_on_background_differs_from_hover() {
+        assert_ne!(toggle_on().bg, Some(hover_bg()));
     }
 
     #[test]

@@ -18,6 +18,7 @@ use unicode_segmentation::UnicodeSegmentation;
 
 use crate::buffer::cells::{self, Glyph};
 use crate::buffer::wrap::{RowBreak, VisualRow, WrapLayout};
+use crate::paint;
 use crate::theme;
 
 /// Everything [`render`] draws: a text, its layout, and what to paint on
@@ -52,8 +53,8 @@ pub fn render(
 ) -> Option<Position> {
     let gutter_clip = gutter.intersection(buf.area);
     let editor_clip = editor.intersection(buf.area);
-    fill(buf, gutter_clip, theme::gutter());
-    fill(buf, editor_clip, theme::base());
+    paint::fill(buf, gutter_clip, theme::gutter());
+    paint::fill(buf, editor_clip, theme::base());
 
     let rows = view.layout.rows();
     let mut painter = Painter {
@@ -99,18 +100,6 @@ fn caret_position(view: &RowsView<'_>, editor: Rect) -> Option<Position> {
         .x
         .saturating_add(view.layout.column_of_char(view.text, view.caret));
     (x < editor.right()).then_some(Position { x, y })
-}
-
-/// Blanks every cell of `area` (already inside the buffer) with `style`.
-fn fill(buf: &mut Buffer, area: Rect, style: Style) {
-    for y in area.top()..area.bottom() {
-        for x in area.left()..area.right() {
-            if let Some(cell) = buf.cell_mut((x, y)) {
-                cell.reset();
-                cell.set_symbol(" ").set_style(style);
-            }
-        }
-    }
 }
 
 /// Draws the 1-based number of `line` right-aligned in `gutter` on row
