@@ -321,7 +321,18 @@ impl BufferView {
     /// cursor is left alone; the app's effects place it. A tab the view
     /// has never seen has nothing to record. A recorded group is never
     /// coalesced, so `_now` does not affect grouping.
-    pub fn record_outside_edit(&mut self, tab: &Tab, before: &str, _now: Instant) {
+    ///
+    /// `after` is the selection a redo restores, clamped to the new text:
+    /// the core command's own selection when it set one. With `None` the
+    /// caret goes to the end of the changed span found by diffing `before`
+    /// against the new text, which is ambiguous in repeated text.
+    pub fn record_outside_edit(
+        &mut self,
+        tab: &Tab,
+        before: &str,
+        after: Option<Range<usize>>,
+        _now: Instant,
+    ) {
         if !self.tabs.contains_key(&tab.id) {
             prepare(&mut self.tabs, self.rect, tab);
             return;
@@ -332,25 +343,32 @@ impl BufferView {
         if before == tab.text {
             return;
         }
-        let after = tab.text.as_str();
-        let (prefix_bytes, at, suffix_bytes) = common_affixes(before, after);
+        let text = tab.text.as_str();
+        let (prefix_bytes, at, suffix_bytes) = common_affixes(before, text);
         let removed = before
             .get(prefix_bytes..before.len().saturating_sub(suffix_bytes))
             .unwrap_or("")
             .to_owned();
-        let inserted = after
-            .get(prefix_bytes..after.len().saturating_sub(suffix_bytes))
+        let inserted = text
+            .get(prefix_bytes..text.len().saturating_sub(suffix_bytes))
             .unwrap_or("")
             .to_owned();
-        let end = at.saturating_add(inserted.chars().count());
+        let after = after.map_or_else(
+            || Cursor::at(at.saturating_add(inserted.chars().count())),
+            |chars| {
+                let mut cursor = Cursor::spanning(chars.start, chars.end);
+                cursor.clamp(text);
+                cursor
+            },
+        );
         view.history.record_group(vec![Edit {
             at,
             removed,
             inserted,
             before: view.cursor,
-            after: Cursor::at(end),
+            after,
         }]);
-        view.known = text_hash(after);
+        view.known = text_hash(text);
     }
 
     /// The selected chars of the tab with `tab_id`, if the view knows it.
@@ -781,7 +799,7 @@ mod tests {
         view.set_selection(&tab, 6..6);
         let before = tab.text.clone();
         tab.text = "hello big wide world".to_owned();
-        view.record_outside_edit(&tab, &before, base);
+        view.record_outside_edit(&tab, &before, None, base);
         // Not treated as an unknown change: the group survives.
         draw(&mut view, Some(&tab), 20, 3);
         assert_eq!(
@@ -801,18 +819,48 @@ mod tests {
         let mut view = BufferView::default();
         let base = Instant::now();
         // An unknown tab just starts being tracked.
-        view.record_outside_edit(&tab, "zz", base);
+        view.record_outside_edit(&tab, "zz", None, base);
         assert_eq!(view.caret(1), Some(0));
         let before = tab.text.clone();
         tab.text = "aaaa".to_owned();
-        view.record_outside_edit(&tab, &before, base);
+        view.record_outside_edit(&tab, &before, None, base);
         view.handle(&mut tab, EditAction::Undo, ms(base, 10));
         assert_eq!(tab.text, "aaa");
         // No change records nothing.
         let before = tab.text.clone();
-        view.record_outside_edit(&tab, &before, base);
+        view.record_outside_edit(&tab, &before, None, base);
         view.handle(&mut tab, EditAction::Undo, ms(base, 20));
         assert_eq!(tab.text, "aaa");
+    }
+
+    /// Records "aaa" -> "aaaa" with `after`, then undoes and redoes it,
+    /// returning the caret after the redo.
+    fn redo_caret_after_repeated_insert(after: Option<Range<usize>>) -> Option<usize> {
+        let mut tab = tab(1, "aaa");
+        let mut view = BufferView::default();
+        let base = Instant::now();
+        draw(&mut view, Some(&tab), 12, 3);
+        let before = tab.text.clone();
+        tab.text = "aaaa".to_owned();
+        view.record_outside_edit(&tab, &before, after, base);
+        view.handle(&mut tab, EditAction::Undo, ms(base, 10));
+        assert_eq!(tab.text, "aaa");
+        view.handle(&mut tab, EditAction::Redo, ms(base, 20));
+        assert_eq!(tab.text, "aaaa");
+        view.caret(1)
+    }
+
+    #[test]
+    fn record_outside_edit_redo_restores_the_given_selection() {
+        assert_eq!(redo_caret_after_repeated_insert(Some(1..1)), Some(1));
+        // Out-of-range selections are clamped to the new text.
+        assert_eq!(redo_caret_after_repeated_insert(Some(9..9)), Some(4));
+    }
+
+    #[test]
+    fn record_outside_edit_without_a_selection_uses_the_diff_end() {
+        // The diff cannot tell where in "aaa" the 'a' went: it picks the end.
+        assert_eq!(redo_caret_after_repeated_insert(None), Some(4));
     }
 
     #[test]

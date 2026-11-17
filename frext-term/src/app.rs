@@ -399,7 +399,8 @@ impl TermApp {
     ///
     /// The editor's selection (while it has focus) is passed to core
     /// first. A text-editing command is recorded in the active tab's undo
-    /// history as one group.
+    /// history as one group, redoing to the selection the command sets for
+    /// that tab, if any.
     fn send(&mut self, command: Command, now: Instant) {
         let selection = match self.focus {
             Focus::Editor => self
@@ -427,7 +428,11 @@ impl TermApp {
             && let Some((id, before)) = before
             && let Some(tab) = self.editor.active_tab().filter(|tab| tab.id == id)
         {
-            self.buffer.record_outside_edit(tab, &before, now);
+            let after = outcome.effects.iter().find_map(|effect| match effect {
+                Effect::SetSelection { tab_id, chars, .. } if *tab_id == id => Some(chars.clone()),
+                _ => None,
+            });
+            self.buffer.record_outside_edit(tab, &before, after, now);
         }
         self.effects.extend(outcome.effects);
         self.prompt.sync(&self.editor);
@@ -1228,6 +1233,27 @@ mod tests {
         // The paste is one undo step.
         app.handle(ctrl('z'), Instant::now());
         assert_eq!(text_of(&app), "hello world");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn redo_of_a_paste_into_repeated_text_restores_the_paste_caret() {
+        let dir = temp_dir("paste-redo-caret");
+        let mut app = app_with_text(&dir, "aaa", KeyboardMode::Enhanced);
+        press(&mut app, KeyCode::Right, KeyModifiers::SHIFT, 1);
+        app.handle(ctrl('c'), Instant::now());
+        app.handle(key(KeyCode::Home, KeyModifiers::CONTROL), Instant::now());
+        let tab_id = app.editor().active_tab().unwrap().id;
+        assert_eq!(app.buffer.selection(tab_id), Some(0..0));
+
+        app.handle(ctrl('v'), Instant::now());
+        assert_eq!(text_of(&app), "aaaa");
+        assert_eq!(app.buffer.caret(tab_id), Some(1));
+        app.handle(ctrl('z'), Instant::now());
+        assert_eq!(text_of(&app), "aaa");
+        app.handle(ctrl('y'), Instant::now());
+        assert_eq!(text_of(&app), "aaaa");
+        assert_eq!(app.buffer.caret(tab_id), Some(1));
         fs::remove_dir_all(&dir).unwrap();
     }
 
