@@ -169,7 +169,8 @@ impl FileTree {
         }
     }
 
-    /// The requested width, border included, before clamping.
+    /// The stored width, border included, as clamped for the terminal
+    /// at the last render or resize.
     #[must_use]
     pub const fn width(&self) -> u16 {
         self.width
@@ -227,7 +228,9 @@ impl FileTree {
         }
         self.rows = rows;
         self.repair_selection();
-        self.top = self.top.min(self.rows.len().saturating_sub(1));
+        self.top = self
+            .top
+            .min(self.rows.len().saturating_sub(self.rows_height()));
         Refresh::Changed
     }
 
@@ -503,7 +506,12 @@ impl FileTree {
     ) {
         self.area = area;
         self.total = buf.area.width;
-        self.refresh(editor.workspace());
+        self.width = clamp_width(self.width, self.total);
+        // A hovered row index refers to the rows before a change.
+        let hovered = match (self.refresh(editor.workspace()), hovered) {
+            (Refresh::Changed, Some(Target::TreeRow(_))) => None,
+            (_, hovered) => hovered,
+        };
         let Some(workspace) = editor.workspace() else {
             return;
         };
@@ -1524,6 +1532,43 @@ mod tests {
         assert!(!tree.is_resizing());
         tree.drag_to(20);
         assert_eq!(tree.width(), 80 - MIN_EDITOR_WIDTH);
+    }
+
+    #[test]
+    fn a_stale_hovered_row_after_a_refresh_is_not_painted() {
+        let (project, editor) = fixture("stale-hover", &[]);
+        let mut tree = FileTree::new();
+        render(&mut tree, &editor, TreeFocus::Unfocused, None, SIDEBAR);
+        // Row 1 is `src`; removing `docs` moves `Cargo.toml` into row 1.
+        fs::remove_dir_all(project.join("docs")).unwrap();
+        let hovered = Some(Target::TreeRow(1));
+        let (buf, _) = render(&mut tree, &editor, TreeFocus::Unfocused, hovered, SIDEBAR);
+        assert_eq!(row_text(&buf, 2), "     Cargo.toml");
+        assert_eq!(Some(buf[(0, 2)].bg), mantle());
+
+        // With the rows unchanged, the hover is painted again.
+        let (buf, _) = render(&mut tree, &editor, TreeFocus::Unfocused, hovered, SIDEBAR);
+        assert_eq!(buf[(0, 2)].bg, theme::hover_bg());
+    }
+
+    #[test]
+    fn refresh_clamps_top_to_the_last_full_page() {
+        let (project, mut editor) = fixture("refresh-top", &[]);
+        let src = project.join("src");
+        editor.apply(Command::SetExpanded {
+            dir: src.clone(),
+            state: FolderState::Expanded,
+        });
+        let mut tree = FileTree::new();
+        // Two rows shown out of five.
+        render_in(&mut tree, &editor, Rect::new(0, 0, 30, 3), SCREEN);
+        tree.top = 3;
+        editor.apply(Command::SetExpanded {
+            dir: src,
+            state: FolderState::Collapsed,
+        });
+        assert_eq!(tree.refresh(editor.workspace()), Refresh::Changed);
+        assert_eq!(tree.top, 2);
     }
 
     #[test]
