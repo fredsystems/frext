@@ -11,7 +11,7 @@ use std::time::Instant;
 use crossterm::event::{
     Event, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
-use frext_core::editor::{BufferChange, Command, Editor, EditorFocus, Effect};
+use frext_core::editor::{BufferChange, Command, Editor, EditorFocus, Effect, StepDirection};
 use frext_core::lines::line_count;
 use frext_core::syntax::language_from_path;
 use ratatui::Frame;
@@ -178,6 +178,12 @@ impl TermApp {
                     // The open menu is modal: a paste is dropped.
                 } else if self.prompt.is_open(&self.editor) {
                     self.prompt.handle_paste(&mut self.editor, &text);
+                } else if let Focus::Find(field) = self.focus {
+                    if let FindReply::Send(command) =
+                        self.find.paste(&mut self.editor, field, &text)
+                    {
+                        self.send(command, now);
+                    }
                 } else if self.focus == Focus::Editor
                     && let Some(view) = self.editor.active_view_mut()
                 {
@@ -362,22 +368,36 @@ impl TermApp {
                         }
                         self.set_focus(Focus::Editor);
                     }
+                    Some(Target::FindInput) => {
+                        self.find
+                            .click(&self.editor, FindField::Pattern, mouse.column);
+                        self.set_focus(Focus::Find(FindField::Pattern));
+                    }
+                    Some(Target::ReplaceInput) => {
+                        self.find
+                            .click(&self.editor, FindField::Replacement, mouse.column);
+                        self.set_focus(Focus::Find(FindField::Replacement));
+                    }
+                    Some(Target::FindOption(option)) => {
+                        self.send(Command::ToggleSearchOption(option), now);
+                    }
+                    Some(Target::FindPrev) => {
+                        self.send(Command::StepMatch(StepDirection::Backward), now);
+                    }
+                    Some(Target::FindNext) => {
+                        self.send(Command::StepMatch(StepDirection::Forward), now);
+                    }
+                    Some(Target::FindReplaceRow) => self.send(Command::ToggleReplaceRow, now),
+                    Some(Target::FindClose) => self.send(Command::CloseSearch, now),
+                    Some(Target::ReplaceCurrent) => self.send(Command::ReplaceCurrent, now),
+                    Some(Target::ReplaceAll) => self.send(Command::ReplaceAll, now),
                     Some(
                         Target::PromptPopup
                         | Target::PromptInput
                         | Target::PromptButton(_)
                         | Target::PromptCandidate(_)
                         | Target::MenuPopup
-                        | Target::MenuItem(_)
-                        | Target::FindInput
-                        | Target::ReplaceInput
-                        | Target::FindOption(_)
-                        | Target::FindPrev
-                        | Target::FindNext
-                        | Target::FindReplaceRow
-                        | Target::FindClose
-                        | Target::ReplaceCurrent
-                        | Target::ReplaceAll,
+                        | Target::MenuItem(_),
                     )
                     | None => {}
                 }
@@ -2273,6 +2293,177 @@ mod tests {
             assert!(!row_text(&buf, y).starts_with(" 1 "), "{y}");
         }
         assert!(row_text(&buf, 2 + errors).starts_with(" 1 hello world"));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The column of `needle` on drawn row `y`.
+    fn drawn_column(app: &mut TermApp, y: u16, needle: &str) -> u16 {
+        let buf = draw(app);
+        column_of(&row_text(&buf, y), needle)
+    }
+
+    #[test]
+    fn clicking_the_find_field_focuses_it_at_the_clicked_column() {
+        let dir = temp_dir("find-click-field");
+        let mut app = app_with_text(&dir, "hello world", KeyboardMode::Enhanced);
+        app.handle(ctrl('f'), Instant::now());
+        type_text(&mut app, "hello");
+        draw(&mut app);
+        left_click(&mut app, 5, 2);
+        assert_eq!(app.focus, Focus::Editor);
+
+        draw(&mut app);
+        left_click(&mut app, 6 + 2, 1);
+        assert_eq!(app.focus, Focus::Find(FindField::Pattern));
+        assert_eq!(
+            frame_cursor(&mut app),
+            Some(ratatui::layout::Position::new(8, 1))
+        );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn clicking_match_case_toggles_it_and_keeps_focus() {
+        let dir = temp_dir("find-click-case");
+        let mut app = app_with_text(&dir, "hello world", KeyboardMode::Enhanced);
+        app.handle(ctrl('f'), Instant::now());
+        let x = drawn_column(&mut app, 1, "[Aa]");
+        assert_eq!(x, 21);
+        left_click(&mut app, x, 1);
+        assert!(app.editor().search().query().case_sensitive);
+        assert_eq!(app.focus, Focus::Find(FindField::Pattern));
+
+        draw(&mut app);
+        left_click(&mut app, 5, 2);
+        assert_eq!(app.focus, Focus::Editor);
+        draw(&mut app);
+        left_click(&mut app, x, 1);
+        assert!(!app.editor().search().query().case_sensitive);
+        assert_eq!(app.focus, Focus::Editor);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn clicking_next_and_prev_steps_the_match() {
+        let dir = temp_dir("find-click-step");
+        let mut app = app_with_text(&dir, "hello hello hello", KeyboardMode::Enhanced);
+        let id = active_id(&app);
+        app.handle(ctrl('f'), Instant::now());
+        type_text(&mut app, "hello");
+        let next = drawn_column(&mut app, 1, "[Next]");
+        assert_eq!(next, 48);
+        left_click(&mut app, next, 1);
+        assert_eq!(app.buffer.selection(id), Some(6..11));
+        assert_eq!(app.focus, Focus::Find(FindField::Pattern));
+
+        let prev = drawn_column(&mut app, 1, "[Prev]");
+        assert_eq!(prev, 41);
+        left_click(&mut app, prev, 1);
+        assert_eq!(app.buffer.selection(id), Some(0..5));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn clicking_replace_shows_the_replace_row() {
+        let dir = temp_dir("find-click-replace-row");
+        let mut app = app_with_text(&dir, "hello world", KeyboardMode::Enhanced);
+        app.handle(ctrl('f'), Instant::now());
+        let x = drawn_column(&mut app, 1, "[Replace]");
+        assert_eq!(x, 67);
+        left_click(&mut app, x, 1);
+        assert!(app.editor().search().replace_open());
+        let buf = draw(&mut app);
+        assert!(row_text(&buf, 2).starts_with(" With "));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn clicking_close_closes_the_bar() {
+        let dir = temp_dir("find-click-close");
+        let mut app = app_with_text(&dir, "hello world", KeyboardMode::Enhanced);
+        app.handle(ctrl('f'), Instant::now());
+        let x = drawn_column(&mut app, 1, "[\u{d7}]");
+        assert_eq!(x, 77);
+        left_click(&mut app, x, 1);
+        assert!(!app.editor().search().is_open());
+        let buf = draw(&mut app);
+        assert!(row_text(&buf, 1).starts_with(" 1 hello world"));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn clicking_replace_all_replaces_every_match() {
+        let dir = temp_dir("find-click-replace-all");
+        let mut app = app_with_text(&dir, "a b a", KeyboardMode::Enhanced);
+        app.handle(ctrl('h'), Instant::now());
+        type_text(&mut app, "a");
+        press(&mut app, KeyCode::Tab, KeyModifiers::NONE, 1);
+        type_text(&mut app, "x");
+        let x = drawn_column(&mut app, 2, "[Replace all]");
+        assert_eq!(x, 31);
+        left_click(&mut app, x, 2);
+        assert_eq!(text_of(&app), "x b x");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn hovering_regex_shows_its_hint() {
+        let dir = temp_dir("find-hover-regex");
+        let mut app = app_with_text(&dir, "hello world", KeyboardMode::Enhanced);
+        app.handle(ctrl('f'), Instant::now());
+        let x = drawn_column(&mut app, 1, "[.*]");
+        assert_eq!(x, 30);
+        app.handle(mouse(MouseEventKind::Moved, x, 1), Instant::now());
+        assert_eq!(app.status.hint(), Some("Regular expression (Alt+R)"));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_paste_into_the_find_field_sets_the_pattern() {
+        let dir = temp_dir("find-paste");
+        let mut app = app_with_text(&dir, "hello world", KeyboardMode::Enhanced);
+        app.handle(ctrl('f'), Instant::now());
+        app.handle(
+            AppEvent::Input(Event::Paste("wor".to_owned())),
+            Instant::now(),
+        );
+        assert_eq!(app.editor().search().query().pattern, "wor");
+        assert_eq!(app.editor().search().count_label(), "1/1");
+        assert_eq!(text_of(&app), "hello world");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_paste_with_the_editor_focused_goes_to_the_buffer() {
+        let dir = temp_dir("find-paste-editor");
+        let mut app = app_with_text(&dir, "hello world", KeyboardMode::Enhanced);
+        app.handle(ctrl('f'), Instant::now());
+        type_text(&mut app, "hello");
+        draw(&mut app);
+        left_click(&mut app, 3, 2);
+        assert_eq!(app.focus, Focus::Editor);
+        app.handle(
+            AppEvent::Input(Event::Paste("zz".to_owned())),
+            Instant::now(),
+        );
+        assert_eq!(text_of(&app), "zzhello world");
+        assert_eq!(app.editor().search().query().pattern, "hello");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn clicks_on_the_bar_with_a_prompt_open_do_nothing_to_it() {
+        let dir = temp_dir("find-click-prompt");
+        let mut app = app_with_text(&dir, "hello world", KeyboardMode::Enhanced);
+        app.handle(ctrl('f'), Instant::now());
+        let x = drawn_column(&mut app, 1, "[Aa]");
+        app.handle(ctrl('o'), Instant::now());
+        assert!(app.prompt.is_open(app.editor()));
+        let focus = app.focus;
+        draw(&mut app);
+        left_click(&mut app, x, 1);
+        assert!(!app.editor().search().query().case_sensitive);
+        assert_eq!(app.focus, focus);
         fs::remove_dir_all(&dir).unwrap();
     }
 }
