@@ -501,18 +501,16 @@ impl TermApp {
 
     /// Applies `command` and queues the effects it returns.
     ///
-    /// The editor's selection is passed to core first, while the editor
-    /// or a find field has focus. A text-editing command is recorded in
+    /// The editor's selection is passed to core first, whatever has
+    /// focus, as the GUI keeps reporting the editor's cursor range while
+    /// the editor is unfocused. A text-editing command is recorded in
     /// the active tab's undo history as one group, redoing to the
     /// selection the command sets for that tab, if any.
     fn send(&mut self, command: Command, now: Instant) {
-        let selection = match self.focus {
-            Focus::Editor | Focus::Find(_) => self
-                .editor
-                .active_tab()
-                .and_then(|tab| self.buffer.selection(tab.id)),
-            Focus::Sidebar => None,
-        };
+        let selection = self
+            .editor
+            .active_tab()
+            .and_then(|tab| self.buffer.selection(tab.id));
         self.editor.set_selection(selection);
         let edits_text = matches!(
             command,
@@ -2371,6 +2369,36 @@ mod tests {
         assert_eq!(app.editor().search().count_label(), "1/4");
 
         app.handle(alt('l'), Instant::now());
+        assert!(app.editor().search().in_selection());
+        assert_eq!(app.editor().search().count_label(), "1/2");
+        assert!(app.editor().search().matches().iter().all(|m| m.end <= 3));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn in_selection_from_the_sidebar_uses_the_editor_selection() {
+        let dir = temp_dir("find-in-selection-sidebar");
+        let ws = dir.join("ws");
+        fs::create_dir_all(&ws).unwrap();
+        let file = ws.join("text.txt");
+        fs::write(&file, "a a\na a").unwrap();
+        let editor = open_editor(&dir, std::slice::from_ref(&file), Some(&ws));
+        let mut app = TermApp::new(editor, KeyboardMode::Enhanced, ws.clone(), None);
+        draw(&mut app);
+        assert!(app.sidebar_shown());
+        press(&mut app, KeyCode::End, KeyModifiers::SHIFT, 1);
+        assert_eq!(app.buffer.selection(active_id(&app)), Some(0..3));
+        app.handle(ctrl('f'), Instant::now());
+        press(&mut app, KeyCode::Backspace, KeyModifiers::NONE, 3);
+        type_text(&mut app, "a");
+        assert_eq!(app.editor().search().count_label(), "1/4");
+        app.handle(ctrl('e'), Instant::now());
+        assert_eq!(app.focus, Focus::Editor);
+        app.handle(ctrl('e'), Instant::now());
+        assert_eq!(app.focus, Focus::Sidebar);
+
+        let x = drawn_column(&mut app, 1, "[sel]");
+        left_click(&mut app, x, 1);
         assert!(app.editor().search().in_selection());
         assert_eq!(app.editor().search().count_label(), "1/2");
         assert!(app.editor().search().matches().iter().all(|m| m.end <= 3));
