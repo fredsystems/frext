@@ -792,13 +792,15 @@ impl TermApp {
                 self.status.set_hint(None);
             }
         }
+        let proofread = self.editor.proofread();
+        let diagnostics = tab.map_or_else(Vec::new, |tab| proofread.diagnostics(tab.id, &tab.text));
         let caret = self.buffer.render(
             tab,
             areas.gutter,
             areas.editor,
             Overlays {
                 matches: self.editor.match_highlights_ref(),
-                diagnostics: &[],
+                diagnostics: &diagnostics,
             },
             buf,
             &mut self.hits,
@@ -807,9 +809,19 @@ impl TermApp {
         let (left, right) = tab.map_or_else(
             || (String::new(), String::new()),
             |tab| {
-                let left = tab.path.as_deref().map_or_else(
-                    || tab.display_name(),
-                    |path| self.editor.relative_to_root(path),
+                // The caret as the view holds it after rendering.
+                let at_caret = self
+                    .buffer
+                    .caret(tab.id)
+                    .and_then(|caret| proofread.diagnostic_at(tab.id, &tab.text, caret));
+                let left = at_caret.map_or_else(
+                    || {
+                        tab.path.as_deref().map_or_else(
+                            || tab.display_name(),
+                            |path| self.editor.relative_to_root(path),
+                        )
+                    },
+                    |diagnostic| diagnostic.message.clone(),
                 );
                 let mut language = language_from_path(tab.path.as_deref());
                 if language.is_empty() {
@@ -861,9 +873,11 @@ mod tests {
     use frext_core::highlight::MatchBackground;
     use frext_core::palette::BASE;
     use frext_core::persistence::Store;
+    use frext_core::proofread::{Diagnostic, DiagnosticKind};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use ratatui::buffer::Buffer;
+    use ratatui::style::{Color, Modifier};
 
     use super::*;
     use crate::theme;
@@ -3776,6 +3790,145 @@ mod tests {
             assert_eq!(app.hovered, None);
             assert_eq!(app.status.hint(), None);
         }
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Runs one proofreading pass over the active tab and waits for it:
+    /// starts the editor's worker with a notify that signals a channel,
+    /// queues a check, waits for the notify, then polls. Must be the
+    /// first `begin_frame` on `app` (only the first notify is kept).
+    ///
+    /// The worker sends each result before calling notify, so once the
+    /// notify arrives the result for this one request is ready to poll.
+    fn proofread(app: &mut TermApp) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.begin_frame(move || {
+            let _ = tx.send(());
+        });
+        app.end_frame();
+        rx.recv_timeout(Duration::from_secs(60)).unwrap();
+        app.begin_frame(|| {});
+    }
+
+    const MISSPELT: &str = "This is a tset of the editor.";
+
+    /// Wide enough that neither a temp-dir path nor a diagnostic message
+    /// is truncated on the status row.
+    const STATUS_WIDTH: u16 = 300;
+
+    /// The spelling diagnostic over `tset` in the active tab.
+    fn tset_diagnostic(app: &TermApp) -> Diagnostic {
+        let tab = app.editor().active_tab().unwrap();
+        app.editor()
+            .proofread()
+            .diagnostics(tab.id, &tab.text)
+            .into_iter()
+            .find(|d| d.kind == DiagnosticKind::Spelling && d.flagged == "tset")
+            .cloned()
+            .unwrap()
+    }
+
+    /// Whether `cell` carries a squiggle (`Color::Reset` is no colour).
+    fn underline_of(cell: &ratatui::buffer::Cell) -> Option<Color> {
+        Some(cell.underline_color).filter(|&colour| {
+            cell.modifier.contains(Modifier::UNDERLINED) && colour != Color::Reset
+        })
+    }
+
+    /// The status row text the path of the active tab gives.
+    fn path_status(app: &TermApp) -> String {
+        let tab = app.editor().active_tab().unwrap();
+        format!(
+            " {} ",
+            app.editor().relative_to_root(tab.path.as_deref().unwrap())
+        )
+    }
+
+    #[test]
+    fn proofreading_results_repaint_as_squiggles() {
+        let dir = temp_dir("squiggles");
+        let mut app = app_with_text(&dir, MISSPELT, KeyboardMode::Enhanced);
+        let buf = draw(&mut app);
+        let unchecked: Vec<_> = (1..23)
+            .flat_map(|y| (0..80).map(move |x| (x, y)))
+            .filter(|&(x, y)| underline_of(&buf[(x, y)]).is_some())
+            .collect();
+        assert!(
+            unchecked.is_empty(),
+            "underlined before checking: {unchecked:?}"
+        );
+
+        // The repaint path: the worker's notify fires, `begin_frame`
+        // polls the result, and the next draw shows it.
+        proofread(&mut app);
+        let diagnostic = tset_diagnostic(&app);
+        let buf = draw(&mut app);
+        // The gutter " 1 " is three columns wide; the text is ASCII.
+        for char_idx in diagnostic.chars.clone() {
+            let x = 3 + u16::try_from(char_idx).unwrap();
+            assert_eq!(
+                underline_of(&buf[(x, 1)]),
+                Some(theme::squiggle(DiagnosticKind::Spelling)),
+                "char {char_idx} of {diagnostic:?}"
+            );
+        }
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_status_line_shows_the_diagnostic_under_the_caret() {
+        let dir = temp_dir("status-diagnostic");
+        let mut app = app_with_text(&dir, MISSPELT, KeyboardMode::Enhanced);
+        proofread(&mut app);
+        let diagnostic = tset_diagnostic(&app);
+        let tab_id = app.editor().active_tab().unwrap().id;
+        assert_eq!(app.buffer.caret(tab_id), Some(0));
+        assert!(
+            app.editor()
+                .proofread()
+                .diagnostic_at(tab_id, MISSPELT, 0)
+                .is_none()
+        );
+
+        press(
+            &mut app,
+            KeyCode::Right,
+            KeyModifiers::NONE,
+            diagnostic.chars.start + 1,
+        );
+        let buf = draw_sized(&mut app, STATUS_WIDTH, 24);
+        assert!(
+            row_text(&buf, 23).starts_with(&format!(" {} ", diagnostic.message)),
+            "{:?}",
+            row_text(&buf, 23)
+        );
+
+        app.handle(key(KeyCode::Home, KeyModifiers::NONE), Instant::now());
+        assert_eq!(app.buffer.caret(tab_id), Some(0));
+        let buf = draw_sized(&mut app, STATUS_WIDTH, 24);
+        let status = row_text(&buf, 23);
+        assert!(status.starts_with(&path_status(&app)), "{status:?}");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_status_message_outranks_the_diagnostic_under_the_caret() {
+        let dir = temp_dir("status-message-over-diagnostic");
+        let mut app = app_with_text(&dir, MISSPELT, KeyboardMode::Enhanced);
+        proofread(&mut app);
+        let diagnostic = tset_diagnostic(&app);
+        press(
+            &mut app,
+            KeyCode::Right,
+            KeyModifiers::NONE,
+            diagnostic.chars.start + 1,
+        );
+        app.status
+            .set_message("Saved", MessageKind::Info, Instant::now());
+        let buf = draw_sized(&mut app, STATUS_WIDTH, 24);
+        let status = row_text(&buf, 23);
+        assert!(status.starts_with(" Saved "), "{status:?}");
+        assert!(!status.contains(&diagnostic.message), "{status:?}");
         fs::remove_dir_all(&dir).unwrap();
     }
 }
