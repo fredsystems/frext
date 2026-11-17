@@ -380,6 +380,14 @@ mod tests {
             squiggle(DiagnosticKind::Grammar),
             color(palette::grammar_squiggle())
         );
+        assert_eq!(
+            squiggle(DiagnosticKind::Spelling),
+            Color::Rgb(0xf3, 0x8b, 0xa8)
+        );
+        assert_eq!(
+            squiggle(DiagnosticKind::Grammar),
+            Color::Rgb(0xa6, 0xe3, 0xa1)
+        );
         assert_ne!(
             squiggle(DiagnosticKind::Spelling),
             squiggle(DiagnosticKind::Grammar)

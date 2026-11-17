@@ -16,6 +16,7 @@ use frext_core::tab::Tab;
 use frext_term::buffer::edit::EditAction;
 use frext_term::buffer::{BufferView, Overlays};
 use frext_term::hit::HitMap;
+use frext_term::theme;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 
@@ -104,13 +105,13 @@ fn render_with(
 /// One diagnostic over every `self` in `src`, alternating spelling and
 /// grammar.
 fn self_diagnostics(src: &str) -> Vec<Diagnostic> {
-    let (mut byte, mut char) = (0, 0);
+    let (mut byte, mut chars) = (0, 0);
     src.match_indices("self")
         .enumerate()
         .map(|(n, (i, s))| {
-            char += src[byte..i].chars().count();
+            chars += src.get(byte..i).unwrap_or("").chars().count();
             byte = i;
-            let start = char;
+            let start = chars;
             Diagnostic {
                 kind: if n % 2 == 0 {
                     DiagnosticKind::Spelling
@@ -151,6 +152,19 @@ fn bench_buffer(c: &mut Criterion) {
     let mut view = BufferView::default();
     render(&mut view, &tab, &mut buf, &mut hits);
     view.set_selection(&tab, line_2500..line_2500);
+    render(&mut view, &tab, &mut buf, &mut hits);
+    let squiggles = Overlays {
+        diagnostics: &diagnostic_refs,
+        ..Overlays::default()
+    };
+    render_with(&mut view, &tab, squiggles, &mut buf, &mut hits);
+    let spelling = theme::squiggle(DiagnosticKind::Spelling);
+    assert!(
+        buf.content()
+            .iter()
+            .any(|cell| cell.underline_color == spelling),
+        "the squiggle bench must draw a spelling squiggle"
+    );
     render(&mut view, &tab, &mut buf, &mut hits);
 
     let mut group = c.benchmark_group("buffer");
