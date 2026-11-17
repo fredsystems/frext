@@ -679,6 +679,76 @@ was checked to fail without the 07.9 refresh).
 Every review-fix subtask: the standard ritual; do NOT touch files
 outside its scope; one commit each, reviewed before committing.
 
+### 07.13 -- 07.14: Review fixes (PR #45)
+
+Copilot and CodeRabbit reviewed PR #45. Two accepted findings:
+
+- **Lookups do not match drawing for multi-char graphemes.** 07.10
+  underlines every grapheme a diagnostic intersects, but right-click
+  looks up `Probe::Cell` at the grapheme's first char only, so for
+  `"cafe\u{301} x"` with a diagnostic at `4..5` the underlined `é`
+  opens the plain menu. Caret lookups have the same gap at grapheme
+  boundaries.
+- **The keyboard menu is placed from the previous frame.** Its anchor
+  comes from `caret_cell` over the last render's rect, so Esc (closing
+  the find bar, which moves the editor up two rows) then Shift+F10 in
+  one batch anchors the menu two rows below where the caret is drawn
+  next.
+
+Decisions:
+
+- **One range lookup.** `Probe` is dropped and `diagnostic_in` becomes
+  `diagnostic_in(diagnostics: &[&Diagnostic], chars: Range<usize>)`:
+  the first diagnostic whose `chars` intersect `chars` (half-open, the
+  renderer's rule), spelling first. A drawn cell passes its grapheme's
+  char range. A caret passes the graphemes either side of it, from the
+  start of the grapheme ending at the caret to the end of the grapheme
+  starting there. Over single-char graphemes that is `c - 1 .. c + 1`,
+  whose intersection test is exactly the old end-inclusive caret rule,
+  so `Proofreading::diagnostic_at` (the GUI's) keeps its behaviour by
+  passing `char_idx.saturating_sub(1) .. char_idx + 1`.
+- **The keyboard menu follows the caret at render time.** `TermApp`
+  records how the open menu was placed:
+  `enum MenuOrigin { Pointer, Caret }`. Each `render`, after the buffer
+  is drawn, a `Caret` menu is re-anchored with `ContextMenu::set_anchor`
+  to `Below` the caret position `render` just returned, or `At` the
+  editor's top-left when the caret is off screen. A pointer-placed menu
+  never moves. The menu is modal and a resize closes it, so the caret
+  does not move under an open menu; the re-anchor only corrects a stale
+  first placement.
+
+#### 07.13 -- Range lookups for cells and carets
+
+Scope: `frext-core/src/proofread/state.rs`, `frext-term/src/buffer/wrap.rs`,
+`frext-term/src/buffer/mod.rs`, `frext-term/src/app.rs`.
+
+What: the "One range lookup" decision. `WrapLayout::grapheme_at` and
+`BufferView::grapheme_at_cell` return the grapheme's char range
+(`Option<Range<usize>>`). A `BufferView::caret_span(&self, tab) ->
+Option<Range<usize>>` (graphemes either side of the caret, clamped to
+the text) serves the keyboard menu and the status line.
+
+Deliverable: core tests rewritten for ranges (cell, caret-equivalent
+`c - 1 .. c + 1`, spelling preference, adjacency: a range ending where
+a diagnostic starts does not match); `diagnostic_at`'s tests unchanged;
+buffer tests for the returned ranges (combining mark, wide char, tab)
+and `caret_span` (start, end, between, combining mark). The app has
+no seam for hand-placed diagnostics (they come only from Harper), so
+the combining-mark case is pinned by those unit tests; the existing
+app tests over real Harper results must keep passing unchanged.
+
+#### 07.14 -- The keyboard menu follows the caret at render time
+
+Scope: `frext-term/src/menu.rs`, `frext-term/src/app.rs`.
+
+What: the "follows the caret" decision; `ContextMenu::set_anchor(&mut
+self, anchor: MenuAnchor)`.
+
+Deliverable: a menu test for `set_anchor`; app tests: with the find
+bar open and drawn, Esc then Shift+F10 with no draw, then a draw: the
+menu's rect starts on the row under the caret as drawn by that frame;
+a right-click menu stays where it was opened across draws.
+
 ## Manual smoke checklist
 
 Run in a real terminal (kitty or freminal, then a terminal without
