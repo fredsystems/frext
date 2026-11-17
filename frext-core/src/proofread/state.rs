@@ -1,9 +1,11 @@
 //! Per-session proofreading state the app drives each frame: which revision
 //! of each tab was last sent to the [`Worker`], the latest results per tab,
-//! the personal dictionary, and the session's ignored diagnostics.
+//! the personal dictionary, and the session's ignored diagnostics. Also
+//! [`diagnostic_in`], the lookup of the diagnostic at a [`Probe`]d position.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::hash::{DefaultHasher, Hash, Hasher};
+use std::ops::Range;
 use std::path::Path;
 
 use super::worker::{CheckRequest, CheckResult, Worker};
@@ -149,8 +151,10 @@ impl Proofreading {
     /// The diagnostic under the cursor position `char_idx`, preferring a
     /// spelling one when several overlap (its fixes are the most specific).
     ///
-    /// The range end is inclusive: a click on the right half of a word's
-    /// last glyph resolves to the cursor position just *after* it.
+    /// This is [`diagnostic_in`] over [`Self::diagnostics`] with
+    /// [`Probe::Caret`]: the range end is inclusive, so a click on the right
+    /// half of a word's last glyph resolves to the cursor position just
+    /// *after* it.
     #[must_use]
     pub fn diagnostic_at<'a>(
         &'a self,
@@ -158,18 +162,7 @@ impl Proofreading {
         text: &'a str,
         char_idx: usize,
     ) -> Option<&'a Diagnostic> {
-        let mut hits = self
-            .diagnostics(tab_id, text)
-            .into_iter()
-            .filter(|d| d.chars.start <= char_idx && char_idx <= d.chars.end);
-        let first = hits.next()?;
-        if first.kind == DiagnosticKind::Spelling {
-            return Some(first);
-        }
-        Some(
-            hits.find(|d| d.kind == DiagnosticKind::Spelling)
-                .unwrap_or(first),
-        )
+        diagnostic_in(&self.diagnostics(tab_id, text), char_idx, Probe::Caret)
     }
 
     /// Add `word` to the personal dictionary. Returns `true` if it was new,
@@ -215,6 +208,53 @@ impl Proofreading {
         log::error!("proofreading worker stopped; proofreading disabled");
         self.worker = WorkerSlot::Unavailable;
     }
+}
+
+/// What a char position names when looking up a diagnostic with
+/// [`diagnostic_in`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Probe {
+    /// A cursor position between chars, so a diagnostic's end counts: a
+    /// caret just after a word is "in" it.
+    Caret,
+    /// One char (a terminal cell, a clicked glyph), so a diagnostic's range
+    /// is half-open: the char just after a word is not in it.
+    Cell,
+}
+
+impl Probe {
+    /// Whether `chars` holds `char_idx` under this probe.
+    fn holds(self, chars: &Range<usize>, char_idx: usize) -> bool {
+        match self {
+            Self::Caret => chars.start <= char_idx && char_idx <= chars.end,
+            Self::Cell => chars.start <= char_idx && char_idx < chars.end,
+        }
+    }
+}
+
+/// The diagnostic among `diagnostics` at `char_idx`, read per `probe`.
+///
+/// Of those whose `chars` hold `char_idx`, the first is returned, unless it
+/// is not a spelling diagnostic and a later one is, in which case the first
+/// spelling one wins (its fixes are the most specific).
+#[must_use]
+pub fn diagnostic_in<'a>(
+    diagnostics: &[&'a Diagnostic],
+    char_idx: usize,
+    probe: Probe,
+) -> Option<&'a Diagnostic> {
+    let mut hits = diagnostics
+        .iter()
+        .copied()
+        .filter(|d| probe.holds(&d.chars, char_idx));
+    let first = hits.next()?;
+    if first.kind == DiagnosticKind::Spelling {
+        return Some(first);
+    }
+    Some(
+        hits.find(|d| d.kind == DiagnosticKind::Spelling)
+            .unwrap_or(first),
+    )
 }
 
 /// A revision id for a (text, path) pair. Only ever compared for equality
@@ -370,6 +410,55 @@ mod tests {
         // Just past the end of "wrrod" (cursor after its last glyph).
         assert_eq!(at(9), Some(DiagnosticKind::Spelling));
         assert_eq!(at(10), None);
+    }
+
+    #[test]
+    fn caret_includes_the_end_and_cell_does_not() {
+        let text = "a wrrod here";
+        let wrrod = diagnostic(DiagnosticKind::Spelling, text, "wrrod");
+        assert_eq!(wrrod.chars, 2..7);
+        let all = [&wrrod];
+        let at = |idx, probe| diagnostic_in(&all, idx, probe).map(|d| d.flagged.as_str());
+        for probe in [Probe::Caret, Probe::Cell] {
+            assert_eq!(at(1, probe), None, "{probe:?} before start");
+            assert_eq!(at(2, probe), Some("wrrod"), "{probe:?} at start");
+            assert_eq!(at(6, probe), Some("wrrod"), "{probe:?} on last char");
+        }
+        assert_eq!(at(7, Probe::Caret), Some("wrrod"));
+        assert_eq!(at(7, Probe::Cell), None);
+        assert_eq!(at(8, Probe::Caret), None);
+    }
+
+    #[test]
+    fn diagnostic_in_prefers_overlapping_spelling_for_both_probes() {
+        let text = "the wrrod here";
+        let grammar = diagnostic(DiagnosticKind::Grammar, text, "the wrrod");
+        let spelling = diagnostic(DiagnosticKind::Spelling, text, "wrrod");
+        let all = [&grammar, &spelling];
+        for probe in [Probe::Caret, Probe::Cell] {
+            let kind = diagnostic_in(&all, 5, probe).map(|d| d.kind);
+            assert_eq!(kind, Some(DiagnosticKind::Spelling), "{probe:?}");
+            let kind = diagnostic_in(&all, 1, probe).map(|d| d.kind);
+            assert_eq!(kind, Some(DiagnosticKind::Grammar), "{probe:?}");
+        }
+    }
+
+    #[test]
+    fn grammar_starting_at_a_spelling_end_wins_only_for_a_cell() {
+        let text = "wrrod, here";
+        let spelling = diagnostic(DiagnosticKind::Spelling, text, "wrrod");
+        let grammar = diagnostic(DiagnosticKind::Grammar, text, ", here");
+        assert_eq!(spelling.chars.end, grammar.chars.start);
+        let all = [&spelling, &grammar];
+        let at = |probe| diagnostic_in(&all, 5, probe).map(|d| d.kind);
+        assert_eq!(at(Probe::Cell), Some(DiagnosticKind::Grammar));
+        assert_eq!(at(Probe::Caret), Some(DiagnosticKind::Spelling));
+    }
+
+    #[test]
+    fn diagnostic_in_an_empty_slice_is_none() {
+        assert!(diagnostic_in(&[], 0, Probe::Caret).is_none());
+        assert!(diagnostic_in(&[], 0, Probe::Cell).is_none());
     }
 
     #[test]
