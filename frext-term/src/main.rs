@@ -13,7 +13,13 @@ use frext_term::terminal::TerminalGuard;
 use frext_term::{cli, logging, run};
 
 fn main() -> ExitCode {
-    let args = cli::parse(std::env::args_os().skip(1));
+    let args = match cli::parse(std::env::args_os().skip(1)) {
+        Ok(args) => args,
+        Err(err) => {
+            eprintln!("frext-term: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
 
     let store = match Store::new(Profile::Term) {
         Ok(store) => store,
