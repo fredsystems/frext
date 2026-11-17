@@ -401,7 +401,8 @@ impl Editor {
         self.persist_active_swap();
         // Keep the cursor near where we just replaced.
         self.recompute_matches();
-        // Focus the match at (or after) the replaced position.
+        // Focus the match at (or after) the replaced position, wrapping to
+        // the first when none follows.
         if let Some(pos) = self
             .search
             .matches
@@ -409,6 +410,8 @@ impl Editor {
             .position(|m| m.start >= range.start)
         {
             self.search.current = Some(pos);
+        } else if !self.search.matches.is_empty() {
+            self.search.current = Some(0);
         }
         let effects = self
             .search
@@ -1045,6 +1048,38 @@ mod tests {
                 Effect::SetSelection {
                     tab_id,
                     chars: 0..5,
+                    focus: EditorFocus::Keep,
+                },
+                Effect::RevealSelection { tab_id },
+            ]
+        );
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn replacing_when_no_match_follows_wraps_to_the_first() {
+        let dir = temp_dir("search-replace-wrap-none-after");
+        // Replacing the last "ab" with "b" leaves a new match before the
+        // replaced position, so none starts at or after it.
+        let mut editor = editor_with_two_tabs(&dir, "ab ab aab", "");
+        *editor.search_replacement_mut() = "b".to_owned();
+        find(&mut editor, "ab");
+        editor.apply(Command::StepMatch(StepDirection::Forward));
+        editor.apply(Command::StepMatch(StepDirection::Forward));
+        assert_eq!(editor.search().current(), Some(2));
+        let tab_id = editor.active_tab().unwrap().id;
+
+        let outcome = editor.apply(Command::ReplaceCurrent);
+
+        assert_eq!(editor.active_tab().unwrap().text, "ab ab ab");
+        assert_eq!(editor.search().current(), Some(0));
+        assert_eq!(
+            outcome.effects,
+            vec![
+                Effect::SetSelection {
+                    tab_id,
+                    chars: 0..2,
                     focus: EditorFocus::Keep,
                 },
                 Effect::RevealSelection { tab_id },
