@@ -1,6 +1,6 @@
 # 08 -- TUI file icons (kitty images, Nerd Font)
 
-- **Status:** active
+- **Status:** pending merge
 - **Depends on:** 05, 06
 - **Branch:** `feat/frext-term-file-icons` (one branch, one commit per
   subtask, one PR)
