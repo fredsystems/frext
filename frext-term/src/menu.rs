@@ -219,6 +219,10 @@ impl<T: Clone> ContextMenu<T> {
     /// Draws the menu over `area` and records its hit regions: the whole
     /// menu as [`Target::MenuPopup`], then each item row as
     /// [`Target::MenuItem`] with its entry index.
+    ///
+    /// When the menu is clamped shorter than its entries, only a window of
+    /// them is drawn: from the first entry, or scrolled down just enough
+    /// that the highlighted item is on the last row.
     pub fn render(&self, area: Rect, buf: &mut Buffer, hits: &mut HitMap) {
         let r = self.rect(area.intersection(buf.area));
         Clear.render(r, buf);
@@ -229,13 +233,13 @@ impl<T: Clone> ContextMenu<T> {
         block.render(r, buf);
         hits.push(r, Target::MenuPopup);
 
-        for (index, entry) in self.entries.iter().enumerate() {
-            let Ok(offset) = u16::try_from(index) else {
-                break;
-            };
-            if offset >= inner.height {
-                break;
-            }
+        let rows = usize::from(inner.height);
+        let start = match self.highlighted {
+            Some(highlighted) if rows > 0 && highlighted + 1 > rows => highlighted + 1 - rows,
+            _ => 0,
+        };
+        let visible = self.entries.iter().enumerate().skip(start).take(rows);
+        for (offset, (index, entry)) in (0..inner.height).zip(visible) {
             let y = inner.y + offset;
             match entry {
                 MenuEntry::Item { label, enabled, .. } => {
@@ -503,6 +507,69 @@ mod tests {
         }
         assert_eq!(buf[(1, 4)].style().fg, theme::popup_border().fg);
         assert_eq!(buf[(5, 4)].style().fg, theme::popup_border().fg);
+    }
+
+    /// Nine entries, the size of the editor menu: Cut, Copy, Paste, ---,
+    /// Select all, ---, Undo, Redo, Last.
+    fn tall(anchor: Position) -> ContextMenu<u8> {
+        ContextMenu::new(
+            vec![
+                item("Cut", Enablement::Enabled, 0),
+                item("Copy", Enablement::Enabled, 1),
+                item("Paste", Enablement::Enabled, 2),
+                MenuEntry::Separator,
+                item("Select all", Enablement::Enabled, 3),
+                MenuEntry::Separator,
+                item("Undo", Enablement::Enabled, 4),
+                item("Redo", Enablement::Enabled, 5),
+                item("Last", Enablement::Enabled, 6),
+            ],
+            anchor,
+        )
+    }
+
+    fn render_into(menu: &ContextMenu<u8>, area: Rect) -> (Buffer, HitMap) {
+        let mut buf = Buffer::empty(area);
+        let mut hits = HitMap::default();
+        menu.render(area, &mut buf, &mut hits);
+        (buf, hits)
+    }
+
+    #[test]
+    fn a_clamped_menu_scrolls_to_show_the_highlighted_item() {
+        // 8 rows tall: the 11-row menu is clamped to 6 inner rows.
+        let area = Rect::new(0, 0, 20, 8);
+        let mut menu = tall(Position::new(0, 0));
+        menu.handle_key(press(KeyCode::Up));
+        assert_eq!(menu.highlighted(), Some(8));
+        let (buf, hits) = render_into(&menu, area);
+
+        // Entries 3..9 are drawn on rows 1..7.
+        assert_eq!(row_text(&buf, 1), "├────────────┤      ");
+        assert_eq!(row_text(&buf, 2), "│ Select all │      ");
+        assert_eq!(row_text(&buf, 5), "│ Redo       │      ");
+        assert_eq!(row_text(&buf, 6), "│ Last       │      ");
+        for x in 1..13 {
+            assert_eq!(buf[(x, 6)].style().bg, theme::button_focused().bg);
+        }
+        assert_eq!(hits.hit(2, 6), Some(Target::MenuItem(8)));
+        assert_eq!(hits.hit(2, 2), Some(Target::MenuItem(4)));
+        for y in 0..8 {
+            let row = row_text(&buf, y);
+            assert!(!row.contains("Cut") && !row.contains("Copy"), "{row:?}");
+        }
+    }
+
+    #[test]
+    fn a_clamped_menu_with_nothing_highlighted_starts_at_the_first_entry() {
+        let area = Rect::new(0, 0, 20, 8);
+        let (buf, hits) = render_into(&tall(Position::new(0, 0)), area);
+        assert_eq!(row_text(&buf, 1), "│ Cut        │      ");
+        assert_eq!(row_text(&buf, 5), "│ Select all │      ");
+        assert_eq!(row_text(&buf, 6), "├────────────┤      ");
+        assert_eq!(hits.hit(2, 1), Some(Target::MenuItem(0)));
+        assert_eq!(hits.hit(2, 5), Some(Target::MenuItem(4)));
+        assert_eq!(hits.hit(2, 6), Some(Target::MenuPopup));
     }
 
     #[test]
