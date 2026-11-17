@@ -24,6 +24,7 @@ use crate::buffer::edit::{Applied, EditAction};
 use crate::buffer::{BufferView, WHEEL_ROWS};
 use crate::editor_menu;
 use crate::events::AppEvent;
+use crate::find_bar::{self, FindBar, FindField, FindReply};
 use crate::hit::{HitMap, Target};
 use crate::keymap::{self, Action, Focus, KeyContext};
 use crate::layout;
@@ -39,9 +40,6 @@ const SIDEBAR_WIDTH: u16 = 30;
 
 /// Shown on startup when the kitty keyboard protocol is unavailable.
 const LEGACY_MESSAGE: &str = "Kitty keyboard protocol unavailable: use Ctrl+R for find and replace";
-
-/// Shown when a find key is pressed before the find bar exists.
-const FIND_BAR_MESSAGE: &str = "Find bar is not available yet";
 
 /// Whether the user wants the sidebar shown (when there is a workspace).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -65,6 +63,7 @@ pub struct TermApp {
     sidebar: SidebarVisibility,
     prompt: PromptUi,
     menu: Option<ContextMenu<Command>>,
+    find: FindBar,
     buffer: BufferView,
     status: StatusLine,
     hovered: Option<Target>,
@@ -97,6 +96,7 @@ impl TermApp {
             sidebar: SidebarVisibility::Shown,
             prompt: PromptUi::new(base, home),
             menu: None,
+            find: FindBar::new(),
             buffer: BufferView::default(),
             status,
             hovered: None,
@@ -138,10 +138,18 @@ impl TermApp {
         self.editor.workspace().is_some() && self.sidebar == SidebarVisibility::Shown
     }
 
-    /// Returns focus to the editor when the sidebar is not shown.
+    /// Moves focus off a pane that is not shown: the sidebar or the find
+    /// bar back to the editor, and the "With" field back to the find
+    /// field when the replace row is hidden.
     fn settle_focus(&mut self) {
         if self.focus == Focus::Sidebar && !self.sidebar_shown() {
             self.set_focus(Focus::Editor);
+        }
+        let search = self.editor.search();
+        if matches!(self.focus, Focus::Find(_)) && !search.is_open() {
+            self.set_focus(Focus::Editor);
+        } else if self.focus == Focus::Find(FindField::Replacement) && !search.replace_open() {
+            self.set_focus(Focus::Find(FindField::Pattern));
         }
     }
 
@@ -158,7 +166,7 @@ impl TermApp {
     }
 
     /// Routes one event, then applies the effects it queued, so the next
-    /// event in the same batch sees them.
+    /// event in the same batch sees them, and settles the focus again.
     pub fn handle(&mut self, event: AppEvent, now: Instant) {
         self.prompt.sync(&self.editor);
         self.settle_focus();
@@ -185,6 +193,7 @@ impl TermApp {
             AppEvent::InputClosed => self.quit = Quit::Requested,
         }
         self.apply_effects();
+        self.settle_focus();
     }
 
     /// Persists an edit the buffer view made to the active tab.
@@ -226,10 +235,17 @@ impl TermApp {
             focus: self.focus,
         };
         let Some(action) = keymap::action_for(key, ctx) else {
+            if let Focus::Find(field) = self.focus {
+                match self.find.handle_key(&mut self.editor, field, key) {
+                    FindReply::Send(command) => self.send(command, now),
+                    FindReply::Focus(field) => self.set_focus(Focus::Find(field)),
+                    FindReply::Handled | FindReply::Ignored => {}
+                }
+            }
             return;
         };
         match action {
-            Action::Command(command) => self.send_command(command, now),
+            Action::Command(command) => self.send(command, now),
             Action::OpenFilePrompt => self.open_file_prompt(),
             Action::Quit => self.quit = Quit::Requested,
             Action::ToggleSidebar => {
@@ -253,17 +269,6 @@ impl TermApp {
         }
     }
 
-    /// Sends a command chosen from a key binding or the editor menu. The
-    /// find commands also note that the find bar is not drawn yet.
-    fn send_command(&mut self, command: Command, now: Instant) {
-        let find = matches!(command, Command::OpenSearch(_));
-        self.send(command, now);
-        if find {
-            self.status
-                .set_message(FIND_BAR_MESSAGE, MessageKind::Info, now);
-        }
-    }
-
     /// Acts on the open menu's reply: a choice closes it and is sent, a
     /// dismissal closes it. Either way the hit map, which still holds the
     /// menu's rows, is dropped until the next render.
@@ -271,7 +276,7 @@ impl TermApp {
         match reply {
             MenuReply::Chosen(command) => {
                 self.menu = None;
-                self.send_command(command, now);
+                self.send(command, now);
             }
             MenuReply::Dismissed => self.forget_layout(),
             MenuReply::Handled => {}
@@ -504,7 +509,12 @@ impl TermApp {
                     }
                 }
                 Effect::FocusPromptField => self.prompt.focus_field(&self.editor),
-                Effect::FocusSearchField => {}
+                Effect::FocusSearchField => {
+                    if self.editor.search().is_open() {
+                        self.find.focus_field(&self.editor, FindField::Pattern);
+                        self.set_focus(Focus::Find(FindField::Pattern));
+                    }
+                }
             }
         }
         self.buffer
@@ -520,7 +530,7 @@ impl TermApp {
         let sidebar_width = self.sidebar_shown().then_some(SIDEBAR_WIDTH);
         let areas = layout::areas(
             area,
-            u16::from(self.editor.search().is_open()),
+            find_bar::height(self.editor.search()),
             sidebar_width,
             gutter_width,
         );
@@ -536,7 +546,18 @@ impl TermApp {
             buf,
             &mut self.hits,
         );
-        fill(buf, areas.find_bar, theme::chrome());
+        let find_focus = match self.focus {
+            Focus::Find(field) => Some(field),
+            Focus::Editor | Focus::Sidebar => None,
+        };
+        let find_cursor = self.find.render(
+            &self.editor,
+            find_focus,
+            self.hovered,
+            areas.find_bar,
+            buf,
+            &mut self.hits,
+        );
         fill(buf, areas.sidebar, theme::chrome());
         let caret = self.buffer.render(
             tab,
@@ -571,10 +592,10 @@ impl TermApp {
         }
 
         let prompt_cursor = self.prompt.render(&self.editor, area, buf, &mut self.hits);
-        let editor_cursor = caret.filter(|_| {
-            self.focus == Focus::Editor && self.menu.is_none() && !self.prompt.is_open(&self.editor)
-        });
-        if let Some(position) = prompt_cursor.or(editor_cursor) {
+        let unobscured = self.menu.is_none() && !self.prompt.is_open(&self.editor);
+        let editor_cursor = caret.filter(|_| self.focus == Focus::Editor && unobscured);
+        let find_cursor = find_cursor.filter(|_| find_focus.is_some() && unobscured);
+        if let Some(position) = prompt_cursor.or(editor_cursor).or(find_cursor) {
             frame.set_cursor_position(position);
         }
     }
@@ -1001,16 +1022,12 @@ mod tests {
         assert!(!app.editor().search().is_open());
         app.handle(ctrl('r'), now);
         assert!(app.editor().search().is_open());
-        assert_eq!(
-            app.status.message(),
-            Some((FIND_BAR_MESSAGE, MessageKind::Info))
-        );
-        app.apply_effects();
 
-        // The find-bar row is reserved, pushing the editor down a row.
+        // The find and replace rows push the editor down two rows.
         let buf = draw(&mut app);
-        assert_eq!(row_text(&buf, 1).trim(), "");
-        assert!(row_text(&buf, 2).starts_with(" 1 "));
+        assert!(row_text(&buf, 1).starts_with(" Find "));
+        assert!(row_text(&buf, 2).starts_with(" With "));
+        assert!(row_text(&buf, 3).starts_with(" 1 "));
 
         app.handle(key(KeyCode::Esc, KeyModifiers::NONE), now);
         assert!(!app.editor().search().is_open());
@@ -1527,9 +1544,12 @@ mod tests {
         let mut app = app_with_text(&dir, "hello world hello", KeyboardMode::Enhanced);
         press(&mut app, KeyCode::Right, KeyModifiers::SHIFT, 5);
         app.handle(ctrl('f'), Instant::now());
-        // The selection colour wins over a match, so collapse it to show
-        // the first match's own background.
-        press(&mut app, KeyCode::Right, KeyModifiers::NONE, 1);
+        // The selection colour wins over a match, so collapse it (with a
+        // click past the end of the line, which also focuses the editor)
+        // to show the first match's own background.
+        draw(&mut app);
+        left_click(&mut app, 60, 2);
+        assert_eq!(app.focus, Focus::Editor);
         let buf = draw(&mut app);
         // The find bar row sits under the tab bar, so the text is on row 2.
         let row = row_text(&buf, 2);
@@ -1559,9 +1579,10 @@ mod tests {
     #[test]
     fn a_tick_after_four_seconds_clears_the_message() {
         let dir = temp_dir("tick");
-        let mut app = app(&dir, &[], KeyboardMode::Enhanced);
+        // The legacy startup message is set when the app is made, just
+        // before `start`.
+        let mut app = app(&dir, &[], KeyboardMode::Legacy);
         let start = Instant::now();
-        app.handle(ctrl('f'), start);
         app.handle(AppEvent::Tick, start + Duration::from_secs(3));
         assert!(app.status.message().is_some());
         app.handle(AppEvent::Tick, start + Duration::from_secs(4));
@@ -1900,10 +1921,9 @@ mod tests {
         );
         assert!(app.menu.is_none());
         assert!(app.editor().search().is_open());
-        assert_eq!(
-            app.status.message(),
-            Some((FIND_BAR_MESSAGE, MessageKind::Info))
-        );
+        assert_eq!(app.focus, Focus::Find(FindField::Pattern));
+        let buf = draw(&mut app);
+        assert!(row_text(&buf, 1).starts_with(" Find "));
         fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -2013,6 +2033,246 @@ mod tests {
 
         app.handle(key(KeyCode::Esc, KeyModifiers::NONE), Instant::now());
         assert!(frame_cursor(&mut app).is_some());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    fn alt(c: char) -> AppEvent {
+        key(KeyCode::Char(c), KeyModifiers::ALT)
+    }
+
+    #[test]
+    fn ctrl_f_draws_the_bar_and_focuses_the_find_field() {
+        let dir = temp_dir("find-open");
+        let mut app = app_with_text(&dir, "hello world", KeyboardMode::Enhanced);
+        app.handle(ctrl('f'), Instant::now());
+        assert_eq!(app.focus, Focus::Find(FindField::Pattern));
+        let buf = draw(&mut app);
+        assert!(row_text(&buf, 1).starts_with(" Find "));
+        assert!(row_text(&buf, 2).starts_with(" 1 hello world"));
+        let cursor = frame_cursor(&mut app).unwrap();
+        assert_eq!(cursor.y, 1);
+        assert!((6..20).contains(&cursor.x), "{cursor:?}");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn typing_in_the_find_field_searches_and_highlights() {
+        use frext_core::highlight::MatchBackground;
+
+        let dir = temp_dir("find-typing");
+        let mut app = app_with_text(&dir, "hello world", KeyboardMode::Enhanced);
+        app.handle(ctrl('f'), Instant::now());
+        type_text(&mut app, "wor");
+        assert_eq!(app.editor().search().query().pattern, "wor");
+        assert_eq!(text_of(&app), "hello world");
+        let buf = draw(&mut app);
+        assert!(row_text(&buf, 1).contains("1/1"), "{:?}", row_text(&buf, 1));
+        let row = row_text(&buf, 2);
+        let start = column_of(&row, "world");
+        for x in 0..3 {
+            assert_eq!(
+                buf[(start + x, 2)].bg,
+                theme::match_bg(MatchBackground::Current)
+            );
+        }
+        assert_eq!(
+            frame_cursor(&mut app),
+            Some(ratatui::layout::Position::new(9, 1))
+        );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn enter_shift_enter_and_f3_step_from_the_find_field() {
+        let dir = temp_dir("find-step");
+        let mut app = app_with_text(&dir, "hello hello hello", KeyboardMode::Enhanced);
+        let id = active_id(&app);
+        app.handle(ctrl('f'), Instant::now());
+        type_text(&mut app, "hello");
+        assert_eq!(app.editor().search().count_label(), "1/3");
+
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, 1);
+        assert_eq!(app.buffer.selection(id), Some(6..11));
+        assert_eq!(app.focus, Focus::Find(FindField::Pattern));
+        assert_eq!(app.editor().search().count_label(), "2/3");
+
+        press(&mut app, KeyCode::Enter, KeyModifiers::SHIFT, 1);
+        assert_eq!(app.buffer.selection(id), Some(0..5));
+        assert_eq!(app.focus, Focus::Find(FindField::Pattern));
+
+        press(&mut app, KeyCode::F(3), KeyModifiers::NONE, 1);
+        assert_eq!(app.buffer.selection(id), Some(6..11));
+        assert_eq!(app.focus, Focus::Find(FindField::Pattern));
+        assert_eq!(app.editor().search().query().pattern, "hello");
+        assert_eq!(text_of(&app), "hello hello hello");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn alt_c_toggles_match_case_from_the_find_field() {
+        let dir = temp_dir("find-case");
+        let mut app = app_with_text(&dir, "Hello hello", KeyboardMode::Enhanced);
+        app.handle(ctrl('f'), Instant::now());
+        type_text(&mut app, "hello");
+        assert_eq!(app.editor().search().count_label(), "1/2");
+        app.handle(alt('c'), Instant::now());
+        assert!(app.editor().search().query().case_sensitive);
+        assert_eq!(app.editor().search().count_label(), "1/1");
+        assert_eq!(app.editor().search().query().pattern, "hello");
+        assert_eq!(app.focus, Focus::Find(FindField::Pattern));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn replace_from_the_with_field_is_undoable_in_the_editor() {
+        let dir = temp_dir("find-replace");
+        let mut app = app_with_text(&dir, "hello world", KeyboardMode::Enhanced);
+        app.handle(ctrl('h'), Instant::now());
+        assert_eq!(app.focus, Focus::Find(FindField::Pattern));
+        let buf = draw(&mut app);
+        assert!(row_text(&buf, 1).starts_with(" Find "));
+        assert!(row_text(&buf, 2).starts_with(" With "));
+        assert!(row_text(&buf, 3).starts_with(" 1 hello world"));
+
+        type_text(&mut app, "world");
+        press(&mut app, KeyCode::Tab, KeyModifiers::NONE, 1);
+        assert_eq!(app.focus, Focus::Find(FindField::Replacement));
+        type_text(&mut app, "bye");
+        assert_eq!(app.editor().search().replacement(), "bye");
+        assert_eq!(app.editor().search().query().pattern, "world");
+
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, 1);
+        assert_eq!(text_of(&app), "hello bye");
+        assert_eq!(app.focus, Focus::Find(FindField::Replacement));
+
+        draw(&mut app);
+        left_click(&mut app, 5, 3);
+        assert_eq!(app.focus, Focus::Editor);
+        app.handle(ctrl('z'), Instant::now());
+        assert_eq!(text_of(&app), "hello world");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn hiding_the_replace_row_moves_focus_to_the_find_field() {
+        let dir = temp_dir("find-hide-replace");
+        let mut app = app_with_text(&dir, "hello world", KeyboardMode::Enhanced);
+        app.handle(ctrl('h'), Instant::now());
+        press(&mut app, KeyCode::Tab, KeyModifiers::NONE, 1);
+        assert_eq!(app.focus, Focus::Find(FindField::Replacement));
+
+        // Ctrl+F switches the open bar to find only.
+        app.handle(ctrl('f'), Instant::now());
+        assert!(!app.editor().search().replace_open());
+        assert_eq!(app.focus, Focus::Find(FindField::Pattern));
+        let buf = draw(&mut app);
+        assert!(row_text(&buf, 1).starts_with(" Find "));
+        assert!(!row_text(&buf, 2).starts_with(" With "));
+        assert!(row_text(&buf, 2).starts_with(" 1 hello world"));
+
+        // `ToggleReplaceRow` itself (as the bar's [Replace] button sends
+        // it) settles the focus on the next event.
+        app.handle(ctrl('h'), Instant::now());
+        press(&mut app, KeyCode::Tab, KeyModifiers::NONE, 1);
+        assert_eq!(app.focus, Focus::Find(FindField::Replacement));
+        app.send(Command::ToggleReplaceRow, Instant::now());
+        assert!(!app.editor().search().replace_open());
+        app.handle(AppEvent::Wake, Instant::now());
+        assert_eq!(app.focus, Focus::Find(FindField::Pattern));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn esc_closes_the_bar_and_returns_focus_to_the_editor() {
+        let dir = temp_dir("find-esc");
+        let mut app = app_with_text(&dir, "hello world", KeyboardMode::Enhanced);
+        app.handle(ctrl('f'), Instant::now());
+        type_text(&mut app, "wor");
+        assert_eq!(frame_cursor(&mut app).unwrap().y, 1);
+
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE, 1);
+        assert!(!app.editor().search().is_open());
+        assert_eq!(app.focus, Focus::Editor);
+        let buf = draw(&mut app);
+        assert!(row_text(&buf, 1).starts_with(" 1 hello world"));
+        // The caret never moved: it is at the start of the text.
+        assert_eq!(
+            frame_cursor(&mut app),
+            Some(ratatui::layout::Position::new(3, 1))
+        );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_seeded_pattern_puts_the_field_cursor_at_its_end() {
+        let dir = temp_dir("find-seed-cursor");
+        let mut app = app_with_hello_selected(&dir);
+        app.handle(ctrl('f'), Instant::now());
+        assert_eq!(app.editor().search().query().pattern, "hello");
+        assert_eq!(app.focus, Focus::Find(FindField::Pattern));
+        assert_eq!(
+            frame_cursor(&mut app),
+            Some(ratatui::layout::Position::new(6 + 5, 1))
+        );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn in_selection_from_the_find_field_uses_the_editor_selection() {
+        let dir = temp_dir("find-in-selection");
+        let mut app = app_with_text(&dir, "a a\na a", KeyboardMode::Enhanced);
+        press(&mut app, KeyCode::End, KeyModifiers::SHIFT, 1);
+        assert_eq!(app.buffer.selection(active_id(&app)), Some(0..3));
+        app.handle(ctrl('f'), Instant::now());
+        assert_eq!(app.editor().search().query().pattern, "a a");
+        press(&mut app, KeyCode::Backspace, KeyModifiers::NONE, 3);
+        assert_eq!(app.editor().search().query().pattern, "");
+        type_text(&mut app, "a");
+        assert_eq!(app.editor().search().count_label(), "1/4");
+
+        app.handle(alt('l'), Instant::now());
+        assert!(app.editor().search().in_selection());
+        assert_eq!(app.editor().search().count_label(), "1/2");
+        assert!(app.editor().search().matches().iter().all(|m| m.end <= 3));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn legacy_ctrl_h_in_the_find_field_deletes_a_char() {
+        let dir = temp_dir("find-legacy-ctrl-h");
+        let mut app = app_with_text(&dir, "abc", KeyboardMode::Legacy);
+        app.handle(ctrl('f'), Instant::now());
+        type_text(&mut app, "ab");
+        assert_eq!(app.editor().search().query().pattern, "ab");
+        app.handle(ctrl('h'), Instant::now());
+        assert_eq!(app.editor().search().query().pattern, "a");
+        assert_eq!(app.focus, Focus::Find(FindField::Pattern));
+        assert_eq!(text_of(&app), "abc");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_regex_error_draws_its_rows_and_moves_the_editor_down() {
+        let dir = temp_dir("find-regex-error");
+        let mut app = app_with_text(&dir, "hello world", KeyboardMode::Enhanced);
+        app.handle(ctrl('f'), Instant::now());
+        app.handle(alt('r'), Instant::now());
+        type_text(&mut app, "(");
+        assert!(app.editor().search().error().is_some());
+        let errors = u16::try_from(find_bar::error_lines(app.editor().search()).len()).unwrap();
+        assert!(errors > 0);
+
+        let buf = draw(&mut app);
+        assert!(row_text(&buf, 1).starts_with(" Find "));
+        assert!(
+            row_text(&buf, 2).starts_with(" regex:"),
+            "{:?}",
+            row_text(&buf, 2)
+        );
+        for y in 2..=1 + errors {
+            assert!(!row_text(&buf, y).starts_with(" 1 "), "{y}");
+        }
+        assert!(row_text(&buf, 2 + errors).starts_with(" 1 hello world"));
         fs::remove_dir_all(&dir).unwrap();
     }
 }
