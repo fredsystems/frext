@@ -11,12 +11,16 @@
 use frext_core::editor::FolderState;
 use frext_core::palette::{self, Rgb};
 
+use crate::term::caps::{IconChoice, Multiplexer};
 use crate::term::kitty::ImageId;
 
 pub mod kitty;
 pub mod nerd;
 pub mod nerd_table;
 pub mod raster;
+
+use kitty::KittyIcons;
+use nerd::NerdIcons;
 
 /// The width of the icon slot in front of a tree row, in cells.
 pub const ICON_WIDTH: u16 = 2;
@@ -105,6 +109,57 @@ impl IconProvider for AsciiIcons {
     }
 }
 
+/// Whether escape output carries colours. crossterm drops every colour
+/// when `NO_COLOR` is set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnsiColours {
+    /// Colours are written.
+    Enabled,
+    /// Colours are dropped.
+    Disabled,
+}
+
+impl AnsiColours {
+    /// What crossterm will do with colours, as decided by `NO_COLOR`.
+    #[must_use]
+    pub fn from_env() -> Self {
+        if crossterm::style::Colored::ansi_color_disabled() {
+            Self::Disabled
+        } else {
+            Self::Enabled
+        }
+    }
+}
+
+/// The provider for `choice`: kitty icons wrapped for `multiplexer`,
+/// Nerd Font, ASCII or no icons.
+///
+/// Kitty icons need colour output, because the image id travels in the
+/// placeholder's foreground colour; under [`AnsiColours::Disabled`] a
+/// kitty choice gives Nerd Font icons instead.
+#[must_use]
+pub fn provider(
+    choice: IconChoice,
+    multiplexer: Multiplexer,
+    colours: AnsiColours,
+) -> Box<dyn IconProvider> {
+    match (choice, colours) {
+        (IconChoice::Kitty { cell_px }, AnsiColours::Enabled) => {
+            Box::new(KittyIcons::new(cell_px, multiplexer))
+        }
+        (IconChoice::Kitty { .. }, AnsiColours::Disabled) => {
+            log::warn!(
+                "kitty icons need colour output (the image id travels in the \
+                 placeholder's foreground colour); falling back to Nerd Font icons"
+            );
+            Box::new(NerdIcons)
+        }
+        (IconChoice::Nerd, _) => Box::new(NerdIcons),
+        (IconChoice::Ascii, _) => Box::new(AsciiIcons),
+        (IconChoice::None, _) => Box::new(NoIcons),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -180,6 +235,45 @@ mod tests {
         }
         assert!(NoIcons.take_uploads().is_empty());
         assert!(NoIcons.release().is_empty());
+    }
+
+    const KITTY: IconChoice = IconChoice::Kitty {
+        cell_px: crate::term::caps::CellPx {
+            width: 10,
+            height: 20,
+        },
+    };
+
+    fn provider_name(choice: IconChoice, colours: AnsiColours) -> String {
+        format!("{:?}", provider(choice, Multiplexer::None, colours))
+    }
+
+    #[test]
+    fn kitty_choice_with_colours_gives_kitty_icons() {
+        assert!(provider_name(KITTY, AnsiColours::Enabled).starts_with("KittyIcons"));
+    }
+
+    #[test]
+    fn kitty_choice_without_colours_falls_back_to_nerd_icons() {
+        assert!(provider_name(KITTY, AnsiColours::Disabled).starts_with("NerdIcons"));
+    }
+
+    #[test]
+    fn other_choices_give_their_providers() {
+        for colours in [AnsiColours::Enabled, AnsiColours::Disabled] {
+            assert!(provider_name(IconChoice::Nerd, colours).starts_with("NerdIcons"));
+            assert!(provider_name(IconChoice::Ascii, colours).starts_with("AsciiIcons"));
+            assert!(provider_name(IconChoice::None, colours).starts_with("NoIcons"));
+        }
+    }
+
+    #[test]
+    fn ansi_colours_from_env_is_callable() {
+        let colours = AnsiColours::from_env();
+        assert!(matches!(
+            colours,
+            AnsiColours::Enabled | AnsiColours::Disabled
+        ));
     }
 
     /// The `(glyph, colour)` the Nerd table has for `stem`.

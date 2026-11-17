@@ -1,5 +1,6 @@
 //! frext-term binary entry point.
 
+use std::io::Write;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Instant;
@@ -10,6 +11,7 @@ use frext_core::persistence::{Profile, Store};
 use frext_term::app::TermApp;
 use frext_term::clipboard::{ClipboardChoice, make_clipboard};
 use frext_term::events::{EventLoop, TICK};
+use frext_term::icons::{self, AnsiColours};
 use frext_term::term::caps::IconChoice;
 use frext_term::term::late_replies::{self, LateReplyFilter};
 use frext_term::terminal::TerminalGuard;
@@ -71,12 +73,16 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    log::info!(
-        "icons: {:?}",
-        IconChoice::select(settings.icons, guard.caps())
+    let icon_choice = IconChoice::select(settings.icons, guard.caps());
+    log::info!("icons: {icon_choice:?}");
+    let icons = icons::provider(
+        icon_choice,
+        guard.caps().multiplexer,
+        AnsiColours::from_env(),
     );
 
     let mut app = TermApp::new(editor, guard.mode(), base, home);
+    app.set_icons(icons);
 
     // Spawned after `enter`, so the terminal probe is not raced by the
     // input reader.
@@ -98,6 +104,13 @@ fn main() -> ExitCode {
     }
 
     let result = run::run(&mut app, &mut terminal, &events, Instant::now);
+    let release = app.release_graphics();
+    if !release.is_empty() {
+        let backend = terminal.backend_mut();
+        if let Err(err) = backend.write_all(&release).and_then(|()| backend.flush()) {
+            log::warn!("failed to release the icon images: {err}");
+        }
+    }
     app.shutdown();
     drop(terminal);
     drop(guard);
