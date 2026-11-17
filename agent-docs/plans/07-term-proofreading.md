@@ -691,9 +691,9 @@ Copilot and CodeRabbit reviewed PR #45. Two accepted findings:
   boundaries.
 - **The keyboard menu is placed from the previous frame.** Its anchor
   comes from `caret_cell` over the last render's rect, so Esc (closing
-  the find bar, which moves the editor up two rows) then Shift+F10 in
-  one batch anchors the menu two rows below where the caret is drawn
-  next.
+  the find bar, which moves the editor up one row, or two with the
+  replace row) then Shift+F10 in one batch anchors the menu that far
+  below where the caret is drawn next.
 
 Decisions:
 
