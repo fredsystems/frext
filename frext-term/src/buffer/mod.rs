@@ -370,6 +370,14 @@ impl BufferView {
         view.known = text_hash(text);
     }
 
+    /// Closes the open typing group of the tab with `tab_id`, if the view
+    /// knows it, so the next edit starts a new undo step.
+    pub fn break_group(&mut self, tab_id: u64) {
+        if let Some(view) = self.tabs.get_mut(&tab_id) {
+            view.history.break_group();
+        }
+    }
+
     /// The selected chars of the tab with `tab_id`, if the view knows it.
     #[must_use]
     pub fn selection(&self, tab_id: u64) -> Option<Range<usize>> {
@@ -869,6 +877,22 @@ mod tests {
     fn record_outside_edit_without_a_selection_uses_the_diff_end() {
         // The diff cannot tell where in "aaa" the 'a' went: it picks the end.
         assert_eq!(redo_caret_after_repeated_insert(None), Some(4));
+    }
+
+    #[test]
+    fn break_group_splits_typing_into_two_undo_steps() {
+        let mut tab = tab(1, "");
+        let mut view = BufferView::default();
+        let base = Instant::now();
+        draw(&mut view, Some(&tab), 12, 3);
+        view.handle(&mut tab, EditAction::Type('a'), base);
+        view.break_group(1);
+        view.handle(&mut tab, EditAction::Type('b'), base);
+        view.handle(&mut tab, EditAction::Undo, ms(base, 10));
+        assert_eq!(tab.text, "a");
+        // An unknown tab is ignored.
+        view.break_group(99);
+        assert_eq!(view.caret(99), None);
     }
 
     #[test]

@@ -141,8 +141,20 @@ impl TermApp {
     /// Returns focus to the editor when the sidebar is not shown.
     fn settle_focus(&mut self) {
         if self.focus == Focus::Sidebar && !self.sidebar_shown() {
-            self.focus = Focus::Editor;
+            self.set_focus(Focus::Editor);
         }
+    }
+
+    /// Moves focus to `focus`. An actual change closes the active tab's
+    /// typing group, so typing after it starts a new undo step.
+    fn set_focus(&mut self, focus: Focus) {
+        if focus == self.focus {
+            return;
+        }
+        if let Some(tab) = self.editor.active_tab() {
+            self.buffer.break_group(tab.id);
+        }
+        self.focus = focus;
     }
 
     /// Routes one event, then applies the effects it queued, so the next
@@ -230,13 +242,13 @@ impl TermApp {
             }
             Action::ToggleFocus => {
                 if self.sidebar_shown() {
-                    self.focus = match self.focus {
+                    self.set_focus(match self.focus {
                         Focus::Editor => Focus::Sidebar,
                         Focus::Sidebar => Focus::Editor,
-                    };
+                    });
                 }
             }
-            Action::FocusEditor => self.focus = Focus::Editor,
+            Action::FocusEditor => self.set_focus(Focus::Editor),
             Action::Edit(action) => self.edit(action, now),
         }
     }
@@ -343,7 +355,7 @@ impl TermApp {
                             self.buffer
                                 .mouse_down(tab, mouse.column, mouse.row, selecting, now);
                         }
-                        self.focus = Focus::Editor;
+                        self.set_focus(Focus::Editor);
                     }
                     Some(
                         Target::PromptPopup
@@ -375,7 +387,7 @@ impl TermApp {
                         Position::new(mouse.column, mouse.row),
                     ));
                     // The chosen command acts on the editor's selection.
-                    self.focus = Focus::Editor;
+                    self.set_focus(Focus::Editor);
                 }
             }
             MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
@@ -423,6 +435,9 @@ impl TermApp {
             .active_tab()
             .filter(|_| edits_text)
             .map(|tab| (tab.id, tab.text.clone()));
+        if let Some(tab) = self.editor.active_tab() {
+            self.buffer.break_group(tab.id);
+        }
         let outcome = self.editor.apply(command);
         if outcome.buffer == BufferChange::Edited
             && let Some((id, before)) = before
@@ -471,7 +486,7 @@ impl TermApp {
                         self.buffer.set_selection(tab, chars);
                     }
                     if focus == EditorFocus::Focus {
-                        self.focus = Focus::Editor;
+                        self.set_focus(Focus::Editor);
                     }
                 }
                 Effect::RevealSelection { tab_id } => {
@@ -1310,6 +1325,42 @@ mod tests {
         app.handle(ctrl('z'), Instant::now());
         assert_eq!(text_of(&app), "");
         app.handle(ctrl('y'), Instant::now());
+        assert_eq!(text_of(&app), "a");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_core_command_breaks_the_typing_group() {
+        let dir = temp_dir("save-breaks-group");
+        let mut app = app_with_text(&dir, "", KeyboardMode::Enhanced);
+        let now = Instant::now();
+        app.handle(key(KeyCode::Char('a'), KeyModifiers::NONE), now);
+        app.handle(ctrl('s'), now);
+        assert!(!app.editor().active_tab().unwrap().is_dirty());
+        app.handle(key(KeyCode::Char('b'), KeyModifiers::NONE), now);
+        assert_eq!(text_of(&app), "ab");
+        app.handle(ctrl('z'), now);
+        assert_eq!(text_of(&app), "a");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_focus_change_breaks_the_typing_group() {
+        let dir = temp_dir("focus-breaks-group");
+        let ws = dir.join("ws");
+        fs::create_dir_all(&ws).unwrap();
+        let editor = open_editor(&dir, &[], Some(&ws));
+        let mut app = TermApp::new(editor, KeyboardMode::Enhanced, ws.clone(), None);
+        draw(&mut app);
+        let now = Instant::now();
+        app.handle(key(KeyCode::Char('a'), KeyModifiers::NONE), now);
+        app.handle(ctrl('e'), now);
+        assert_eq!(app.focus, Focus::Sidebar);
+        app.handle(ctrl('e'), now);
+        assert_eq!(app.focus, Focus::Editor);
+        app.handle(key(KeyCode::Char('b'), KeyModifiers::NONE), now);
+        assert_eq!(text_of(&app), "ab");
+        app.handle(ctrl('z'), now);
         assert_eq!(text_of(&app), "a");
         fs::remove_dir_all(&dir).unwrap();
     }
