@@ -1,6 +1,6 @@
 # 04 -- TUI find and replace
 
-- **Status:** active
+- **Status:** pending merge
 - **Depends on:** 03
 - **Branch:** `feat/frext-term-find-replace` (one branch, one commit per
   subtask, one PR)
@@ -914,3 +914,18 @@ Recorded, not changed:
 - Alt+letter does not reach the app in freminal, which sends a plain
   letter. That is a freminal bug, fixed in freminal; wezterm and kitty
   work.
+
+Benchmark results (`frext-term` `buffer`, criterion middle estimates,
+each fix against a baseline taken just before it):
+
+| Bench                               | Before C | After C  | Before F | After F  |
+| ----------------------------------- | -------- | -------- | -------- | -------- |
+| `type_and_render_rust_5k_lines`     | 7.189 ms | 7.241 ms | 7.238 ms | 7.193 ms |
+| `render_only_rust_5k_lines`         | 1.271 ms | 1.287 ms | 1.280 ms | 1.287 ms |
+| `render_with_matches_rust_5k_lines` | 1.279 ms | 1.297 ms | 1.268 ms | 1.287 ms |
+
+All changes are within 3%. The bench has only one or two matches on
+screen, so C's binary search pays off with many matches, or with a long
+line, which this bench does not show. F's shared `paint::fill` keeps the
+row-then-column loop of the old buffer copies: a `positions()` version
+cost up to 4%.
