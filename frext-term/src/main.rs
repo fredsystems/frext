@@ -11,6 +11,7 @@ use frext_term::app::TermApp;
 use frext_term::clipboard::{ClipboardChoice, make_clipboard};
 use frext_term::events::{EventLoop, TICK};
 use frext_term::term::caps::IconChoice;
+use frext_term::term::late_replies::{self, LateReplyFilter};
 use frext_term::terminal::TerminalGuard;
 use frext_term::{cli, logging, run};
 
@@ -81,7 +82,11 @@ fn main() -> ExitCode {
     // input reader.
     let events = EventLoop::new();
     let spawned = events
-        .spawn_input(crossterm::event::read)
+        .spawn_input(late_replies::filtered(
+            crossterm::event::read,
+            LateReplyFilter::new(guard.probe_end(), guard.caps().multiplexer, Instant::now()),
+            Instant::now,
+        ))
         .and_then(|()| events.spawn_tick(TICK));
     if let Err(err) = spawned {
         log::error!("failed to start the event threads: {err}");

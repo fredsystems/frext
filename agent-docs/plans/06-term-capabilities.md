@@ -891,7 +891,8 @@ Surfaced by a CODE-REVIEW pass over `main...60f510b`. Findings 9 and
 10 (the case-insensitive `TERM` match and the trimmed `toml` features)
 were plan-text mismatches, fixed in the plan above. Finding 8 (keys
 typed during the probe are lost) is accepted and recorded under "Bytes
-after DA1". Finding 4 is deferred to 06.10.
+after DA1". Finding 4 was deferred to 06.10, which the PR #44
+review then promoted to a pre-merge fix.
 
 Scope: `frext-term/src/term/probe.rs`, `frext-term/src/terminal.rs`,
 `frext-term/src/term/caps.rs` (one doc comment).
@@ -987,26 +988,138 @@ Tests:
 
 Verification: the standard ritual.
 
-### 06.10 -- Cleanup (deferred): replies arriving after the probe
+### 06.10 -- Late probe replies are not typed into the editor
 
-Surfaced by the 06.9 review (finding 4), on `60f510b`.
+Surfaced by the 06.9 review (finding 4) on `60f510b` and first recorded
+as deferred. Promoted by the CodeRabbit review of PR #44: a reply that
+arrives after the probe gave up reaches crossterm's reader, which turns
+it into key events that type text into the open buffer. That is a
+startup defect, so it is fixed before merge.
 
-- **Surface point:** `probe::read_replies` gives up at the timeout (or
-  at DA1, plus `TMUX_SETTLE` under tmux).
-- **Impact:** a reply that arrives later (a very slow SSH link, or a
-  kitty reply through tmux slower than 100 ms) reaches crossterm's
-  reader, which reads `ESC P` / `ESC _` as Alt+P / Alt+_ and the rest
-  as typed characters, so the text lands in the buffer.
-- **Scope of fix:** `frext-term/src/events.rs` or the app's key
-  routing.
-- **Suggested approach:** when the probe ended without DA1, or under
-  tmux, have the input thread drop key events that form a DCS/APC
-  reply (Alt+P / Alt+_ followed by printable text up to Alt+\) for a
-  short window after startup.
-- **Verification:** a unit test feeding the events a late
-  `ESC P >| … ESC \` produces to the filter, and a manual run over a
-  slow link.
-- **Scheduling:** independent; any later `frext-term` branch.
+How late replies look (crossterm 0.29's parser, checked):
+
+- A DCS / APC / OSC reply (`ESC P …`, `ESC _ …`, `ESC ] …`) arrives as
+  one key press `Alt+P` (`ALT | SHIFT`, `Char('P')`), `Alt+_` or
+  `Alt+]`, then one plain (or Shift for upper case) `Char` press per
+  payload byte, then `Alt+\` for the `ESC \` terminator (or `Ctrl+G`
+  for a BEL terminator). Those events come out back to back, because
+  they were parsed from one read.
+- A late CSI reply (`CSI ? flags u`, DA1, `CSI 6;h;w t`) is never
+  delivered as an event (crossterm keeps the first two internal and
+  drops what it cannot parse), so it needs nothing.
+- A late reply can only happen when the probe ended without DA1
+  (`ReplyEnd::Incomplete`: a timeout, or a probe error) or under tmux
+  (the passthrough kitty reply). Otherwise every reply came before DA1
+  and was consumed.
+
+Scope: `frext-term/src/term/late_replies.rs` (new),
+`frext-term/src/term/mod.rs`, `frext-term/src/terminal.rs`,
+`frext-term/src/main.rs`.
+
+What:
+
+- `term/late_replies.rs`:
+  - `pub const LATE_REPLY_WINDOW: Duration = Duration::from_secs(5);`,
+    `pub const REPLY_GAP: Duration = Duration::from_millis(50);`,
+    `pub const MAX_REPLY_EVENTS: usize = 512;`
+  - `#[derive(Debug, Clone, Copy, PartialEq, Eq)] pub enum Verdict {
+    Pass, Drop }`
+  - `#[derive(Debug, Clone)] pub struct LateReplyFilter` with private
+    state: a private `enum Arming { Never, Until(Instant), NoEnd }`, and
+    a private `enum State { Idle, InReply { last: Instant, events:
+    usize } }`.
+  - `#[must_use] pub fn new(end: ReplyEnd, multiplexer: Multiplexer,
+    now: Instant) -> Self`: armed until `now + LATE_REPLY_WINDOW` when
+    `end == ReplyEnd::Incomplete` or `multiplexer == Multiplexer::Tmux`
+    (`Until`; an overflowing `checked_add` gives `NoEnd`); otherwise
+    `Never`.
+  - `pub fn verdict(&mut self, event: &Event, now: Instant) -> Verdict`.
+    Only key events with `KeyEventKind::Press` count as key events
+    here; everything else is "another event".
+    - `Idle`: when armed (`now` before `armed_until`) and the event is a
+      key press whose modifiers contain `ALT` and whose code is
+      `Char('P')`, `Char('_')` or `Char(']')`: become `InReply { last:
+      now, events: 1 }` and `Drop`. Otherwise `Pass`.
+    - `InReply { last, events }`:
+      - When `now - last > REPLY_GAP` (a person typing, not a burst),
+        or `events >= MAX_REPLY_EVENTS`: become `Idle`, then judge the
+        event as `Idle` would.
+      - A key press `Alt+\` (modifiers contain `ALT`, code
+        `Char('\\')`) or `Ctrl+G` (modifiers exactly `CONTROL`, code
+        `Char('g')`): become `Idle` and `Drop`. One `log::info!` says a
+        late terminal reply of `events + 1` events was dropped (never
+        its content).
+      - A key press `Char(c)` with `c` in `' '..='~'` and modifiers
+        empty or exactly `SHIFT`: `Drop`, setting `last = now` and
+        adding one to `events`.
+      - Anything else: become `Idle` and `Pass`.
+  - `pub fn filtered(mut read: impl FnMut() -> io::Result<Event>, mut
+    filter: LateReplyFilter, now: impl Fn() -> Instant) -> impl FnMut()
+    -> io::Result<Event>`: each call reads until an event the filter
+    passes and returns it. Errors are returned as they come.
+- `terminal.rs`: `TerminalGuard` also stores the probe's `ReplyEnd`
+  (`Replies::default().end` after a probe error) and gains
+  `#[must_use] pub const fn probe_end(&self) -> ReplyEnd`.
+- `main.rs`: `spawn_input(late_replies::filtered(crossterm::event::read,
+  LateReplyFilter::new(guard.probe_end(), guard.caps().multiplexer,
+  Instant::now()), Instant::now))`.
+
+Deliverable: tests in `late_replies.rs` (events built with
+`KeyEvent::new`; `now` values built from one `Instant` plus offsets):
+
+- not armed (`Da1`, no tmux): `Alt+P` and its payload all pass
+- armed (`Incomplete`): the events of `ESC P >|tmux 3.5a ESC \` within
+  1 ms of each other are all dropped, and a following plain `x` passes
+- armed under tmux with `Da1`: the events of `ESC _ Gi=31;OK ESC \`
+  are all dropped
+- a BEL-terminated reply (`Alt+]`, payload, `Ctrl+G`) is dropped
+- after `LATE_REPLY_WINDOW`, `Alt+P` passes
+- `Alt+P` followed 200 ms later by `x`: `Alt+P` is dropped, `x` passes
+  (the gap ends the reply)
+- `Alt+P` followed by an arrow key: the arrow passes, and a later
+  plain `y` passes
+- `Alt+P` followed by more than `MAX_REPLY_EVENTS` printable presses
+  in a burst: the ones past the limit pass
+- key release events and a mouse event inside a reply pass and end it
+- `filtered` over a scripted `read` returning a late reply then `q`
+  returns `q` first; an `Err` from `read` is returned
+- `probe_end` on a directly built guard returns what it was built with
+
+Verification: the standard ritual, plus the orchestrator's
+pseudo-terminal run where the fake terminal answers only after 1.5 s:
+nothing reaches the buffer (the session's swap file stays empty).
+
+### 06.11 -- Review fixes (PR #44)
+
+Surfaced by the Copilot and CodeRabbit reviews of PR #44, checked
+against the code and valid.
+
+Scope: `assets/licenses/ratatui-LICENSE` (new), `ATTRIBUTIONS.md`,
+`frext-term/src/term/backend.rs` (module doc), `frext-term/src/term/probe.rs`.
+
+The fixes:
+
+- **A -- ratatui's licence notice** (Copilot). `backend.rs` copies
+  ratatui-crossterm 0.1.2 code, and MIT requires its copyright and
+  permission notice to be kept.
+  - `assets/licenses/ratatui-LICENSE`: the `LICENSE` file shipped in
+    the ratatui-crossterm 0.1.2 crate, verbatim.
+  - `ATTRIBUTIONS.md`: the intro also mentions adapted third-party
+    source code, and a new `## Adapted source code` section lists
+    `ratatui-crossterm` (upstream URL, the MIT licence, the licence text
+    link, and the file `frext-term/src/term/backend.rs`).
+  - The `backend.rs` module doc points at `ATTRIBUTIONS.md` and the
+    licence file.
+- **B -- the probe log keeps no typed text** (CodeRabbit). `probe`
+  logged every byte it read, including anything typed or pasted during
+  startup. Now a private `fn reply_sequences(bytes: &[u8]) -> Vec<u8>`
+  returns only the complete escape sequences the tokenizer recognises
+  (CSI, DCS, APC, OSC), byte for byte, and `probe` logs that at `debug`
+  instead. Tests: the `KITTY` fixture is returned unchanged; with
+  `hello` before it and `x` inside the gaps, the result is the fixture
+  alone; a cut-off sequence at the end is dropped.
+
+Verification: the standard ritual.
 
 ## Manual smoke checklist
 

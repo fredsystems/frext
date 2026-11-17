@@ -36,7 +36,7 @@ use crate::term::backend::FrextBackend;
 use crate::term::caps::{
     KeyboardProtocol, Multiplexer, TermEnv, TerminalCaps, detect_multiplexer, resolve,
 };
-use crate::term::probe::{PROBE_TIMEOUT, Replies, probe};
+use crate::term::probe::{PROBE_TIMEOUT, Replies, ReplyEnd, probe};
 
 /// Whether the terminal is currently set up and needs restoring.
 static ACTIVE: AtomicBool = AtomicBool::new(false);
@@ -134,6 +134,7 @@ pub fn write_restore(out: &mut impl Write, mode: KeyboardMode) -> io::Result<()>
 pub struct TerminalGuard {
     mode: KeyboardMode,
     caps: TerminalCaps,
+    probe_end: ReplyEnd,
 }
 
 impl TerminalGuard {
@@ -187,7 +188,11 @@ impl TerminalGuard {
         install_panic_hook();
         // From here on, an early return drops the guard, which restores.
         let underline = caps.underline;
-        let guard = Self { mode, caps };
+        let guard = Self {
+            mode,
+            caps,
+            probe_end: replies.end,
+        };
         let terminal = Terminal::new(FrextBackend::new(io::stdout(), underline))?;
         Ok((guard, terminal))
     }
@@ -202,6 +207,13 @@ impl TerminalGuard {
     #[must_use]
     pub const fn caps(&self) -> &TerminalCaps {
         &self.caps
+    }
+
+    /// How the startup probe's replies ended; [`ReplyEnd::Incomplete`]
+    /// after a probe error.
+    #[must_use]
+    pub const fn probe_end(&self) -> ReplyEnd {
+        self.probe_end
     }
 }
 
@@ -416,9 +428,23 @@ mod tests {
         let guard = TerminalGuard {
             mode: KeyboardMode::Legacy,
             caps: caps.clone(),
+            probe_end: ReplyEnd::Da1,
         };
         assert_eq!(guard.mode(), KeyboardMode::Legacy);
         assert_eq!(guard.caps(), &caps);
+    }
+
+    #[test]
+    fn probe_end_reports_what_the_guard_was_built_with() {
+        // Built directly, as above: ACTIVE stays false.
+        for end in [ReplyEnd::Da1, ReplyEnd::Incomplete] {
+            let guard = TerminalGuard {
+                mode: KeyboardMode::Legacy,
+                caps: TerminalCaps::default(),
+                probe_end: end,
+            };
+            assert_eq!(guard.probe_end(), end);
+        }
     }
 
     #[test]

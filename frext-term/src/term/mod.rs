@@ -7,5 +7,6 @@
 
 pub mod backend;
 pub mod caps;
+pub mod late_replies;
 pub mod probe;
 pub mod tmux;
