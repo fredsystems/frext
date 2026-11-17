@@ -149,9 +149,11 @@ These come from reading the current code: `frext-core/src/workspace.rs`,
 - **Width.** `DEFAULT_WIDTH = 30` (the current `SIDEBAR_WIDTH`),
   `MIN_WIDTH = 12`, `MIN_EDITOR_WIDTH = 20`. The width includes the
   border. `clamp_width(width, total) = width.clamp(MIN_WIDTH,
-  total.saturating_sub(MIN_EDITOR_WIDTH).max(MIN_WIDTH))`. The stored
-  width is always clamped against the last rendered terminal width;
-  the app passes `clamp_width(stored, area.width)` to `layout::areas`,
+  total.saturating_sub(MIN_EDITOR_WIDTH).max(MIN_WIDTH))`, where
+  `total` is the terminal width minus the gutter, so the editor text
+  keeps `MIN_EDITOR_WIDTH` columns (05.11 B). The stored width is
+  always clamped against it; the app sets it every render through
+  `FileTree::set_space` and passes the stored width to `layout::areas`,
   which still clamps to the terminal for very small terminals. Dragging
   the border sets the width so the border sits under the mouse:
   `clamp_width(column - area.x + 1, total)`.
@@ -198,7 +200,8 @@ These come from reading the current code: `frext-core/src/workspace.rs`,
     as in the GUI.
   - The wheel over `TreeRow`, `TreeEmpty` or `TreeBorder` scrolls the
     tree by `WHEEL_ROWS` rows, clamped so the last row stays at the
-    bottom at most.
+    bottom at most. Until the next render the moved rows' regions
+    become `TreeScrolled`, which scrolls but ignores clicks (05.11 A).
 - **Menus** (exact GUI labels and order; `…` is U+2026, as in the
   editor menu):
   - File: `Open` (`OpenPath`), separator, `Copy path`,
@@ -767,6 +770,77 @@ Not changed (recorded so they are not re-litigated):
   clamps the menu onto the screen.
 - `total` and `area` go stale while the sidebar is hidden; the next
   render corrects them, and A clamps the width then.
+
+Verification: the standard ritual.
+
+### 05.11 -- Review fixes (PR #43)
+
+Surfaced by the Copilot and CodeRabbit reviews of PR #43 (`c6c5482`),
+all checked against the code and valid.
+
+Scope: `frext-term/src/hit.rs`, `frext-term/src/tree.rs`,
+`frext-term/src/app.rs`, `agent-docs/plans/05-term-file-tree.md` (the
+Width and mouse rules below).
+
+The fixes:
+
+- **A -- a batch of wheel events scrolls by all of them** (Copilot).
+  A tree wheel event called `forget_layout`, so every later wheel event
+  in the same batch hit nothing, and fast scrolling moved only
+  `WHEEL_ROWS` per batch. Now:
+  - `hit::Target` gains `TreeScrolled`: a tree region whose rows moved
+    since the render. It has no hint.
+  - `HitMap` gains `pub fn retarget(&mut self, f: impl Fn(Target) ->
+    Target)`, which maps every region's target in place.
+  - A tree wheel event no longer calls `forget_layout`. Instead it calls
+    `hits.retarget(..)`, turning every `TreeRow(_)` and `TreeEmpty`
+    into `TreeScrolled`, and clears `hovered` and the hint when the
+    hover was a `TreeRow(_)`.
+  - The wheel over `TreeScrolled` scrolls the tree too. Left and right
+    clicks on it do nothing, so a click can never act on a row that has
+    moved.
+- **B -- the 20-column minimum is for the editor text** (Copilot). The
+  limit reserved 20 columns for the gutter and the text together, so a
+  wide sidebar left fewer than 20 text columns. Now:
+  - `FileTree::set_space(&mut self, columns: u16)` stores `total =
+    columns` (the columns the sidebar and the editor text share: the
+    terminal width minus the gutter) and clamps the stored width
+    against it. `render` no longer sets `total` or clamps the width.
+  - `TermApp::render` calls `self.tree.set_space(area.width
+    .saturating_sub(gutter_width))` before the layout, whether or not
+    the sidebar is shown, and passes `self.tree.width()` as the sidebar
+    width when it is shown. Keyboard and drag resizing clamp against the
+    same `total`.
+  - This also keeps `total` current while the sidebar is hidden (05.10's
+    "not changed" note about a stale `total`).
+- **C -- a held drag cannot resize the tree behind a prompt**
+  (CodeRabbit). A `Drag(Left)` while a prompt is open calls
+  `end_resize()` and does not resize, whichever way the prompt opened
+  (Ctrl+O, or a core prompt such as an unsaved-close confirmation).
+- **D -- a stale hover does not come back on the next frame**
+  (CodeRabbit). 05.10 dropped a stale hovered row only for the frame
+  whose refresh changed the rows; `TermApp::hovered` kept the old index
+  and painted it on the next frame. Now `FileTree::render` returns the
+  `Refresh` from its refresh, and `TermApp::render` clears `hovered`
+  and the hint when it is `Changed` and the hover is a `TreeRow(_)`.
+- **E -- tree tests clean up their temp directories** (CodeRabbit).
+  `tree.rs`'s tests keep a `TempDir` guard (a test-only struct owning
+  the path, removing it in `Drop`, ignoring errors) alive for the whole
+  test, and the fixture returns it.
+
+Tests:
+
+- A: three wheel-down events in one batch (no render between them)
+  scroll the 40-file tree by 9 rows; a left click on a row after a
+  wheel event in the same batch does nothing; `retarget` maps only the
+  targets the closure changes
+- B: in 80 columns with a 3-cell gutter, dragging the border to column
+  79 leaves the sidebar `80 - 3 - 20 = 57` wide and the editor text 20
+  columns; `set_space` clamps a stored width
+- C: start a border drag, open the Ctrl+O prompt, then a `Drag(Left)`
+  does not change the width and ends the drag
+- D: after a refresh that changed the rows with a row hovered, two
+  renders in a row paint no hover, and `TermApp::hovered` is `None`
 
 Verification: the standard ritual.
 
