@@ -529,9 +529,14 @@ impl TermApp {
         );
         fill(buf, areas.find_bar, theme::chrome());
         fill(buf, areas.sidebar, theme::chrome());
-        let caret = self
-            .buffer
-            .render(tab, areas.gutter, areas.editor, buf, &mut self.hits);
+        let caret = self.buffer.render(
+            tab,
+            areas.gutter,
+            areas.editor,
+            &self.editor.match_highlights(),
+            buf,
+            &mut self.hits,
+        );
 
         let (left, right) = tab.map_or_else(
             || (String::new(), String::new()),
@@ -1502,6 +1507,43 @@ mod tests {
         app.handle(ctrl('f'), Instant::now());
         assert!(app.editor().search().is_open());
         assert_eq!(app.editor().search().query().pattern, "hello");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn open_search_paints_its_matches_in_the_editor() {
+        use frext_core::highlight::MatchBackground;
+
+        let dir = temp_dir("search-highlights");
+        let mut app = app_with_text(&dir, "hello world hello", KeyboardMode::Enhanced);
+        press(&mut app, KeyCode::Right, KeyModifiers::SHIFT, 5);
+        app.handle(ctrl('f'), Instant::now());
+        // The selection colour wins over a match, so collapse it to show
+        // the first match's own background.
+        press(&mut app, KeyCode::Right, KeyModifiers::NONE, 1);
+        let buf = draw(&mut app);
+        // The find bar row sits under the tab bar, so the text is on row 2.
+        let row = row_text(&buf, 2);
+        let first = column_of(&row, "hello world");
+        let second = column_of(&row, "world hello") + 6;
+        let current = theme::match_bg(MatchBackground::Current);
+        let other = theme::match_bg(MatchBackground::Other);
+        for x in 0..5 {
+            assert_eq!(buf[(first + x, 2)].bg, current);
+            assert_eq!(buf[(second + x, 2)].bg, other);
+        }
+
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE, 1);
+        let buf = draw(&mut app);
+        let row = row_text(&buf, 1);
+        let first = column_of(&row, "hello world");
+        let second = column_of(&row, "world hello") + 6;
+        for x in 0..5 {
+            for bg in [buf[(first + x, 1)].bg, buf[(second + x, 1)].bg] {
+                assert_ne!(bg, current);
+                assert_ne!(bg, other);
+            }
+        }
         fs::remove_dir_all(&dir).unwrap();
     }
 

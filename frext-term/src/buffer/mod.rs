@@ -30,6 +30,7 @@ use std::ops::Range;
 use std::time::{Duration, Instant};
 
 use frext_core::highlight::incremental::IncrementalHighlighter;
+use frext_core::highlight::{MatchHighlights, overlay_matches};
 use frext_core::syntax::language_from_path;
 use frext_core::tab::Tab;
 use ratatui::buffer::Buffer;
@@ -533,11 +534,15 @@ impl BufferView {
     /// records `editor` as [`Target::Editor`], and returns the caret's
     /// screen position when it is visible. With no tab, both rects are
     /// blank.
+    ///
+    /// `matches` are the search matches to paint, as byte ranges of the
+    /// whole text; only those overlapping the visible lines are used.
     pub fn render(
         &mut self,
         tab: Option<&Tab>,
         gutter: Rect,
         editor: Rect,
+        matches: &MatchHighlights,
         buf: &mut Buffer,
         hits: &mut HitMap,
     ) -> Option<Position> {
@@ -566,6 +571,13 @@ impl BufferView {
         let spans =
             view.highlighter
                 .spans(&tab.text, &language_from_path(tab.path.as_deref()), lines);
+        let spans = match (spans.first(), spans.last()) {
+            (Some(first), Some(last)) => {
+                let window = first.bytes.start..last.bytes.end;
+                overlay_matches(spans, &matches.within(window))
+            }
+            _ => spans,
+        };
         render::render(
             &RowsView {
                 text: &tab.text,
@@ -589,6 +601,7 @@ mod tests {
 
     use super::*;
     use crate::buffer::cursor::Motion;
+    use frext_core::highlight::MatchBackground;
     use frext_core::palette::BASE;
 
     const GUTTER: u16 = 4;
@@ -623,12 +636,24 @@ mod tests {
         width: u16,
         height: u16,
     ) -> (Buffer, Option<Position>, HitMap) {
+        draw_with(view, tab, width, height, &MatchHighlights::default())
+    }
+
+    /// [`draw`] with search `matches` painted.
+    fn draw_with(
+        view: &mut BufferView,
+        tab: Option<&Tab>,
+        width: u16,
+        height: u16,
+        matches: &MatchHighlights,
+    ) -> (Buffer, Option<Position>, HitMap) {
         let mut buf = Buffer::empty(Rect::new(0, 0, width, height));
         let mut hits = HitMap::default();
         let caret = view.render(
             tab,
             Rect::new(0, 0, GUTTER, height),
             Rect::new(GUTTER, 0, width - GUTTER, height),
+            matches,
             &mut buf,
             &mut hits,
         );
@@ -1045,6 +1070,7 @@ mod tests {
             Some(&tab),
             Rect::new(0, 1, GUTTER, 5),
             Rect::new(GUTTER, 1, 8, 5),
+            &MatchHighlights::default(),
             &mut buf,
             &mut hits,
         );
@@ -1106,6 +1132,7 @@ mod tests {
             None,
             Rect::new(0, 0, GUTTER, 2),
             Rect::new(GUTTER, 0, 4, 2),
+            &MatchHighlights::default(),
             &mut buf,
             &mut hits,
         );
@@ -1115,6 +1142,70 @@ mod tests {
         assert_eq!(buf[(0, 0)].style().bg, Some(theme::color(BASE)));
         assert_eq!(buf[(6, 1)].style().bg, Some(theme::color(BASE)));
         assert_eq!(hits.hit(5, 1), Some(Target::Editor));
+    }
+
+    fn bg(buf: &Buffer, x: u16, y: u16) -> Option<ratatui::style::Color> {
+        buf[(x, y)].style().bg
+    }
+
+    #[test]
+    fn matches_on_a_visible_row_paint_their_cells() {
+        let tab = tab(1, "ab foo cd foo");
+        let mut view = BufferView::default();
+        let matches = MatchHighlights {
+            ranges: vec![3..6, 10..13],
+            current: Some(1),
+        };
+        let (buf, _, _) = draw_with(&mut view, Some(&tab), 20, 2, &matches);
+        let base = Some(theme::color(BASE));
+        let other = Some(theme::match_bg(MatchBackground::Other));
+        let current = Some(theme::match_bg(MatchBackground::Current));
+        for x in 3..6 {
+            assert_eq!(bg(&buf, GUTTER + x, 0), other, "column {x}");
+        }
+        for x in 10..13 {
+            assert_eq!(bg(&buf, GUTTER + x, 0), current, "column {x}");
+        }
+        for x in [2, 6, 9, 13] {
+            assert_eq!(bg(&buf, GUTTER + x, 0), base, "column {x}");
+        }
+    }
+
+    #[test]
+    fn a_match_scrolled_out_of_view_paints_nothing() {
+        let text = numbered(100);
+        let tab = tab(1, &text);
+        let mut view = BufferView::default();
+        draw(&mut view, Some(&tab), 12, 5);
+        view.wheel(&tab, 50);
+        let matches = MatchHighlights {
+            ranges: vec![0..1, text.len() - 3..text.len()],
+            current: Some(0),
+        };
+        let (buf, _, _) = draw_with(&mut view, Some(&tab), 12, 5, &matches);
+        assert_eq!(&row_text(&buf, 0)[..6], " 51 51");
+        for y in 0..5 {
+            for x in GUTTER..12 {
+                assert_eq!(bg(&buf, x, y), Some(theme::color(BASE)), "({x}, {y})");
+            }
+        }
+    }
+
+    #[test]
+    fn a_selected_cell_inside_a_match_keeps_the_selection_colour() {
+        let tab = tab(1, "ab foo cd foo");
+        let mut view = BufferView::default();
+        draw(&mut view, Some(&tab), 20, 2);
+        view.set_selection(&tab, 4..5);
+        let matches = MatchHighlights {
+            ranges: vec![3..6, 10..13],
+            current: None,
+        };
+        let (buf, _, _) = draw_with(&mut view, Some(&tab), 20, 2, &matches);
+        let other = Some(theme::match_bg(MatchBackground::Other));
+        assert_eq!(bg(&buf, GUTTER + 3, 0), other);
+        assert_eq!(bg(&buf, GUTTER + 4, 0), Some(theme::selection_bg()));
+        assert_eq!(bg(&buf, GUTTER + 5, 0), other);
     }
 
     #[test]
