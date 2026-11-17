@@ -5,7 +5,7 @@
 //!
 //! - [`AsciiIcons`]: plain text that works in every terminal;
 //! - [`nerd::NerdIcons`]: Nerd Font glyphs in each icon's colour;
-//! - `KittyIcons`: the file-type SVGs drawn as kitty images;
+//! - [`kitty::KittyIcons`]: the file-type SVGs drawn as kitty images;
 //! - [`NoIcons`]: an empty slot for every row.
 
 use frext_core::editor::FolderState;
@@ -13,6 +13,7 @@ use frext_core::palette::{self, Rgb};
 
 use crate::term::kitty::ImageId;
 
+pub mod kitty;
 pub mod nerd;
 pub mod nerd_table;
 pub mod raster;
