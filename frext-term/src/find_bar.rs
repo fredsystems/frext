@@ -387,6 +387,12 @@ impl FindBar {
         }
     }
 
+    /// Whether `field` was drawn by the last [`FindBar::render`].
+    #[must_use]
+    pub const fn is_drawn(&self, field: FindField) -> bool {
+        self.rect(field).is_some()
+    }
+
     /// Handles one key event in the focused `field`.
     ///
     /// Releases are [`FindReply::Ignored`]. Tab, `BackTab` and Shift+Tab
@@ -1008,6 +1014,26 @@ mod tests {
         assert_eq!(hits.hit(6, 0), Some(Target::FindPattern));
         assert_eq!(cursor, None);
         assert_eq!(bar.replacement_rect, None);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn is_drawn_follows_the_last_render() {
+        let (dir, mut editor) = fixture("is-drawn", "hello");
+        let mut bar = FindBar::new();
+        editor.apply(Command::OpenSearch(SearchBar::FindReplace));
+        draw(&mut bar, &editor, None, None, 80, 2);
+        assert!(bar.is_drawn(FindField::Pattern));
+        assert!(bar.is_drawn(FindField::Replacement));
+
+        draw(&mut bar, &editor, None, None, 80, 1);
+        assert!(bar.is_drawn(FindField::Pattern));
+        assert!(!bar.is_drawn(FindField::Replacement));
+
+        editor.apply(Command::CloseSearch);
+        draw(&mut bar, &editor, None, None, 80, 2);
+        assert!(!bar.is_drawn(FindField::Pattern));
+        assert!(!bar.is_drawn(FindField::Replacement));
         fs::remove_dir_all(&dir).unwrap();
     }
 

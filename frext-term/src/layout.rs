@@ -8,8 +8,8 @@ use ratatui::layout::Rect;
 pub struct Areas {
     /// The tab bar, one row at the top.
     pub tab_bar: Rect,
-    /// The find bar under the tab bar, `find_rows` rows tall (0 when
-    /// closed).
+    /// The find bar under the tab bar (0 rows when closed; clamped to the
+    /// space left).
     pub find_bar: Rect,
     /// The file-tree sidebar on the left of the body.
     pub sidebar: Rect,
