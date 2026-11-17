@@ -732,8 +732,12 @@ and the error paths; pinned-glyph tests in `icons/mod.rs` for
 `javascript` `U+E60C`, `yaml` `U+E8EB`, `ruby` `U+E791`, `text`
 `U+F0219`, `properties` `U+E615`, `haskell` `U+E61F`, `html` `U+E736`,
 `coffeescript` `U+E61B`, and the
-regenerated values of `typescript`, `json`, `toml`, `markdown`, `nix`
-and `python` checked against devicons' own extension entries.
+regenerated values of `typescript`, `json`, `toml`, `nix` and `python`
+checked against devicons' own extension entries (`ts`, `json`, `toml`,
+`nix`, `py`). `markdown` is `U+E609`, devicons' `markdown` entry, which
+wins its tie with `md` (`U+F48A`) because its key equals the stem.
+Regeneration changed exactly the eight stems above (`coffeescript`,
+`haskell`, `html`, `javascript`, `properties`, `ruby`, `text`, `yaml`).
 
 #### 08.13 -- Kitty: id blocks, size cap, `C=1`, checked uploads
 

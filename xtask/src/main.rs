@@ -52,6 +52,17 @@ enum XtaskError {
     /// `git rev-parse HEAD` failed or printed no commit.
     #[error("git rev-parse HEAD failed in {0}")]
     GitFailed(PathBuf),
+    /// A devicons data file could not be parsed.
+    #[error("cannot parse {path}: {source}")]
+    Parse {
+        /// The file.
+        path: PathBuf,
+        /// The cause.
+        source: nerd_icons::NerdIconsError,
+    },
+    /// The table could not be generated.
+    #[error("cannot generate the table: {0}")]
+    Generate(#[from] nerd_icons::NerdIconsError),
     /// The table could not be written.
     #[error("cannot write {path}: {source}")]
     Write {
@@ -116,14 +127,14 @@ fn run(task: &Task) -> Result<(), XtaskError> {
 /// Generate the Nerd icon table from `devicons` into `out`.
 fn nerd_icons_task(devicons: &Path, out: &Path) -> Result<(), XtaskError> {
     let data = devicons.join(DATA_DIR);
-    let extensions = nerd_icons::parse_devicons(&read(&data.join("icons_by_file_extension.lua"))?);
-    let filenames = nerd_icons::parse_devicons(&read(&data.join("icons_by_filename.lua"))?);
+    let extensions = parse(&data.join("icons_by_file_extension.lua"))?;
+    let filenames = parse(&data.join("icons_by_filename.lua"))?;
     let commit = head_commit(devicons)?;
 
     let votes = nerd_icons::votes(&extensions, &filenames);
     let table = nerd_icons::render_table(
         &commit,
-        &nerd_icons::entries(&votes, &extensions, &filenames),
+        &nerd_icons::entries(&votes, &extensions, &filenames)?,
     );
 
     let write_error = |source| XtaskError::Write {
@@ -136,6 +147,14 @@ fn nerd_icons_task(devicons: &Path, out: &Path) -> Result<(), XtaskError> {
     fs::write(out, table).map_err(write_error)?;
     println!("wrote {}", out.display());
     Ok(())
+}
+
+/// Read and parse a devicons data file.
+fn parse(path: &Path) -> Result<Vec<nerd_icons::DevIcon>, XtaskError> {
+    nerd_icons::parse_devicons(&read(path)?).map_err(|source| XtaskError::Parse {
+        path: path.to_path_buf(),
+        source,
+    })
 }
 
 /// Read a file to a string.
@@ -164,6 +183,10 @@ fn head_commit(dir: &Path) -> Result<String, XtaskError> {
 
 #[cfg(test)]
 mod tests {
+    // `unwrap` is acceptable in test code: a panic on an unexpected error is
+    // exactly the failure signal we want from a test.
+    #![allow(clippy::unwrap_used)]
+
     use super::*;
 
     fn args(items: &[&str]) -> Vec<String> {
@@ -226,6 +249,23 @@ mod tests {
                 out: PathBuf::from("o.rs"),
             })
         );
+    }
+
+    #[test]
+    fn a_data_file_without_entries_is_a_parse_error() {
+        let dir = std::env::temp_dir().join(format!("xtask-empty-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("empty.lua");
+        fs::write(&path, "return {\n}\n").unwrap();
+        let result = parse(&path);
+        fs::remove_dir_all(&dir).unwrap();
+        assert!(matches!(
+            result,
+            Err(XtaskError::Parse {
+                source: nerd_icons::NerdIconsError::NoEntries,
+                ..
+            })
+        ));
     }
 
     #[test]

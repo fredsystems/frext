@@ -313,6 +313,46 @@ mod tests {
         assert_eq!(nerd("rust"), Some(("\u{e68b}", Rgb::new(0xfa, 0xb3, 0x87))));
     }
 
+    /// The Nerd table's glyph for `stem`, as a code point.
+    fn nerd_glyph(stem: &str) -> Option<u32> {
+        nerd(stem).and_then(|(glyph, _)| glyph.chars().next().map(u32::from))
+    }
+
+    #[test]
+    fn nerd_generic_stems_keep_their_extension_glyph() {
+        // Tool-config filename entries must not outvote the language's own
+        // extension glyph, and ties pick the entry named like the stem.
+        for (stem, glyph) in [
+            ("javascript", 0xe60c),
+            ("yaml", 0xe8eb),
+            ("ruby", 0xe791),
+            ("text", 0xf0219),
+            ("properties", 0xe615),
+            ("haskell", 0xe61f),
+            ("html", 0xe736),
+            ("coffeescript", 0xe61b),
+        ] {
+            assert_eq!(nerd_glyph(stem), Some(glyph), "{stem}");
+        }
+    }
+
+    #[test]
+    fn nerd_languages_match_devicons_extension_entries() {
+        // The glyphs of devicons' own `ts`, `json`, `toml`, `nix` and `py`
+        // entries at the pinned commit. `markdown` takes devicons' `markdown`
+        // entry, which wins its tie with `md` because its key equals the stem.
+        for (stem, glyph) in [
+            ("typescript", 0xe628),
+            ("json", 0xe60b),
+            ("toml", 0xe6b2),
+            ("markdown", 0xe609),
+            ("nix", 0xf313),
+            ("python", 0xe606),
+        ] {
+            assert_eq!(nerd_glyph(stem), Some(glyph), "{stem}");
+        }
+    }
+
     #[test]
     fn nerd_folder_controllers_takes_its_accent_colour() {
         let colour = nerd("folder_controllers").map(|(_, colour)| colour);
