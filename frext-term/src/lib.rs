@@ -24,6 +24,7 @@ pub mod prompt;
 pub mod run;
 pub mod status;
 pub mod tab_bar;
+pub mod term;
 pub mod terminal;
 pub mod text_input;
 pub mod theme;
