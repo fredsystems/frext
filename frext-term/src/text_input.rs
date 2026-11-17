@@ -111,15 +111,23 @@ fn remove_chars(text: &mut String, start: usize, end: usize) {
     text.replace_range(from..to, "");
 }
 
+/// Modifiers other than Ctrl and Shift that mark a key as a binding
+/// rather than text.
+const NON_TEXT_MODIFIERS: KeyModifiers = KeyModifiers::ALT
+    .union(KeyModifiers::SUPER)
+    .union(KeyModifiers::HYPER)
+    .union(KeyModifiers::META);
+
 /// The key code `key` is handled as.
 ///
-/// Ctrl+H (without Alt) becomes [`KeyCode::Backspace`]: legacy terminals
-/// send 0x08 for the Backspace key, which crossterm reports as Ctrl+H.
+/// Ctrl+H (without Alt, Super, Hyper or Meta) becomes
+/// [`KeyCode::Backspace`]: legacy terminals send 0x08 for the Backspace
+/// key, which crossterm reports as Ctrl+H.
 fn normalise(key: KeyEvent) -> KeyCode {
     match key.code {
         KeyCode::Char('h' | 'H')
             if key.modifiers.contains(KeyModifiers::CONTROL)
-                && !key.modifiers.contains(KeyModifiers::ALT) =>
+                && !key.modifiers.intersects(NON_TEXT_MODIFIERS) =>
         {
             KeyCode::Backspace
         }
@@ -157,6 +165,10 @@ impl TextInput {
     }
 
     /// Handles one key event against `text`.
+    ///
+    /// A char typed with Ctrl, Alt, Super, Hyper or Meta held inserts
+    /// nothing and is [`InputOutcome::Ignored`], so the caller may bind
+    /// it; Shift is allowed.
     pub fn handle_key(&mut self, text: &mut String, key: KeyEvent) -> InputOutcome {
         let graphemes = self.clamp(text);
         if key.kind == KeyEventKind::Release {
@@ -167,7 +179,7 @@ impl TextInput {
             KeyCode::Char(c) => {
                 if key
                     .modifiers
-                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+                    .intersects(NON_TEXT_MODIFIERS.union(KeyModifiers::CONTROL))
                     || c.is_control()
                 {
                     return InputOutcome::Ignored;
@@ -448,6 +460,40 @@ mod tests {
         );
         assert_eq!(
             input.handle_key(&mut text, ctrl_alt_h),
+            InputOutcome::Ignored
+        );
+        assert_eq!(text, "abc");
+        assert_eq!(input.cursor(), 3);
+    }
+
+    #[test]
+    fn super_hyper_and_meta_chars_are_ignored() {
+        let mut input = TextInput::new();
+        let mut text = String::new();
+        for key in [
+            KeyEvent::new(KeyCode::Char('v'), KeyModifiers::SUPER),
+            KeyEvent::new(KeyCode::Char('x'), KeyModifiers::HYPER),
+            KeyEvent::new(KeyCode::Char('f'), KeyModifiers::META),
+        ] {
+            assert_eq!(input.handle_key(&mut text, key), InputOutcome::Ignored);
+            assert_eq!(text, "");
+        }
+        let shifted = KeyEvent::new(KeyCode::Char('A'), KeyModifiers::SHIFT);
+        assert_eq!(input.handle_key(&mut text, shifted), InputOutcome::Edited);
+        assert_eq!(text, "A");
+    }
+
+    #[test]
+    fn super_ctrl_h_does_not_delete() {
+        let mut input = TextInput::new();
+        let mut text = String::from("abc");
+        input.move_to_end(&text);
+        let super_ctrl_h = KeyEvent::new(
+            KeyCode::Char('h'),
+            KeyModifiers::CONTROL | KeyModifiers::SUPER,
+        );
+        assert_eq!(
+            input.handle_key(&mut text, super_ctrl_h),
             InputOutcome::Ignored
         );
         assert_eq!(text, "abc");
