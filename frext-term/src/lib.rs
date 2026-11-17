@@ -27,3 +27,4 @@ pub mod tab_bar;
 pub mod terminal;
 pub mod text_input;
 pub mod theme;
+pub mod tree_menu;
