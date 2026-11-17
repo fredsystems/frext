@@ -12,7 +12,7 @@ use std::time::Instant;
 
 use frext_core::edit_ops::{replace_range, selected_text};
 
-use crate::buffer::cursor::{Cursor, Motion, Selecting, next_grapheme, previous_grapheme};
+use crate::buffer::cursor::{Cursor, Motion, Selecting, next_grapheme, previous_grapheme, snap_up};
 use crate::buffer::history::{Edit, EditHistory, EditKind};
 use crate::buffer::words::{next_word_boundary, previous_word_boundary};
 use crate::buffer::wrap::WrapLayout;
@@ -149,12 +149,14 @@ pub fn insert_text(target: EditTarget<'_>, inserted: &str, _now: Instant) -> App
 }
 
 /// Replaces chars `at..end` of `text` with `inserted`, leaving the
-/// cursor after the insertion, and returns the recorded edit.
+/// cursor after the insertion, and returns the recorded edit. The edit
+/// can join graphemes across its ends, so the caret is snapped up to a
+/// grapheme boundary of the new text.
 fn splice(text: &mut String, cursor: &mut Cursor, at: usize, end: usize, inserted: &str) -> Edit {
     let before = *cursor;
     let removed = selected_text(text, at, end);
     replace_range(text, at, end, inserted);
-    *cursor = Cursor::at(at + inserted.chars().count());
+    *cursor = Cursor::at(snap_up(text, at + inserted.chars().count()));
     Edit {
         at,
         removed,
@@ -249,7 +251,7 @@ fn outdent(text: &mut String, cursor: &mut Cursor, history: &mut EditHistory) ->
         let before = *cursor;
         let removed_text = selected_text(text, line_start, line_start + removed);
         replace_range(text, line_start, line_start + removed, "");
-        *cursor = Cursor::at(new_caret);
+        *cursor = Cursor::at(snap_up(text, new_caret));
         edits.push(Edit {
             at: line_start,
             removed: removed_text,
@@ -464,6 +466,34 @@ mod tests {
         b.assert("a", Cursor::at(1));
         b.act(EditAction::Undo);
         b.assert("a\u{1F469}\u{200D}\u{1F4BB}", Cursor::at(4));
+    }
+
+    #[test]
+    fn a_delete_that_joins_graphemes_leaves_the_caret_after_the_join() {
+        let mut b = Buf::new("a\n\u{301}b", Cursor::at(1));
+        b.act(EditAction::Delete);
+        b.assert("a\u{301}b", Cursor::at(2));
+        b.act(EditAction::Type('x'));
+        b.assert("a\u{301}xb", Cursor::at(3));
+    }
+
+    #[test]
+    fn an_insert_that_joins_graphemes_leaves_the_caret_after_the_join() {
+        // After a '\n' the combining mark starts its own grapheme, so 2 is
+        // a boundary; typing 'e' there joins it into "é".
+        let mut b = Buf::new("x\n\u{301}", Cursor::at(2));
+        b.act(EditAction::Type('e'));
+        b.assert("x\ne\u{301}", Cursor::at(4));
+    }
+
+    #[test]
+    fn undo_and_redo_of_a_joining_delete_round_trip() {
+        let mut b = Buf::new("a\n\u{301}b", Cursor::at(1));
+        b.act(EditAction::Delete);
+        assert_eq!(b.act(EditAction::Undo), Applied::Edited);
+        b.assert("a\n\u{301}b", Cursor::at(1));
+        assert_eq!(b.act(EditAction::Redo), Applied::Edited);
+        b.assert("a\u{301}b", Cursor::at(2));
     }
 
     #[test]

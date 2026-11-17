@@ -221,6 +221,17 @@ pub(crate) fn snap_down(text: &str, char_idx: usize) -> usize {
     }
 }
 
+/// `char_idx` clamped to the text and snapped up to the nearest grapheme
+/// boundary of the whole `text` at or after it.
+pub(crate) fn snap_up(text: &str, char_idx: usize) -> usize {
+    let char_idx = char_idx.min(text.chars().count());
+    let mut cursor = GraphemeCursor::new(byte_of_char(text, char_idx), text.len(), true);
+    match cursor.is_boundary(text, 0) {
+        Ok(false) => next_grapheme(text, char_idx),
+        _ => char_idx,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -566,6 +577,21 @@ mod tests {
     fn apply_clamps_first() {
         let c = moved("abc", 80, Cursor::at(99), Motion::Left, Selecting::Move);
         assert_eq!(c, Cursor::at(2));
+    }
+
+    #[test]
+    fn snap_up_moves_to_the_next_boundary() {
+        // Inside "\r\n": after it.
+        assert_eq!(snap_up("a\r\nb", 2), 3);
+        // On a boundary: unchanged.
+        assert_eq!(snap_up("a\r\nb", 1), 1);
+        assert_eq!(snap_up("a\r\nb", 3), 3);
+        assert_eq!(snap_up("e\u{301}x", 0), 0);
+        // Inside a combining sequence: after it.
+        assert_eq!(snap_up("e\u{301}x", 1), 2);
+        // Past the end: the char count.
+        assert_eq!(snap_up("a\r\nb", 100), 4);
+        assert_eq!(snap_up("", 5), 0);
     }
 
     #[test]
