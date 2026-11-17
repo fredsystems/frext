@@ -2751,6 +2751,39 @@ mod tests {
     }
 
     #[test]
+    fn replace_all_collapses_the_editor_selection() {
+        let dir = temp_dir("find-replace-all-selection");
+        let mut app = app_with_text(&dir, "foo tail foo", KeyboardMode::Enhanced);
+        let id = active_id(&app);
+        press(&mut app, KeyCode::Right, KeyModifiers::SHIFT, 3);
+        assert_eq!(app.buffer.selection(id), Some(0..3));
+        app.handle(ctrl('h'), Instant::now());
+        assert_eq!(app.editor().search().query().pattern, "foo");
+        press(&mut app, KeyCode::Tab, KeyModifiers::NONE, 1);
+        type_text(&mut app, "X");
+        let x = drawn_column(&mut app, 2, "[Replace all]");
+        left_click(&mut app, x, 2);
+        assert_eq!(text_of(&app), "X tail X");
+        // The caret sits at the end of the diffed change, not over the
+        // old selection.
+        assert_eq!(app.buffer.selection(id), Some(8..8));
+
+        app.handle(ctrl('e'), Instant::now());
+        assert_eq!(app.focus, Focus::Editor);
+        type_text(&mut app, "!");
+        assert_eq!(text_of(&app), "X tail X!");
+
+        app.handle(ctrl('z'), Instant::now());
+        assert_eq!(text_of(&app), "X tail X");
+        app.handle(ctrl('z'), Instant::now());
+        assert_eq!(text_of(&app), "foo tail foo");
+        app.handle(ctrl('y'), Instant::now());
+        assert_eq!(text_of(&app), "X tail X");
+        assert_eq!(app.buffer.selection(id), Some(8..8));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn ctrl_f_from_the_sidebar_focuses_the_find_field() {
         let dir = temp_dir("find-from-sidebar");
         let ws = dir.join("ws");

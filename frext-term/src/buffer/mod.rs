@@ -307,17 +307,19 @@ impl BufferView {
     }
 
     /// Records a change made to `tab` outside the view (a core command),
-    /// where `before` is the text before it, as one undo group. The
-    /// cursor is left alone; the app's effects place it. A tab the view
-    /// has never seen (a new tab edited before its first render) gets
-    /// fresh view state for `before` first, so its edit is undoable too;
-    /// its layout is built on the next render. A recorded group is never
-    /// coalesced, so `_now` does not affect grouping.
+    /// where `before` is the text before it, as one undo group. A tab the
+    /// view has never seen (a new tab edited before its first render)
+    /// gets fresh view state for `before` first, so its edit is undoable
+    /// too; its layout is built on the next render. A recorded group is
+    /// never coalesced, so `_now` does not affect grouping.
     ///
     /// `after` is the selection a redo restores, clamped to the new text:
-    /// the core command's own selection when it set one. With `None` the
-    /// caret goes to the end of the changed span found by diffing `before`
-    /// against the new text, which is ambiguous in repeated text.
+    /// the core command's own selection when it set one, in which case the
+    /// live cursor is left alone and the app's effects place it. With
+    /// `None` the caret goes to the end of the changed span found by
+    /// diffing `before` against the new text, which is ambiguous in
+    /// repeated text, and the live cursor collapses to that caret too, so
+    /// it never keeps a selection over text the edit changed.
     pub fn record_outside_edit(
         &mut self,
         tab: &Tab,
@@ -342,6 +344,7 @@ impl BufferView {
             .get(prefix_bytes..text.len().saturating_sub(suffix_bytes))
             .unwrap_or("")
             .to_owned();
+        let moves_cursor = after.is_none();
         let after = after.map_or_else(
             || Cursor::at(at.saturating_add(inserted.chars().count())),
             |chars| {
@@ -357,6 +360,9 @@ impl BufferView {
             before: view.cursor,
             after,
         }]);
+        if moves_cursor {
+            view.cursor = after;
+        }
         view.known = text_hash(text);
     }
 
@@ -841,6 +847,27 @@ mod tests {
     }
 
     #[test]
+    fn record_outside_edit_without_after_collapses_the_cursor() {
+        let mut tab = tab(1, "foo tail foo");
+        let mut view = BufferView::default();
+        let base = Instant::now();
+        draw(&mut view, Some(&tab), 20, 3);
+        view.set_selection(&tab, 0..3);
+        let before = tab.text.clone();
+        tab.text = "X tail X".to_owned();
+        view.record_outside_edit(&tab, &before, None, base);
+        // The diff spans "foo tail foo" -> "X tail X" from 0 to the end
+        // of the inserted text.
+        assert_eq!(view.selection(1), Some(8..8));
+        // With an `after`, the live cursor is the effects' to place.
+        view.set_selection(&tab, 0..1);
+        let before = tab.text.clone();
+        tab.text = "X tail Y".to_owned();
+        view.record_outside_edit(&tab, &before, Some(7..8), base);
+        assert_eq!(view.selection(1), Some(0..1));
+    }
+
+    #[test]
     fn record_outside_edit_handles_repeated_chars_and_unknown_tabs() {
         let mut tab = tab(1, "aaa");
         let mut view = BufferView::default();
@@ -848,7 +875,7 @@ mod tests {
         // An unknown tab gets view state for `before`, and its edit is
         // undoable.
         view.record_outside_edit(&tab, "zz", None, base);
-        assert_eq!(view.caret(1), Some(0));
+        assert_eq!(view.caret(1), Some(3));
         view.handle(&mut tab, EditAction::Undo, ms(base, 5));
         assert_eq!(tab.text, "zz");
         view.handle(&mut tab, EditAction::Redo, ms(base, 6));
