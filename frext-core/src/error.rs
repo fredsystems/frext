@@ -23,6 +23,34 @@ pub enum PersistenceError {
     Serde(#[from] serde_json::Error),
 }
 
+/// Errors that can occur while loading the shared config file or parsing
+/// one of its values.
+#[derive(Debug, thiserror::Error)]
+pub enum ConfigError {
+    /// The config file exists but could not be read.
+    #[error("could not read {path}: {source}")]
+    Read {
+        /// The config file path.
+        path: PathBuf,
+        /// The underlying I/O error.
+        source: std::io::Error,
+    },
+
+    /// The config file is not valid TOML, or a value has the wrong shape.
+    #[error("invalid config: {0}")]
+    Parse(#[from] toml::de::Error),
+
+    /// A setting was given a value it does not accept (e.g. on the
+    /// command line).
+    #[error("invalid value {value:?} for {field}")]
+    InvalidValue {
+        /// The setting name, e.g. `"icons"`.
+        field: &'static str,
+        /// The rejected value, as given.
+        value: String,
+    },
+}
+
 /// Errors that can occur while starting the background proofreader.
 #[derive(Debug, thiserror::Error)]
 pub enum ProofreadError {

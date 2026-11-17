@@ -6,6 +6,7 @@
 //! UI toolkit.
 
 pub mod clipboard;
+pub mod config;
 pub mod edit_ops;
 pub mod editor;
 pub mod error;
