@@ -8,6 +8,8 @@
 use frext_core::editor::FolderState;
 use frext_core::palette::{self, Rgb};
 
+pub mod nerd_table;
+
 /// The width of the icon slot in front of a tree row, in cells.
 pub const ICON_WIDTH: u16 = 2;
 
@@ -121,5 +123,49 @@ mod tests {
             FOLDER
         );
         assert_eq!(provider.icon("lib.rs", IconKind::File), FILE);
+    }
+
+    /// The `(glyph, colour)` the Nerd table has for `stem`.
+    fn nerd(stem: &str) -> Option<(&'static str, Rgb)> {
+        nerd_table::NERD_ICONS
+            .iter()
+            .find(|&&(s, _, _)| s == stem)
+            .map(|&(_, glyph, color)| (glyph, color))
+    }
+
+    #[test]
+    fn nerd_table_stems_match_the_file_icon_stems_in_order() {
+        let nerd: Vec<&str> = nerd_table::NERD_ICONS
+            .iter()
+            .map(|&(stem, _, _)| stem)
+            .collect();
+        let core: Vec<&str> = frext_core::file_icon::stems().collect();
+        assert_eq!(nerd, core);
+    }
+
+    #[test]
+    fn every_nerd_glyph_is_one_char() {
+        for &(stem, glyph, _) in nerd_table::NERD_ICONS {
+            assert_eq!(glyph.chars().count(), 1, "{stem}");
+        }
+    }
+
+    #[test]
+    fn nerd_folder_and_file_glyphs() {
+        assert_eq!(nerd("_folder").map(|(g, _)| g), Some("\u{e5ff}"));
+        assert_eq!(nerd("_folder_open").map(|(g, _)| g), Some("\u{e5fe}"));
+        assert_eq!(nerd("_file").map(|(g, _)| g), Some("\u{f15b}"));
+    }
+
+    #[test]
+    fn nerd_rust_has_the_devicons_glyph_and_svg_colour() {
+        assert_eq!(nerd("rust"), Some(("\u{e68b}", Rgb::new(0xfa, 0xb3, 0x87))));
+    }
+
+    #[test]
+    fn nerd_folder_controllers_takes_its_accent_colour() {
+        let colour = nerd("folder_controllers").map(|(_, colour)| colour);
+        assert!(colour.is_some());
+        assert_ne!(colour, Some(palette::TEXT));
     }
 }

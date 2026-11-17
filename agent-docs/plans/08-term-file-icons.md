@@ -368,6 +368,25 @@ What:
   `extraExcludes` beside the file-icon tables, under their comment
   (generated, so not ours to lint).
 
+Review of the first generated table (rework inside 08.3, scope adds
+`xtask/src/nerd_icons.rs` and `xtask/src/main.rs`):
+
+- **Accent colours win.** 259 of 623 stems came out Mocha Text,
+  because most artwork pairs a neutral outline with one accent and the
+  outline is counted as often or first. `dominant_colour` now picks the
+  most frequent colour that is not a Mocha neutral (Text, Subtext 1/0,
+  Overlay 2/1/0, Surface 2/1/0, Base, Mantle, Crust); only an SVG with
+  no accent at all takes its most frequent neutral; no colour at all is
+  still `TEXT`.
+- **Stem-name fallback.** A stem with no vote (and not a folder) tries,
+  in order, the stem, the stem with `-` and `_` removed, and the stem up
+  to its first `-` or `_`, each lowercased, against devicons' keys
+  (extensions, then filenames, lowercased) and then against devicons'
+  `name` fields (lowercased). The first hit's glyph is used, else
+  `U+F15B`. This recovers about 41 stems (`astro-config`, `go-mod`,
+  `package-json`, `lua-*`, ...). `parse_devicons` therefore returns the
+  `name` too.
+
 Deliverable: tests in `icons/mod.rs`: `NERD_ICONS` stems equal
 `file_icon::stems()` exactly and in order; every glyph is one `char`;
 `rust`, `_folder`, `_folder_open` and `_file` have the expected glyphs

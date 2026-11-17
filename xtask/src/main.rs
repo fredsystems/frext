@@ -121,7 +121,10 @@ fn nerd_icons_task(devicons: &Path, out: &Path) -> Result<(), XtaskError> {
     let commit = head_commit(devicons)?;
 
     let votes = nerd_icons::votes(&extensions, &filenames);
-    let table = nerd_icons::render_table(&commit, &nerd_icons::entries(&votes));
+    let table = nerd_icons::render_table(
+        &commit,
+        &nerd_icons::entries(&votes, &extensions, &filenames),
+    );
 
     let write_error = |source| XtaskError::Write {
         path: out.to_path_buf(),

@@ -3,8 +3,10 @@
 //! Each frext icon stem's glyph is the majority vote of `nvim-web-devicons`'
 //! extension and filename glyphs, mapped onto frext's stems through
 //! [`frext_core::file_icon`]'s own lookups. Its colour is the dominant colour
-//! of the stem's vendored Catppuccin Mocha SVG. Folder stems get the
-//! open / closed folder glyphs; unvoted stems get a generic file glyph.
+//! of the stem's vendored Catppuccin Mocha SVG, preferring accents over
+//! neutrals. Folder stems get the open / closed folder glyphs; unvoted stems
+//! fall back to a devicons entry whose key or name matches the stem's name,
+//! else a generic file glyph.
 
 use std::{collections::BTreeMap, fmt::Write as _, sync::LazyLock};
 
@@ -23,6 +25,27 @@ const FILE: char = '\u{f15b}';
 /// The default file stem; votes for it carry no information.
 const DEFAULT_FILE_STEM: &str = "_file";
 
+/// The Catppuccin Mocha neutrals: Text, Subtext 1/0, Overlay 2/1/0,
+/// Surface 2/1/0, Base, Mantle and Crust.
+///
+/// Most icon artwork pairs a neutral outline with one accent; the accent is
+/// the colour that identifies the icon, so neutrals only win when an SVG has
+/// no accent at all.
+const NEUTRALS: [Rgb; 12] = [
+    Rgb::new(0xcd, 0xd6, 0xf4),
+    Rgb::new(0xba, 0xc2, 0xde),
+    Rgb::new(0xa6, 0xad, 0xc8),
+    Rgb::new(0x93, 0x99, 0xb2),
+    Rgb::new(0x7f, 0x84, 0x9c),
+    Rgb::new(0x6c, 0x70, 0x86),
+    Rgb::new(0x58, 0x5b, 0x70),
+    Rgb::new(0x45, 0x47, 0x5a),
+    Rgb::new(0x31, 0x32, 0x44),
+    Rgb::new(0x1e, 0x1e, 0x2e),
+    Rgb::new(0x18, 0x18, 0x25),
+    Rgb::new(0x11, 0x11, 0x1b),
+];
+
 /// rustfmt's default `fn_call_width`: a tuple whose fields are wider than
 /// this is laid out one field per line, so the table must be too.
 const RUSTFMT_FN_CALL_WIDTH: usize = 60;
@@ -31,17 +54,33 @@ const RUSTFMT_FN_CALL_WIDTH: usize = 60;
 static ENTRY_LINE: LazyLock<Option<Regex>> =
     LazyLock::new(|| Regex::new(r#"^\s*\["([^"]+)"\]\s*=\s*\{\s*icon\s*=\s*"([^"]*)""#).ok());
 
+/// The `name = "<name>"` field of a devicons entry line.
+static NAME_FIELD: LazyLock<Option<Regex>> =
+    LazyLock::new(|| Regex::new(r#"\bname\s*=\s*"([^"]*)""#).ok());
+
 /// A `#`-prefixed hex run, ending at a word boundary.
 static HEX_COLOUR: LazyLock<Option<Regex>> =
     LazyLock::new(|| Regex::new(r"#([0-9a-fA-F]+)\b").ok());
 
+/// One `nvim-web-devicons` entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DevIcon {
+    /// The extension or file name the entry is keyed by.
+    pub key: String,
+    /// The entry's glyph, exactly one `char`.
+    pub glyph: String,
+    /// The entry's `name` field, empty when the line has none.
+    pub name: String,
+}
+
 /// Every `["<key>"] = { icon = "<glyph>", ...` line of a devicons data file
-/// as `(key, glyph)`.
+/// as a [`DevIcon`].
 ///
 /// Entries whose glyph is not exactly one `char` are skipped, as are lines of
-/// any other shape (comments, `return {`, closing braces).
+/// any other shape (comments, `return {`, closing braces). An entry line
+/// without a `name = "..."` field is kept with an empty name.
 #[must_use]
-pub fn parse_devicons(lua: &str) -> Vec<(String, String)> {
+pub fn parse_devicons(lua: &str) -> Vec<DevIcon> {
     let Some(pattern) = ENTRY_LINE.as_ref() else {
         return Vec::new();
     };
@@ -51,10 +90,19 @@ pub fn parse_devicons(lua: &str) -> Vec<(String, String)> {
             let key = captures.get(1)?.as_str();
             let glyph = captures.get(2)?.as_str();
             let mut chars = glyph.chars();
-            match (chars.next(), chars.next()) {
-                (Some(_), None) => Some((key.to_owned(), glyph.to_owned())),
-                _ => None,
+            if !matches!((chars.next(), chars.next()), (Some(_), None)) {
+                return None;
             }
+            let name = NAME_FIELD
+                .as_ref()
+                .and_then(|name| name.captures(line))
+                .and_then(|captures| captures.get(1))
+                .map_or("", |name| name.as_str());
+            Some(DevIcon {
+                key: key.to_owned(),
+                glyph: glyph.to_owned(),
+                name: name.to_owned(),
+            })
         })
         .collect()
 }
@@ -65,17 +113,17 @@ pub fn parse_devicons(lua: &str) -> Vec<(String, String)> {
 /// filename key for `icon_for_file(k)`. Votes for the default `_file` stem
 /// are dropped. Ties are broken by the smallest glyph.
 #[must_use]
-pub fn votes(
-    extensions: &[(String, String)],
-    filenames: &[(String, String)],
-) -> BTreeMap<&'static str, String> {
+pub fn votes(extensions: &[DevIcon], filenames: &[DevIcon]) -> BTreeMap<&'static str, String> {
     let mut tally: BTreeMap<&'static str, BTreeMap<&str, usize>> = BTreeMap::new();
-    let extension_votes = extensions
-        .iter()
-        .map(|(key, glyph)| (icon_for_file(&format!("x.{key}")), glyph.as_str()));
+    let extension_votes = extensions.iter().map(|icon| {
+        (
+            icon_for_file(&format!("x.{}", icon.key)),
+            icon.glyph.as_str(),
+        )
+    });
     let filename_votes = filenames
         .iter()
-        .map(|(key, glyph)| (icon_for_file(key), glyph.as_str()));
+        .map(|icon| (icon_for_file(&icon.key), icon.glyph.as_str()));
     for (stem, glyph) in extension_votes.chain(filename_votes) {
         if stem == DEFAULT_FILE_STEM {
             continue;
@@ -99,10 +147,12 @@ pub fn votes(
         .collect()
 }
 
-/// The most frequent `#rrggbb` / `#rgb` colour in `svg`.
+/// The most frequent accent `#rrggbb` / `#rgb` colour in `svg`.
 ///
-/// Matching is case-insensitive and `#rgb` is expanded to `#rrggbb`. Ties are
-/// broken by first occurrence. Returns [`TEXT`] when there is no colour.
+/// Accents are colours not in [`NEUTRALS`]; an SVG with no accent at all
+/// takes its most frequent neutral instead. Matching is case-insensitive and
+/// `#rgb` is expanded to `#rrggbb`. Ties are broken by first occurrence.
+/// Returns [`TEXT`] when there is no colour.
 #[must_use]
 pub fn dominant_colour(svg: &str) -> Rgb {
     let Some(pattern) = HEX_COLOUR.as_ref() else {
@@ -120,13 +170,50 @@ pub fn dominant_colour(svg: &str) -> Rgb {
         }
     }
 
+    let (neutrals, accents): (Vec<_>, Vec<_>) = counts
+        .into_iter()
+        .partition(|(colour, _)| NEUTRALS.contains(colour));
+    most_frequent(&accents)
+        .or_else(|| most_frequent(&neutrals))
+        .unwrap_or(TEXT)
+}
+
+/// The colour with the highest count, ties broken by first position.
+fn most_frequent(counts: &[(Rgb, usize)]) -> Option<Rgb> {
     let mut best: Option<(Rgb, usize)> = None;
-    for (colour, count) in counts {
+    for &(colour, count) in counts {
         if best.is_none_or(|(_, best_count)| count > best_count) {
             best = Some((colour, count));
         }
     }
-    best.map_or(TEXT, |(colour, _)| colour)
+    best.map(|(colour, _)| colour)
+}
+
+/// The glyph of the devicons entry whose key or name matches `stem`'s name.
+///
+/// Candidates, in order: the stem, the stem with every `-` and `_` removed,
+/// and the stem up to its first `-` or `_` (only if it has one), each
+/// lowercased. Each candidate is looked up among the entries' keys
+/// (`extensions` then `filenames`, lowercased), then among their `name`
+/// fields (likewise); the first matching entry in file order wins. Empty
+/// candidates are skipped.
+#[must_use]
+pub fn name_glyph(stem: &str, extensions: &[DevIcon], filenames: &[DevIcon]) -> Option<char> {
+    let lower = stem.to_lowercase();
+    let mut candidates = vec![lower.clone(), lower.replace(['-', '_'], "")];
+    if let Some((prefix, _)) = lower.split_once(['-', '_']) {
+        candidates.push(prefix.to_owned());
+    }
+    let all = || extensions.iter().chain(filenames);
+    candidates
+        .iter()
+        .filter(|candidate| !candidate.is_empty())
+        .find_map(|candidate| {
+            all()
+                .find(|icon| icon.key.to_lowercase() == *candidate)
+                .or_else(|| all().find(|icon| icon.name.to_lowercase() == *candidate))
+        })
+        .and_then(|icon| icon.glyph.chars().next())
 }
 
 /// Parse a 3- or 6-digit hex colour (without the `#`).
@@ -192,14 +279,24 @@ pub fn render_table(commit: &str, entries: &[(&str, char, Rgb)]) -> String {
 /// One `(stem, glyph, colour)` entry per bundled stem, in stem order.
 ///
 /// Folder stems get the closed / open folder glyphs; other stems their vote
-/// from `votes`, else the generic file glyph. The colour is the dominant
-/// colour of the stem's SVG.
+/// from `votes`, else their [`name_glyph`] in `extensions` / `filenames`,
+/// else the generic file glyph. The default `_file` stem always gets the
+/// generic file glyph. The colour is the dominant colour of the stem's SVG.
 #[must_use]
-pub fn entries(votes: &BTreeMap<&'static str, String>) -> Vec<(&'static str, char, Rgb)> {
+pub fn entries(
+    votes: &BTreeMap<&'static str, String>,
+    extensions: &[DevIcon],
+    filenames: &[DevIcon],
+) -> Vec<(&'static str, char, Rgb)> {
     stems()
         .map(|stem| {
             let glyph = folder_glyph(stem)
                 .or_else(|| votes.get(stem).and_then(|glyph| glyph.chars().next()))
+                .or_else(|| {
+                    (stem != DEFAULT_FILE_STEM)
+                        .then(|| name_glyph(stem, extensions, filenames))
+                        .flatten()
+                })
                 .unwrap_or(FILE);
             let colour = icon_bytes(stem).map_or(TEXT, |bytes| {
                 dominant_colour(&String::from_utf8_lossy(bytes))
@@ -227,10 +324,25 @@ mod tests {
 
     use super::*;
 
-    fn pairs(items: &[(&str, &str)]) -> Vec<(String, String)> {
+    fn pairs(items: &[(&str, &str)]) -> Vec<DevIcon> {
         items
             .iter()
-            .map(|&(key, glyph)| (key.to_owned(), glyph.to_owned()))
+            .map(|&(key, glyph)| DevIcon {
+                key: key.to_owned(),
+                glyph: glyph.to_owned(),
+                name: String::new(),
+            })
+            .collect()
+    }
+
+    fn named(items: &[(&str, &str, &str)]) -> Vec<DevIcon> {
+        items
+            .iter()
+            .map(|&(key, glyph, name)| DevIcon {
+                key: key.to_owned(),
+                glyph: glyph.to_owned(),
+                name: name.to_owned(),
+            })
             .collect()
     }
 
@@ -247,7 +359,7 @@ mod tests {
         );
         assert_eq!(
             parse_devicons(lua),
-            pairs(&[("rs", "\u{e7a8}"), ("toml", "\u{e6b2}")])
+            named(&[("rs", "\u{e7a8}", "Rs"), ("toml", "\u{e6b2}", "Toml")])
         );
     }
 
@@ -326,9 +438,114 @@ mod tests {
     }
 
     #[test]
+    fn dominant_colour_prefers_an_accent_over_a_first_neutral() {
+        let svg = r##"<a stroke="#cdd6f4"/><b fill="#fab387"/>"##;
+        assert_eq!(dominant_colour(svg), Rgb::new(0xfa, 0xb3, 0x87));
+    }
+
+    #[test]
+    fn dominant_colour_prefers_an_accent_over_a_more_frequent_neutral() {
+        let svg = r##"<a stroke="#6c7086"/><b fill="#6c7086"/><c fill="#a6e3a1"/>"##;
+        assert_eq!(dominant_colour(svg), Rgb::new(0xa6, 0xe3, 0xa1));
+    }
+
+    #[test]
+    fn dominant_colour_of_neutrals_only_is_the_most_frequent_neutral() {
+        let svg = r##"<a fill="#cdd6f4"/><b fill="#7f849c"/><c fill="#7f849c"/>"##;
+        assert_eq!(dominant_colour(svg), Rgb::new(0x7f, 0x84, 0x9c));
+    }
+
+    #[test]
+    fn dominant_colour_neutral_tie_keeps_first_occurrence() {
+        let svg = r##"<a fill="#7f849c"/><b fill="#cdd6f4"/>"##;
+        assert_eq!(dominant_colour(svg), Rgb::new(0x7f, 0x84, 0x9c));
+    }
+
+    #[test]
+    fn neutrals_are_the_twelve_mocha_neutrals() {
+        assert!(NEUTRALS.contains(&TEXT));
+        for (i, colour) in NEUTRALS.iter().enumerate() {
+            assert!(!NEUTRALS[..i].contains(colour), "{colour:?}");
+        }
+    }
+
+    #[test]
+    fn name_glyph_hits_an_exact_key() {
+        let extensions = pairs(&[("toml", "T"), ("astro", "A")]);
+        assert_eq!(name_glyph("astro", &extensions, &[]), Some('A'));
+    }
+
+    #[test]
+    fn name_glyph_matches_keys_case_insensitively() {
+        let filenames = pairs(&[("Dockerfile", "D")]);
+        assert_eq!(name_glyph("dockerfile", &[], &filenames), Some('D'));
+    }
+
+    #[test]
+    fn name_glyph_hits_a_name_with_separators_removed() {
+        let filenames = named(&[("go.mod", "G", "GoMod")]);
+        assert_eq!(name_glyph("go-mod", &[], &filenames), Some('G'));
+    }
+
+    #[test]
+    fn name_glyph_hits_the_prefix() {
+        let extensions = pairs(&[("astro", "A")]);
+        assert_eq!(name_glyph("astro-config", &extensions, &[]), Some('A'));
+    }
+
+    #[test]
+    fn name_glyph_prefers_a_key_over_a_name() {
+        let extensions = named(&[("other", "N", "Lua")]);
+        let filenames = pairs(&[("lua", "K")]);
+        assert_eq!(name_glyph("lua", &extensions, &filenames), Some('K'));
+    }
+
+    #[test]
+    fn name_glyph_prefers_extensions_and_file_order() {
+        let extensions = pairs(&[("lua", "1"), ("lua", "2")]);
+        let filenames = pairs(&[("lua", "3")]);
+        assert_eq!(name_glyph("lua", &extensions, &filenames), Some('1'));
+    }
+
+    #[test]
+    fn name_glyph_prefers_an_earlier_candidate() {
+        // The full stem matches a name; the prefix matches a key. The full
+        // stem is the earlier candidate, so its name hit wins.
+        let extensions = named(&[("astro", "A", ""), ("x", "C", "astro-config")]);
+        assert_eq!(name_glyph("astro-config", &extensions, &[]), Some('C'));
+    }
+
+    #[test]
+    fn name_glyph_without_a_hit_is_none() {
+        let extensions = named(&[("rs", "R", "Rs")]);
+        assert_eq!(name_glyph("zzz-unknown", &extensions, &[]), None);
+        // A leading separator yields an empty prefix, which matches nothing,
+        // not even entries with an empty name.
+        assert_eq!(name_glyph("_zzz", &pairs(&[("q", "Q")]), &[]), None);
+    }
+
+    #[test]
+    fn votes_beat_the_name_fallback() {
+        let votes = BTreeMap::from([("rust", "V".to_owned())]);
+        let extensions = pairs(&[("rust", "N")]);
+        let all = entries(&votes, &extensions, &[]);
+        let rust = all.iter().find(|entry| entry.0 == "rust").unwrap();
+        assert_eq!(rust.1, 'V');
+    }
+
+    #[test]
+    fn unvoted_stems_use_the_name_fallback() {
+        let extensions = pairs(&[("astro", "A")]);
+        let all = entries(&BTreeMap::new(), &extensions, &[]);
+        let glyph = |stem: &str| all.iter().find(|entry| entry.0 == stem).unwrap().1;
+        assert_eq!(glyph("astro-config"), 'A');
+        assert_eq!(glyph("_file"), FILE);
+    }
+
+    #[test]
     fn folder_stems_get_folder_glyphs() {
         let votes = BTreeMap::from([("_folder", "X".to_owned()), ("rust", "R".to_owned())]);
-        let all = entries(&votes);
+        let all = entries(&votes, &[], &[]);
         let glyph = |stem: &str| all.iter().find(|entry| entry.0 == stem).unwrap().1;
         assert_eq!(glyph("_folder"), FOLDER_CLOSED);
         assert_eq!(glyph("_folder_open"), FOLDER_OPEN);
@@ -346,7 +563,7 @@ mod tests {
 
     #[test]
     fn entries_cover_every_stem_in_order() {
-        let all = entries(&BTreeMap::new());
+        let all = entries(&BTreeMap::new(), &[], &[]);
         let expected: Vec<&str> = stems().collect();
         let actual: Vec<&str> = all.iter().map(|entry| entry.0).collect();
         assert_eq!(actual, expected);
@@ -414,7 +631,7 @@ mod tests {
     fn every_rendered_line_fits_in_100_chars() {
         let commit = "0123456789abcdef0123456789abcdef01234567";
         // The widest possible glyph escape, so no real table can be wider.
-        let widest: Vec<_> = entries(&BTreeMap::new())
+        let widest: Vec<_> = entries(&BTreeMap::new(), &[], &[])
             .into_iter()
             .map(|(stem, _, colour)| (stem, '\u{10ffff}', colour))
             .collect();
