@@ -712,6 +712,64 @@ plan does not change the GUI.
 - **Scheduling:** any GUI-touching branch; independent of the TUI
   plans.
 
+### 05.10 -- Review fixes (adversarial branch review)
+
+Surfaced by a CODE-REVIEW pass over `main...18932b2`.
+
+Scope: `frext-term/src/tree.rs`, `frext-term/src/app.rs`.
+
+The fixes:
+
+- **A -- the stored width follows the terminal** (bug + spec
+  deviation). `render` stored `total` but never clamped `width`. After
+  the terminal shrank, `<` started from the old, wider width, so the
+  first press changed nothing on screen. Now `render` sets
+  `self.width = clamp_width(self.width, self.total)` right after
+  storing `total`, as "Width" requires. Test: drag to 60 in 80
+  columns, render at 40 columns, then `<` once narrows the drawn
+  sidebar by one column.
+- **B -- a lost release cannot leave a drag stuck** (risk). The drag
+  ended only on `Up(Left)`. Now `Moved` (sent only with no button
+  held) and any `Down(Left)` not on `TreeBorder` also call
+  `end_resize()`. Tests: start a drag, send `Moved`, and a later
+  `Drag(Left)` does not resize; the same after a `Down(Left)` on the
+  editor.
+- **C -- hover and scroll after a refresh** (risk).
+  - When the refresh inside `render` returns `Changed`, a hovered
+    `TreeRow(_)` is ignored for that frame, because its index refers to
+    the old rows.
+  - `refresh` clamps `top` to `rows.len().saturating_sub(rows_height)`
+    (the "at least 1" height from the last render) instead of
+    `rows.len() - 1`. This keeps `menu_anchor` right for a menu opened
+    in the same batch as the refresh.
+
+  Tests: a hovered row index past a removed row does not paint
+  `hover_bg()` on the row that moved into its place; after a collapse
+  in a short sidebar, `top` is clamped by `refresh` alone.
+- **D -- tests for paths nothing guarded**:
+  - the `Refresh::Changed` branch of `TermApp::tree_key`: create a file
+    on disk, press Down without rendering, and the hit map is empty
+  - clicking `[x]` while the tree has focus returns focus to the editor
+  - the Shift+F10 app test asserts a literal anchor position, not
+    `menu_anchor()` read back
+
+Not changed (recorded so they are not re-litigated):
+
+- Renaming the selected entry moves the selection to the row now at
+  the old index. That is the Selection rule; re-selecting the new path
+  would need the rename's result, which core does not return.
+- With the find bar open, Esc in the tree closes the search first, and
+  the Alt toggles apply. That is the keymap's order from plan 04, not
+  this plan's.
+- `F(20)` (the Linux console's Shift+F10) is not bound; the key list is
+  as decided.
+- `menu_anchor` does not clamp a very deep row's indent; `ContextMenu`
+  clamps the menu onto the screen.
+- `total` and `area` go stale while the sidebar is hidden; the next
+  render corrects them, and A clamps the width then.
+
+Verification: the standard ritual.
+
 ## Manual smoke checklist
 
 Run in a real terminal (kitty or freminal, then a legacy terminal):
