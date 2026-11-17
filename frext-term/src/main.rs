@@ -79,6 +79,7 @@ fn main() -> ExitCode {
         icon_choice,
         guard.caps().multiplexer,
         AnsiColours::from_env(),
+        std::process::id(),
     );
 
     let mut app = TermApp::new(editor, guard.mode(), base, home);

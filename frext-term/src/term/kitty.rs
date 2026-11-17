@@ -8,9 +8,14 @@
 //! Uploads use direct transfer (`t=d`), because some terminals refuse
 //! file and shared-memory transfers by default. Every command carries
 //! `q=2`, so the terminal sends no replies that could land in the input
-//! stream as garbage key events. Image ids are 24-bit ([`ImageId`]), so
-//! a whole id fits in the cell's foreground colour and the id-high-byte
-//! diacritic is never needed.
+//! stream as garbage key events. Uploads also carry `C=1`, so a
+//! terminal that would move the cursor after a placement leaves it
+//! where it is and cannot scroll the screen under ratatui. Image ids
+//! are 24-bit ([`ImageId`]), so a whole id fits in the cell's
+//! foreground colour and the id-high-byte diacritic is never needed.
+//!
+//! Image ids share one namespace per terminal, so each process takes
+//! its own block of them ([`id_block`]).
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
@@ -33,6 +38,16 @@ const MAX_ID: u32 = 0xFF_FFFF;
 pub struct ImageId(u32);
 
 impl ImageId {
+    /// The id `id`, which the caller has proven is in `1..=0xFF_FFFF`.
+    /// An out-of-range value gives id 1 rather than panicking; no caller
+    /// passes one.
+    const fn in_range(id: u32) -> Self {
+        match Self::new(id) {
+            Some(id) => id,
+            None => Self(1),
+        }
+    }
+
     /// Returns the id `id`, or `None` when it is outside
     /// `1..=0xFF_FFFF`.
     #[must_use]
@@ -63,6 +78,35 @@ impl ImageId {
         let [_, r, g, b] = self.0.to_be_bytes();
         Color::Rgb(r, g, b)
     }
+}
+
+/// The number of image ids in one process's block.
+///
+/// More than the number of icon stems, so a process never runs out.
+pub const ID_BLOCK: u32 = 1024;
+
+/// The number of id blocks: as many whole [`ID_BLOCK`]s as fit in the
+/// 24-bit id space after id 0, so the last block ends at `0xFF_FC00`.
+pub const ID_BLOCKS: u32 = 16383;
+
+/// The first and last (inclusive) image ids of the block chosen by
+/// `seed`.
+///
+/// Image ids live in one namespace per terminal: two frext-term
+/// instances (or another image client) under one tmux would overwrite
+/// and delete each other's images if both counted from 1. Each process
+/// seeds this with its process id, so concurrent instances almost
+/// always get disjoint blocks. Block `b = seed % ID_BLOCKS` runs from
+/// `b * ID_BLOCK + 1` to `b * ID_BLOCK + ID_BLOCK`.
+#[must_use]
+pub const fn id_block(seed: u32) -> (ImageId, ImageId) {
+    // `b < ID_BLOCKS`, so `b * ID_BLOCK + ID_BLOCK <= 0xFF_FC00`: no
+    // overflow, and both ids are in range.
+    let base = (seed % ID_BLOCKS) * ID_BLOCK;
+    (
+        ImageId::in_range(base + 1),
+        ImageId::in_range(base + ID_BLOCK),
+    )
 }
 
 /// The two cells of a 2x1 icon, left then right.
@@ -107,7 +151,7 @@ pub fn upload(
 ) -> Vec<u8> {
     let encoded = STANDARD.encode(rgba);
     let first_keys = format!(
-        "a=T,U=1,f=32,t=d,s={width},v={height},i={},c=2,r=1,q=2",
+        "a=T,U=1,f=32,t=d,s={width},v={height},i={},c=2,r=1,C=1,q=2",
         id.get()
     );
     let mut chunks = encoded.as_bytes().chunks(CHUNK).peekable();
@@ -166,7 +210,7 @@ mod tests {
     fn one_pixel_upload_is_exact() {
         assert_eq!(
             upload(id(7), 1, 1, &[1, 2, 3, 4], Multiplexer::None),
-            b"\x1b_Ga=T,U=1,f=32,t=d,s=1,v=1,i=7,c=2,r=1,q=2;AQIDBA==\x1b\\".to_vec()
+            b"\x1b_Ga=T,U=1,f=32,t=d,s=1,v=1,i=7,c=2,r=1,C=1,q=2;AQIDBA==\x1b\\".to_vec()
         );
     }
 
@@ -174,7 +218,7 @@ mod tests {
     fn empty_upload_is_one_command_with_empty_payload() {
         assert_eq!(
             upload(id(1), 0, 0, &[], Multiplexer::None),
-            b"\x1b_Ga=T,U=1,f=32,t=d,s=0,v=0,i=1,c=2,r=1,q=2;\x1b\\".to_vec()
+            b"\x1b_Ga=T,U=1,f=32,t=d,s=0,v=0,i=1,c=2,r=1,C=1,q=2;\x1b\\".to_vec()
         );
     }
 
@@ -184,7 +228,7 @@ mod tests {
         assert_eq!(count(&out, b"\x1b_G"), 1);
         assert!(!contains(&out, b"m="));
         let payload = b"A".repeat(CHUNK);
-        let mut expected = b"\x1b_Ga=T,U=1,f=32,t=d,s=32,v=24,i=1,c=2,r=1,q=2;".to_vec();
+        let mut expected = b"\x1b_Ga=T,U=1,f=32,t=d,s=32,v=24,i=1,c=2,r=1,C=1,q=2;".to_vec();
         expected.extend_from_slice(&payload);
         expected.extend_from_slice(b"\x1b\\");
         assert_eq!(out, expected);
@@ -194,7 +238,7 @@ mod tests {
     fn one_byte_more_is_two_chunks() {
         let out = upload(id(1), 32, 24, &[0; 3073], Multiplexer::None);
         assert_eq!(count(&out, b"\x1b_G"), 2);
-        let mut expected = b"\x1b_Ga=T,U=1,f=32,t=d,s=32,v=24,i=1,c=2,r=1,q=2,m=1;".to_vec();
+        let mut expected = b"\x1b_Ga=T,U=1,f=32,t=d,s=32,v=24,i=1,c=2,r=1,C=1,q=2,m=1;".to_vec();
         expected.extend_from_slice(&b"A".repeat(CHUNK));
         expected.extend_from_slice(b"\x1b\\\x1b_Gm=0,q=2;AA==\x1b\\");
         assert_eq!(out, expected);
@@ -249,6 +293,22 @@ mod tests {
     fn next_counts_up_and_stops_at_the_top() {
         assert_eq!(id(1).next(), Some(id(2)));
         assert_eq!(id(0xFF_FFFF).next(), None);
+    }
+
+    #[test]
+    fn id_block_zero_is_the_first_block() {
+        assert_eq!(id_block(0), (id(1), id(1024)));
+    }
+
+    #[test]
+    fn id_block_last_block_ends_below_the_top() {
+        assert_eq!(id_block(16382), (id(16382 * 1024 + 1), id(0xFF_FC00)));
+    }
+
+    #[test]
+    fn id_block_wraps_to_block_zero() {
+        assert_eq!(id_block(16383), id_block(0));
+        assert_eq!(id_block(u32::MAX), id_block(u32::MAX % ID_BLOCKS));
     }
 
     #[test]

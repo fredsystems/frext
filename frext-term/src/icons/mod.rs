@@ -134,6 +134,10 @@ impl AnsiColours {
 /// The provider for `choice`: kitty icons wrapped for `multiplexer`,
 /// Nerd Font, ASCII or no icons.
 ///
+/// Kitty icons take their image ids from the block chosen by `seed`
+/// ([`crate::term::kitty::id_block`]); `main` passes the process id, so
+/// instances sharing a terminal use different ids.
+///
 /// Kitty icons need colour output, because the image id travels in the
 /// placeholder's foreground colour; under [`AnsiColours::Disabled`] a
 /// kitty choice gives Nerd Font icons instead.
@@ -142,10 +146,11 @@ pub fn provider(
     choice: IconChoice,
     multiplexer: Multiplexer,
     colours: AnsiColours,
+    seed: u32,
 ) -> Box<dyn IconProvider> {
     match (choice, colours) {
         (IconChoice::Kitty { cell_px }, AnsiColours::Enabled) => {
-            Box::new(KittyIcons::new(cell_px, multiplexer))
+            Box::new(KittyIcons::new(cell_px, multiplexer, seed))
         }
         (IconChoice::Kitty { .. }, AnsiColours::Disabled) => {
             log::warn!(
@@ -245,7 +250,7 @@ mod tests {
     };
 
     fn provider_name(choice: IconChoice, colours: AnsiColours) -> String {
-        format!("{:?}", provider(choice, Multiplexer::None, colours))
+        format!("{:?}", provider(choice, Multiplexer::None, colours, 0))
     }
 
     #[test]

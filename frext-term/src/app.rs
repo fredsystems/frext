@@ -1832,6 +1832,7 @@ mod tests {
                 height: 20,
             },
             Multiplexer::None,
+            0,
         )));
         draw(&mut app);
         let uploads = String::from_utf8(app.take_graphics()).unwrap();

@@ -215,6 +215,7 @@ mod tests {
                 height: 20,
             },
             Multiplexer::None,
+            0,
         )));
         let mut terminal = terminal();
 
