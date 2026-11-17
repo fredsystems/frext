@@ -276,23 +276,30 @@ impl Editor {
             (None, _) => 0,
         };
         self.search.current = Some(next);
-        let mut effects = Vec::new();
-        if let Some(m) = self.search.matches.get(next)
-            && let Some(tab) = self.tabs.get(self.active)
-        {
-            let chars =
-                offsets::char_of_byte(&tab.text, m.start)..offsets::char_of_byte(&tab.text, m.end);
-            effects.push(Effect::SetSelection {
+        Outcome {
+            buffer: BufferChange::Unchanged,
+            effects: self.select_match_effects(next),
+        }
+    }
+
+    /// The effects that select match `index` in the active buffer (as a char
+    /// range, keeping focus where it is) and scroll it into view; empty when
+    /// there is no such match.
+    fn select_match_effects(&self, index: usize) -> Vec<Effect> {
+        let (Some(m), Some(tab)) = (self.search.matches.get(index), self.tabs.get(self.active))
+        else {
+            return Vec::new();
+        };
+        let chars =
+            offsets::char_of_byte(&tab.text, m.start)..offsets::char_of_byte(&tab.text, m.end);
+        vec![
+            Effect::SetSelection {
                 tab_id: tab.id,
                 chars,
                 focus: EditorFocus::Keep,
-            });
-            effects.push(Effect::RevealSelection { tab_id: tab.id });
-        }
-        Outcome {
-            buffer: BufferChange::Unchanged,
-            effects,
-        }
+            },
+            Effect::RevealSelection { tab_id: tab.id },
+        ]
     }
 
     /// Flip one search toggle, then re-find. Turning search-within-selection
@@ -322,29 +329,31 @@ impl Editor {
     }
 
     /// Replace the currently-focused match with the replacement text, then
-    /// re-find so the highlights and indices stay correct.
-    pub(super) fn replace_current(&mut self) -> BufferChange {
+    /// re-find so the highlights and indices stay correct. When a match
+    /// remains, the next one (at or after the replaced position) is selected
+    /// in the editor and scrolled into view.
+    pub(super) fn replace_current(&mut self) -> Outcome {
         let Some(index) = self.search.current else {
-            return BufferChange::Unchanged;
+            return Outcome::default();
         };
         let Some(range) = self.search.matches.get(index).cloned() else {
-            return BufferChange::Unchanged;
+            return Outcome::default();
         };
         let matcher = match self.search.query.compile() {
             Ok(matcher) => matcher,
             Err(err) => {
                 self.search.error = Some(err.to_string());
-                return BufferChange::Unchanged;
+                return Outcome::default();
             }
         };
         let Some(tab) = self.tabs.get_mut(self.active) else {
-            return BufferChange::Unchanged;
+            return Outcome::default();
         };
 
         let Some((new_text, _)) =
             matcher.replace_one_at(&tab.text, range.start, &self.search.replacement)
         else {
-            return BufferChange::Unchanged;
+            return Outcome::default();
         };
         tab.text = new_text;
         self.persist_active_swap();
@@ -359,7 +368,15 @@ impl Editor {
         {
             self.search.current = Some(pos);
         }
-        BufferChange::Edited
+        let effects = self
+            .search
+            .current
+            .map(|current| self.select_match_effects(current))
+            .unwrap_or_default();
+        Outcome {
+            buffer: BufferChange::Edited,
+            effects,
+        }
     }
 
     /// Replace every match in the active buffer (or, with
@@ -855,6 +872,97 @@ mod tests {
         assert_eq!(outcome.buffer, BufferChange::Edited);
         assert!(outcome.effects.is_empty());
         assert_eq!(editor.active_tab().unwrap().text, "dog");
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn replace_current_selects_and_reveals_the_next_match() {
+        let dir = temp_dir("search-replace-select-next");
+        let mut editor = editor_with_two_tabs(&dir, "hello hello hello", "");
+        *editor.search_replacement_mut() = "bye".to_owned();
+        find(&mut editor, "hello");
+        let tab_id = editor.active_tab().unwrap().id;
+
+        let outcome = editor.apply(Command::ReplaceCurrent);
+
+        assert_eq!(editor.active_tab().unwrap().text, "bye hello hello");
+        assert_eq!(outcome.buffer, BufferChange::Edited);
+        assert_eq!(editor.search().current(), Some(0));
+        assert_eq!(
+            outcome.effects,
+            vec![
+                Effect::SetSelection {
+                    tab_id,
+                    chars: 4..9,
+                    focus: EditorFocus::Keep,
+                },
+                Effect::RevealSelection { tab_id },
+            ]
+        );
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn replacing_the_final_match_wraps_to_the_first() {
+        let dir = temp_dir("search-replace-wrap");
+        let mut editor = editor_with_two_tabs(&dir, "hello hello", "");
+        *editor.search_replacement_mut() = "bye".to_owned();
+        find(&mut editor, "hello");
+        editor.apply(Command::StepMatch(StepDirection::Forward));
+        assert_eq!(editor.search().current(), Some(1));
+        let tab_id = editor.active_tab().unwrap().id;
+
+        let outcome = editor.apply(Command::ReplaceCurrent);
+
+        assert_eq!(editor.active_tab().unwrap().text, "hello bye");
+        assert_eq!(outcome.buffer, BufferChange::Edited);
+        assert_eq!(editor.search().current(), Some(0));
+        assert_eq!(
+            outcome.effects,
+            vec![
+                Effect::SetSelection {
+                    tab_id,
+                    chars: 0..5,
+                    focus: EditorFocus::Keep,
+                },
+                Effect::RevealSelection { tab_id },
+            ]
+        );
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn replacing_the_last_match_selects_nothing() {
+        let dir = temp_dir("search-replace-last");
+        let mut editor = editor_with_two_tabs(&dir, "say hello", "");
+        *editor.search_replacement_mut() = "bye".to_owned();
+        find(&mut editor, "hello");
+
+        let outcome = editor.apply(Command::ReplaceCurrent);
+
+        assert_eq!(editor.active_tab().unwrap().text, "say bye");
+        assert_eq!(outcome.buffer, BufferChange::Edited);
+        assert_eq!(editor.search().current(), None);
+        assert!(outcome.effects.is_empty());
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn replace_current_without_a_current_match_is_a_no_op() {
+        let dir = temp_dir("search-replace-no-current");
+        let mut editor = editor_with_two_tabs(&dir, "cat", "");
+        *editor.search_replacement_mut() = "dog".to_owned();
+        find(&mut editor, "absent");
+        assert_eq!(editor.search().current(), None);
+
+        let outcome = editor.apply(Command::ReplaceCurrent);
+
+        assert_eq!(outcome, Outcome::default());
+        assert_eq!(editor.active_tab().unwrap().text, "cat");
 
         fs::remove_dir_all(&dir).unwrap();
     }

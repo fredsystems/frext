@@ -2174,6 +2174,37 @@ mod tests {
     }
 
     #[test]
+    fn replace_selects_the_next_match_and_redo_restores_it() {
+        let dir = temp_dir("find-replace-select-next");
+        let mut app = app_with_text(&dir, "hello hello hello", KeyboardMode::Enhanced);
+        let id = active_id(&app);
+        app.handle(ctrl('h'), Instant::now());
+        type_text(&mut app, "hello");
+        press(&mut app, KeyCode::Tab, KeyModifiers::NONE, 1);
+        type_text(&mut app, "bye");
+
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, 1);
+        assert_eq!(text_of(&app), "bye hello hello");
+        assert_eq!(app.buffer.selection(id), Some(4..9));
+
+        draw(&mut app);
+        left_click(&mut app, 5, 3);
+        assert_eq!(app.focus, Focus::Editor);
+        app.handle(ctrl('z'), Instant::now());
+        assert_eq!(text_of(&app), "hello hello hello");
+        app.handle(
+            key(
+                KeyCode::Char('Z'),
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+            ),
+            Instant::now(),
+        );
+        assert_eq!(text_of(&app), "bye hello hello");
+        assert_eq!(app.buffer.selection(id), Some(4..9));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn hiding_the_replace_row_moves_focus_to_the_find_field() {
         let dir = temp_dir("find-hide-replace");
         let mut app = app_with_text(&dir, "hello world", KeyboardMode::Enhanced);

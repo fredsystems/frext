@@ -257,12 +257,7 @@ impl Editor {
             Command::RecomputeMatches => self.recompute_matches(),
             Command::ToggleSearchOption(option) => self.toggle_search_option(option),
             Command::ToggleReplaceRow => self.toggle_replace_row(),
-            Command::ReplaceCurrent => {
-                return Outcome {
-                    buffer: self.replace_current(),
-                    effects: Vec::new(),
-                };
-            }
+            Command::ReplaceCurrent => return self.replace_current(),
             Command::ReplaceAll => {
                 return Outcome {
                     buffer: self.replace_all(),

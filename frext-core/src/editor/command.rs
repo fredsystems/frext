@@ -78,7 +78,8 @@ pub enum Command {
     ToggleSearchOption(SearchOption),
     /// Show or hide the replace row.
     ToggleReplaceRow,
-    /// Replace the focused match with the replacement text.
+    /// Replace the focused match with the replacement text, then select the
+    /// next remaining match (wrapping to the first) and scroll it into view.
     ReplaceCurrent,
     /// Replace every match in the active buffer.
     ReplaceAll,
