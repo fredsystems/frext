@@ -363,7 +363,16 @@ impl TermApp {
                         | Target::PromptButton(_)
                         | Target::PromptCandidate(_)
                         | Target::MenuPopup
-                        | Target::MenuItem(_),
+                        | Target::MenuItem(_)
+                        | Target::FindInput
+                        | Target::ReplaceInput
+                        | Target::FindOption(_)
+                        | Target::FindPrev
+                        | Target::FindNext
+                        | Target::FindReplaceRow
+                        | Target::FindClose
+                        | Target::ReplaceCurrent
+                        | Target::ReplaceAll,
                     )
                     | None => {}
                 }

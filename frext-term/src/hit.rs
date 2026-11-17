@@ -5,6 +5,7 @@
 //! frame's map, so widgets can register regions without the app knowing
 //! their geometry.
 
+use frext_core::editor::SearchOption;
 use ratatui::layout::{Position, Rect};
 
 /// Something on screen that a mouse event can land on.
@@ -34,6 +35,24 @@ pub enum Target {
     MenuPopup,
     /// The context-menu entry at this index.
     MenuItem(usize),
+    /// The find field of the search bar.
+    FindInput,
+    /// The replace field of the search bar.
+    ReplaceInput,
+    /// A search-option toggle on the search bar.
+    FindOption(SearchOption),
+    /// The search bar's "previous match" button.
+    FindPrev,
+    /// The search bar's "next match" button.
+    FindNext,
+    /// The search bar's replace-row toggle.
+    FindReplaceRow,
+    /// The search bar's close button.
+    FindClose,
+    /// The "replace the current match" button.
+    ReplaceCurrent,
+    /// The "replace all matches" button.
+    ReplaceAll,
 }
 
 impl Target {
@@ -45,6 +64,18 @@ impl Target {
             Self::OpenFile => Some("Open file (Ctrl+O)"),
             Self::Save => Some("Save (Ctrl+S)"),
             Self::CloseTab(_) => Some("Close tab (Ctrl+W)"),
+            Self::FindOption(SearchOption::CaseSensitive) => Some("Match case (Alt+C)"),
+            Self::FindOption(SearchOption::WholeWord) => Some("Whole word (Alt+W)"),
+            Self::FindOption(SearchOption::Regex) => Some("Regular expression (Alt+R)"),
+            Self::FindOption(SearchOption::InSelection) => {
+                Some("Search within the current selection (Alt+L)")
+            }
+            Self::FindPrev => Some("Previous match (Shift+F3)"),
+            Self::FindNext => Some("Next match (F3 / Enter)"),
+            Self::FindReplaceRow => Some("Toggle replace"),
+            Self::FindClose => Some("Close (Esc)"),
+            Self::ReplaceCurrent => Some("Replace the current match (Enter in With)"),
+            Self::ReplaceAll => Some("Replace all matches"),
             Self::SelectTab(_)
             | Self::PromptPopup
             | Self::PromptInput
@@ -52,7 +83,9 @@ impl Target {
             | Self::PromptCandidate(_)
             | Self::Editor
             | Self::MenuPopup
-            | Self::MenuItem(_) => None,
+            | Self::MenuItem(_)
+            | Self::FindInput
+            | Self::ReplaceInput => None,
         }
     }
 }
@@ -144,5 +177,51 @@ mod tests {
         assert_eq!(Target::Editor.hint(), None);
         assert_eq!(Target::MenuPopup.hint(), None);
         assert_eq!(Target::MenuItem(4).hint(), None);
+    }
+
+    #[test]
+    fn find_bar_hints() {
+        assert_eq!(Target::FindInput.hint(), None);
+        assert_eq!(Target::ReplaceInput.hint(), None);
+        assert_eq!(
+            Target::FindOption(SearchOption::CaseSensitive).hint(),
+            Some("Match case (Alt+C)")
+        );
+        assert_eq!(
+            Target::FindOption(SearchOption::WholeWord).hint(),
+            Some("Whole word (Alt+W)")
+        );
+        assert_eq!(
+            Target::FindOption(SearchOption::Regex).hint(),
+            Some("Regular expression (Alt+R)")
+        );
+        assert_eq!(
+            Target::FindOption(SearchOption::InSelection).hint(),
+            Some("Search within the current selection (Alt+L)")
+        );
+        assert_eq!(Target::FindPrev.hint(), Some("Previous match (Shift+F3)"));
+        assert_eq!(Target::FindNext.hint(), Some("Next match (F3 / Enter)"));
+        assert_eq!(Target::FindReplaceRow.hint(), Some("Toggle replace"));
+        assert_eq!(Target::FindClose.hint(), Some("Close (Esc)"));
+        assert_eq!(
+            Target::ReplaceCurrent.hint(),
+            Some("Replace the current match (Enter in With)")
+        );
+        assert_eq!(Target::ReplaceAll.hint(), Some("Replace all matches"));
+    }
+
+    #[test]
+    fn find_option_region_resolves() {
+        let mut map = HitMap::default();
+        map.push(Rect::new(0, 0, 80, 24), Target::Editor);
+        map.push(
+            Rect::new(40, 0, 3, 1),
+            Target::FindOption(SearchOption::Regex),
+        );
+        assert_eq!(
+            map.hit(41, 0),
+            Some(Target::FindOption(SearchOption::Regex))
+        );
+        assert_eq!(map.hit(43, 0), Some(Target::Editor));
     }
 }
