@@ -8,7 +8,9 @@
 use std::path::PathBuf;
 use std::time::Instant;
 
-use crossterm::event::{Event, KeyEvent, KeyEventKind, MouseButton, MouseEvent, MouseEventKind};
+use crossterm::event::{
+    Event, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
 use frext_core::editor::{BufferChange, Command, Editor, EditorFocus, Effect};
 use frext_core::lines::line_count;
 use frext_core::syntax::language_from_path;
@@ -17,6 +19,7 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::Style;
 
+use crate::buffer::cursor::Selecting;
 use crate::buffer::edit::{Applied, EditAction};
 use crate::buffer::{BufferView, WHEEL_ROWS};
 use crate::events::AppEvent;
@@ -240,7 +243,15 @@ impl TermApp {
             MouseEventKind::Moved | MouseEventKind::Drag(_) => {
                 self.hovered = target;
                 self.status.set_hint(target.and_then(Target::hint));
+                if mouse.kind == MouseEventKind::Drag(MouseButton::Left)
+                    && self.buffer.is_dragging()
+                    && !self.prompt.is_open(&self.editor)
+                    && let Some(tab) = self.editor.active_tab()
+                {
+                    self.buffer.mouse_drag(tab, mouse.column, mouse.row);
+                }
             }
+            MouseEventKind::Up(MouseButton::Left) => self.buffer.mouse_up(),
             MouseEventKind::Down(MouseButton::Left) => {
                 if self.prompt.is_open(&self.editor) {
                     let reply = self
@@ -259,7 +270,18 @@ impl TermApp {
                         self.send(Command::RequestClose(index), now);
                     }
                     Some(Target::OpenFile) => self.open_file_prompt(),
-                    Some(Target::Editor) => self.focus = Focus::Editor,
+                    Some(Target::Editor) => {
+                        if let Some(tab) = self.editor.active_tab() {
+                            let selecting = if mouse.modifiers.contains(KeyModifiers::SHIFT) {
+                                Selecting::Extend
+                            } else {
+                                Selecting::Move
+                            };
+                            self.buffer
+                                .mouse_down(tab, mouse.column, mouse.row, selecting, now);
+                        }
+                        self.focus = Focus::Editor;
+                    }
                     Some(
                         Target::PromptPopup
                         | Target::PromptInput
@@ -1329,6 +1351,176 @@ mod tests {
         app.shutdown();
         assert_eq!(app.editor().tabs().len(), 1);
         assert!(!app.should_quit());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    fn left(kind: fn(MouseButton) -> MouseEventKind) -> MouseEventKind {
+        kind(MouseButton::Left)
+    }
+
+    fn shift_down(column: u16, row: u16) -> AppEvent {
+        AppEvent::Input(Event::Mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column,
+            row,
+            modifiers: KeyModifiers::SHIFT,
+        }))
+    }
+
+    fn active_id(app: &TermApp) -> u64 {
+        app.editor().active_tab().unwrap().id
+    }
+
+    #[test]
+    fn a_click_places_the_caret() {
+        let dir = temp_dir("click");
+        let mut app = app_with_text(&dir, "hello\nworld", KeyboardMode::Enhanced);
+        let now = Instant::now();
+        // Gutter " 1 " is three columns: text column 2 of line 2 is x=5.
+        app.handle(mouse(left(MouseEventKind::Down), 5, 2), now);
+        app.handle(mouse(left(MouseEventKind::Up), 5, 2), now);
+        let id = active_id(&app);
+        assert_eq!(app.buffer.caret(id), Some(8));
+        assert_eq!(app.buffer.selection(id), Some(8..8));
+        assert_eq!(app.focus, Focus::Editor);
+        assert_eq!(
+            frame_cursor(&mut app),
+            Some(ratatui::layout::Position::new(5, 2))
+        );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_double_click_selects_a_word_and_ctrl_c_copies_it() {
+        let dir = temp_dir("double-click");
+        let mut app = app_with_text(&dir, "hello world", KeyboardMode::Enhanced);
+        let now = Instant::now();
+        app.handle(mouse(left(MouseEventKind::Down), 10, 1), now);
+        app.handle(mouse(left(MouseEventKind::Up), 10, 1), now);
+        app.handle(mouse(left(MouseEventKind::Down), 10, 1), now);
+        app.handle(mouse(left(MouseEventKind::Up), 10, 1), now);
+        let id = active_id(&app);
+        assert_eq!(app.buffer.selection(id), Some(6..11));
+
+        app.handle(ctrl('c'), now);
+        app.handle(key(KeyCode::End, KeyModifiers::CONTROL), now);
+        app.handle(ctrl('v'), now);
+        assert_eq!(text_of(&app), "hello worldworld");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_drag_selects_across_two_lines() {
+        let dir = temp_dir("drag");
+        let mut app = app_with_text(&dir, "hello\nworld", KeyboardMode::Enhanced);
+        let now = Instant::now();
+        app.handle(mouse(left(MouseEventKind::Down), 4, 1), now);
+        assert!(app.buffer.is_dragging());
+        app.handle(mouse(left(MouseEventKind::Drag), 6, 2), now);
+        app.handle(mouse(left(MouseEventKind::Up), 6, 2), now);
+        assert!(!app.buffer.is_dragging());
+        let id = active_id(&app);
+        assert_eq!(app.buffer.selection(id), Some(1..9));
+
+        // After the release a drag event no longer selects.
+        app.handle(mouse(left(MouseEventKind::Drag), 3, 1), now);
+        assert_eq!(app.buffer.selection(id), Some(1..9));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_drag_that_leaves_the_editor_keeps_selecting() {
+        let dir = temp_dir("drag-out");
+        let file = long_file(&dir);
+        let mut app = app(&dir, &[file], KeyboardMode::Enhanced);
+        let now = Instant::now();
+        draw(&mut app);
+        let id = active_id(&app);
+        // 101 lines: the gutter "  1 " is four columns.
+        app.handle(mouse(left(MouseEventKind::Down), 4, 1), now);
+
+        // The status row (23) is below the editor (rows 1..=22): one row
+        // of scroll per event, selecting to the edge row.
+        app.handle(mouse(left(MouseEventKind::Drag), 4, 23), now);
+        let buf = draw(&mut app);
+        assert!(row_text(&buf, 1).starts_with("  2 line 2 "));
+        assert_eq!(
+            app.buffer.selection(id),
+            Some(0..text_index(&app, "line 23\n"))
+        );
+
+        app.handle(mouse(left(MouseEventKind::Drag), 4, 23), now);
+        let buf = draw(&mut app);
+        assert!(row_text(&buf, 1).starts_with("  3 line 3 "));
+        assert_eq!(
+            app.buffer.selection(id),
+            Some(0..text_index(&app, "line 24\n"))
+        );
+
+        // The tab bar (row 0) is above it: scrolls back up.
+        app.handle(mouse(left(MouseEventKind::Drag), 4, 0), now);
+        let buf = draw(&mut app);
+        assert!(row_text(&buf, 1).starts_with("  2 line 2 "));
+        assert_eq!(
+            app.buffer.selection(id),
+            Some(0..text_index(&app, "line 2\n"))
+        );
+        app.handle(mouse(left(MouseEventKind::Up), 4, 0), now);
+        assert!(!app.buffer.is_dragging());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn shift_click_extends_the_selection() {
+        let dir = temp_dir("shift-click");
+        let mut app = app_with_text(&dir, "hello world", KeyboardMode::Enhanced);
+        let now = Instant::now();
+        app.handle(mouse(left(MouseEventKind::Down), 5, 1), now);
+        app.handle(mouse(left(MouseEventKind::Up), 5, 1), now);
+        app.handle(shift_down(11, 1), now);
+        app.handle(mouse(left(MouseEventKind::Up), 11, 1), now);
+        let id = active_id(&app);
+        assert_eq!(app.buffer.selection(id), Some(2..8));
+        assert_eq!(app.buffer.caret(id), Some(8));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_wheel_scrolls_without_moving_the_caret() {
+        let dir = temp_dir("wheel-caret");
+        let file = long_file(&dir);
+        let mut app = app(&dir, &[file], KeyboardMode::Enhanced);
+        let now = Instant::now();
+        draw(&mut app);
+        app.handle(mouse(left(MouseEventKind::Down), 6, 1), now);
+        app.handle(mouse(left(MouseEventKind::Up), 6, 1), now);
+        let id = active_id(&app);
+        assert_eq!(app.buffer.caret(id), Some(2));
+
+        app.handle(mouse(MouseEventKind::ScrollDown, 40, 10), now);
+        let buf = draw(&mut app);
+        assert!(row_text(&buf, 1).starts_with("  4 line 4 "));
+        assert_eq!(app.buffer.caret(id), Some(2));
+        assert_eq!(app.buffer.selection(id), Some(2..2));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_click_while_a_prompt_is_open_does_not_touch_the_buffer() {
+        let dir = temp_dir("click-prompt");
+        let mut app = app_with_text(&dir, "hello\nworld", KeyboardMode::Enhanced);
+        let now = Instant::now();
+        let id = active_id(&app);
+        let before = app.buffer.selection(id);
+        app.handle(ctrl('o'), now);
+        draw(&mut app);
+        assert!(app.prompt.is_open(&app.editor));
+
+        app.handle(mouse(left(MouseEventKind::Down), 5, 2), now);
+        assert!(!app.buffer.is_dragging());
+        app.handle(mouse(left(MouseEventKind::Drag), 6, 2), now);
+        app.handle(mouse(left(MouseEventKind::Up), 6, 2), now);
+        assert_eq!(app.buffer.selection(id), before);
         fs::remove_dir_all(&dir).unwrap();
     }
 }
