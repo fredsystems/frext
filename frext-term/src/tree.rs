@@ -670,15 +670,26 @@ fn draw_row(
         RowKind::File => IconKind::File,
     };
     let icon_room = room(x).min(usize::from(ICON_WIDTH));
-    match icons.icon(&name, kind) {
-        IconCell::Text { text, color } => {
-            buf.set_stringn(x, line.y, text, icon_room, style.fg(theme::color(color)));
-        }
-        IconCell::Image { id } => {
-            let icon_style = style.fg(id.color());
-            for (offset, symbol) in (0u16..).zip(PLACEHOLDER_CELLS.iter().take(icon_room)) {
-                if let Some(cell) = buf.cell_mut(Position::new(x.saturating_add(offset), line.y)) {
-                    cell.set_symbol(symbol).set_style(icon_style);
+    if icon_room > 0 {
+        match icons.icon(&name, kind) {
+            IconCell::Text { text, color } => {
+                buf.set_stringn(x, line.y, text, icon_room, style.fg(theme::color(color)));
+            }
+            IconCell::Image { id } => {
+                // Kitty reserves every attribute but fg and bg on
+                // placeholder cells, so keep only the row's background.
+                // `set_style` only adds modifiers, hence the reset first.
+                let mut icon_style = Style::new().fg(id.color());
+                if let Some(bg) = style.bg {
+                    icon_style = icon_style.bg(bg);
+                }
+                for (offset, symbol) in (0u16..).zip(PLACEHOLDER_CELLS.iter().take(icon_room)) {
+                    if let Some(cell) =
+                        buf.cell_mut(Position::new(x.saturating_add(offset), line.y))
+                    {
+                        cell.reset();
+                        cell.set_symbol(symbol).set_style(icon_style);
+                    }
                 }
             }
         }
@@ -1267,6 +1278,80 @@ mod tests {
             assert_eq!(Some(buf[(4, y)].bg), theme::tree_border().bg, "{y}");
             assert_eq!(buf[(5, y)], Buffer::empty(SCREEN)[(5, y)], "{y}");
         }
+    }
+
+    #[test]
+    fn image_placeholders_on_the_active_row_carry_only_fg_and_bg() {
+        let (_dir, _, editor) = fixture("image-active", &["Cargo.toml"]);
+        let mut tree = FileTree::new();
+        tree.set_icons(fake_icons());
+        let (buf, _) = render(&mut tree, &editor, TreeFocus::Unfocused, None, SIDEBAR);
+        // Cargo.toml is row 2, drawn at y = 3.
+        assert!(theme::tree_active().add_modifier.contains(Modifier::BOLD));
+        for x in [3, 4] {
+            let cell = &buf[(x, 3)];
+            assert_eq!(cell.modifier, Modifier::empty(), "{x}");
+            assert_eq!(cell.underline_color, Color::Reset, "{x}");
+            assert_eq!(cell.fg, Color::Rgb(1, 2, 3), "{x}");
+            assert_eq!(Some(cell.bg), mantle(), "{x}");
+        }
+        assert_eq!(buf[(3, 3)].symbol(), PLACEHOLDER_CELLS[0]);
+        assert_eq!(buf[(4, 3)].symbol(), PLACEHOLDER_CELLS[1]);
+        assert!(buf[(5, 3)].modifier.contains(Modifier::BOLD));
+        assert_eq!(Some(buf[(5, 3)].fg), theme::tree_active().fg);
+    }
+
+    /// A provider that counts how often it is asked for an icon.
+    #[derive(Debug)]
+    struct CountingIcons {
+        calls: std::rc::Rc<std::cell::Cell<usize>>,
+    }
+
+    impl IconProvider for CountingIcons {
+        fn icon(&mut self, _name: &str, _kind: IconKind) -> IconCell {
+            self.calls.set(self.calls.get() + 1);
+            IconCell::Image {
+                id: crate::term::kitty::ImageId::new(0x01_0203).unwrap(),
+            }
+        }
+
+        fn take_uploads(&mut self) -> Vec<u8> {
+            Vec::new()
+        }
+
+        fn release(&mut self) -> Vec<u8> {
+            Vec::new()
+        }
+    }
+
+    #[test]
+    fn a_row_without_icon_room_never_asks_the_provider() {
+        let (_dir, _, editor) = fixture("image-no-room", &[]);
+        let calls = std::rc::Rc::new(std::cell::Cell::new(0));
+        let mut tree = FileTree::new();
+        tree.set_icons(Box::new(CountingIcons {
+            calls: std::rc::Rc::clone(&calls),
+        }));
+        // Three cells left of the border: the prefix fills them all.
+        let (buf, _) = render(
+            &mut tree,
+            &editor,
+            TreeFocus::Unfocused,
+            None,
+            Rect::new(0, 0, 4, 8),
+        );
+        assert_eq!(buf[(2, 1)].symbol(), " ");
+        assert_eq!(calls.get(), 0);
+
+        // With one cell of room the provider is asked once per row.
+        render(
+            &mut tree,
+            &editor,
+            TreeFocus::Unfocused,
+            None,
+            Rect::new(0, 0, 5, 8),
+        );
+        assert_eq!(calls.get(), 4);
     }
 
     #[test]
