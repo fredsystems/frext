@@ -17,6 +17,7 @@ crossterm = { workspace = true }
 frext-core = { workspace = true }
 log = { workspace = true }
 ratatui = { workspace = true }
+rustix = { workspace = true }
 unicode-segmentation = { workspace = true }
 unicode-width = { workspace = true }
 

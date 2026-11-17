@@ -1,13 +1,28 @@
-//! The startup probe: the query bytes and the reply parser.
+//! The startup probe: the query bytes, the reply parser and the read
+//! loop.
 //!
 //! [`query`] builds the single batch of queries written to the terminal;
-//! [`parse`] turns whatever came back into [`Replies`]. Both are pure:
-//! the read loop that connects them to the terminal lives elsewhere.
+//! [`parse`] turns whatever came back into [`Replies`]. Both are pure.
+//! [`read_replies`] collects the replies from the terminal's input and
+//! [`probe`] connects the three.
 //! The DA1 query goes last because every terminal answers it, so its
 //! reply marks the end of the batch.
 
+use std::io::{self, Write};
+use std::os::fd::AsFd;
+use std::time::{Duration, Instant};
+
+use rustix::event::{PollFd, PollFlags, Timespec};
+use rustix::io::Errno;
+
 use super::caps::{CellPx, Multiplexer};
 use super::tmux;
+
+/// How long the probe waits for the terminal's replies.
+pub const PROBE_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// The size of each read from the input.
+const READ_CHUNK: usize = 1024;
 
 /// The escape byte.
 const ESC: u8 = 0x1b;
@@ -126,6 +141,69 @@ pub fn parse(bytes: &[u8]) -> Replies {
         }
     }
     replies
+}
+
+/// Reads the terminal's replies from `input` until the DA1 reply has
+/// arrived, the input reaches end of file, or `timeout` has passed with
+/// nothing more to read. Interrupted calls are retried.
+///
+/// # Errors
+///
+/// Returns the error from polling or reading `input`, other than an
+/// interruption.
+pub fn read_replies(input: impl AsFd, timeout: Duration) -> io::Result<Vec<u8>> {
+    let deadline = Instant::now().checked_add(timeout);
+    let mut bytes = Vec::new();
+    let mut buf = [0_u8; READ_CHUNK];
+    loop {
+        let remaining = deadline.map(|d| to_timespec(d.saturating_duration_since(Instant::now())));
+        let mut fds = [PollFd::new(&input, PollFlags::IN)];
+        match rustix::event::poll(&mut fds, remaining.as_ref()) {
+            Ok(0) => break,
+            Ok(_) => {}
+            Err(Errno::INTR) => continue,
+            Err(err) => return Err(io::Error::from(err)),
+        }
+        let read = match rustix::io::read(&input, &mut buf) {
+            Ok(0) => break,
+            Ok(read) => read,
+            Err(Errno::INTR) => continue,
+            Err(err) => return Err(io::Error::from(err)),
+        };
+        bytes.extend_from_slice(buf.get(..read).unwrap_or_default());
+        if parse(&bytes).end == ReplyEnd::Da1 {
+            break;
+        }
+    }
+    Ok(bytes)
+}
+
+/// Converts a poll timeout, saturating one too large for a [`Timespec`].
+fn to_timespec(duration: Duration) -> Timespec {
+    Timespec::try_from(duration).unwrap_or(Timespec {
+        tv_sec: i64::MAX,
+        tv_nsec: 0,
+    })
+}
+
+/// Writes [`query`] to `out`, reads the replies from `input` with
+/// [`read_replies`] and parses them. The raw replies are logged at
+/// `debug`.
+///
+/// # Errors
+///
+/// Returns the error from writing the query or reading the replies.
+pub fn probe(
+    out: &mut impl Write,
+    input: impl AsFd,
+    multiplexer: Multiplexer,
+    timeout: Duration,
+) -> io::Result<Replies> {
+    out.write_all(&query(multiplexer))?;
+    out.flush()?;
+    let bytes = read_replies(input, timeout)?;
+    log::debug!("terminal probe replies: {}", bytes.escape_ascii());
+    Ok(parse(&bytes))
 }
 
 /// One complete escape sequence.
@@ -374,6 +452,10 @@ pub(crate) mod fixtures {
 
 #[cfg(test)]
 mod tests {
+    // `unwrap` is acceptable in test code: a panic on an unexpected `Err`
+    // is exactly the failure signal we want from a test.
+    #![allow(clippy::unwrap_used)]
+
     use super::fixtures::{ALACRITTY, FOOT, FREMINAL, GHOSTTY, KITTY, TMUX, WEZTERM};
     use super::*;
 
@@ -566,5 +648,51 @@ mod tests {
                 end: ReplyEnd::Incomplete,
             }
         );
+    }
+
+    #[test]
+    fn read_replies_stops_at_da1() {
+        let (reader, mut writer) = io::pipe().unwrap();
+        writer.write_all(KITTY).unwrap();
+        let start = Instant::now();
+        let bytes = read_replies(&reader, Duration::from_secs(60)).unwrap();
+        assert_eq!(bytes, KITTY);
+        assert!(start.elapsed() < Duration::from_secs(30));
+        drop(writer);
+    }
+
+    #[test]
+    fn read_replies_on_an_empty_pipe_times_out_empty() {
+        let (reader, _writer) = io::pipe().unwrap();
+        let bytes = read_replies(&reader, Duration::from_millis(50)).unwrap();
+        assert_eq!(bytes, Vec::<u8>::new());
+    }
+
+    #[test]
+    fn read_replies_stops_at_end_of_file() {
+        let (reader, mut writer) = io::pipe().unwrap();
+        writer.write_all(b"\x1b[?1u").unwrap();
+        drop(writer);
+        let start = Instant::now();
+        let bytes = read_replies(&reader, Duration::from_secs(60)).unwrap();
+        assert_eq!(bytes, b"\x1b[?1u");
+        assert!(start.elapsed() < Duration::from_secs(30));
+    }
+
+    #[test]
+    fn probe_writes_the_query_and_parses_the_replies() {
+        let (reader, mut writer) = io::pipe().unwrap();
+        writer.write_all(FREMINAL).unwrap();
+        let mut out = Vec::new();
+        let replies = probe(
+            &mut out,
+            &reader,
+            Multiplexer::None,
+            Duration::from_secs(60),
+        )
+        .unwrap();
+        assert_eq!(out, query(Multiplexer::None));
+        assert_eq!(replies, parse(FREMINAL));
+        drop(writer);
     }
 }
