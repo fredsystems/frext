@@ -30,11 +30,11 @@ use std::ops::Range;
 use std::time::{Duration, Instant};
 
 use frext_core::highlight::incremental::IncrementalHighlighter;
+use frext_core::highlight::{MatchHighlightsRef, overlay_matches};
 use frext_core::syntax::language_from_path;
 use frext_core::tab::Tab;
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Position, Rect};
-use ratatui::style::Style;
 
 use crate::buffer::cursor::{Cursor, Selecting};
 use crate::buffer::edit::{Applied, EditAction, EditTarget};
@@ -42,6 +42,7 @@ use crate::buffer::history::{Edit, EditHistory};
 use crate::buffer::render::RowsView;
 use crate::buffer::wrap::WrapLayout;
 use crate::hit::{HitMap, Target};
+use crate::paint;
 use crate::theme;
 
 /// The longest pause between two presses on the same cell that still
@@ -256,19 +257,6 @@ fn common_affixes(before: &str, after: &str) -> (usize, usize, usize) {
     (prefix_bytes, prefix_chars, suffix_bytes)
 }
 
-/// Blanks every cell of `area` with `style`.
-fn fill(buf: &mut Buffer, area: Rect, style: Style) {
-    let area = area.intersection(buf.area);
-    for y in area.top()..area.bottom() {
-        for x in area.left()..area.right() {
-            if let Some(cell) = buf.cell_mut((x, y)) {
-                cell.reset();
-                cell.set_symbol(" ").set_style(style);
-            }
-        }
-    }
-}
-
 impl BufferView {
     /// Applies `action` to `tab` (the active tab) and keeps the caret
     /// visible. PageUp/PageDown move by the last rendered editor height;
@@ -319,17 +307,19 @@ impl BufferView {
     }
 
     /// Records a change made to `tab` outside the view (a core command),
-    /// where `before` is the text before it, as one undo group. The
-    /// cursor is left alone; the app's effects place it. A tab the view
-    /// has never seen (a new tab edited before its first render) gets
-    /// fresh view state for `before` first, so its edit is undoable too;
-    /// its layout is built on the next render. A recorded group is never
-    /// coalesced, so `_now` does not affect grouping.
+    /// where `before` is the text before it, as one undo group. A tab the
+    /// view has never seen (a new tab edited before its first render)
+    /// gets fresh view state for `before` first, so its edit is undoable
+    /// too; its layout is built on the next render. A recorded group is
+    /// never coalesced, so `_now` does not affect grouping.
     ///
     /// `after` is the selection a redo restores, clamped to the new text:
-    /// the core command's own selection when it set one. With `None` the
-    /// caret goes to the end of the changed span found by diffing `before`
-    /// against the new text, which is ambiguous in repeated text.
+    /// the core command's own selection when it set one, in which case the
+    /// live cursor is left alone and the app's effects place it. With
+    /// `None` the caret goes to the end of the changed span found by
+    /// diffing `before` against the new text, which is ambiguous in
+    /// repeated text, and the live cursor collapses to that caret too, so
+    /// it never keeps a selection over text the edit changed.
     pub fn record_outside_edit(
         &mut self,
         tab: &Tab,
@@ -354,6 +344,7 @@ impl BufferView {
             .get(prefix_bytes..text.len().saturating_sub(suffix_bytes))
             .unwrap_or("")
             .to_owned();
+        let moves_cursor = after.is_none();
         let after = after.map_or_else(
             || Cursor::at(at.saturating_add(inserted.chars().count())),
             |chars| {
@@ -369,6 +360,9 @@ impl BufferView {
             before: view.cursor,
             after,
         }]);
+        if moves_cursor {
+            view.cursor = after;
+        }
         view.known = text_hash(text);
     }
 
@@ -533,19 +527,24 @@ impl BufferView {
     /// records `editor` as [`Target::Editor`], and returns the caret's
     /// screen position when it is visible. With no tab, both rects are
     /// blank.
+    ///
+    /// `matches` are the search matches to paint, borrowed, as byte ranges
+    /// of the whole text; only those overlapping the visible lines are
+    /// copied and used.
     pub fn render(
         &mut self,
         tab: Option<&Tab>,
         gutter: Rect,
         editor: Rect,
+        matches: MatchHighlightsRef<'_>,
         buf: &mut Buffer,
         hits: &mut HitMap,
     ) -> Option<Position> {
         self.rect = editor;
         hits.push(editor, Target::Editor);
         let Some(tab) = tab else {
-            fill(buf, gutter, theme::base());
-            fill(buf, editor, theme::base());
+            paint::fill(buf, gutter, theme::base());
+            paint::fill(buf, editor, theme::base());
             return None;
         };
         let view = prepare(&mut self.tabs, editor, tab);
@@ -566,6 +565,13 @@ impl BufferView {
         let spans =
             view.highlighter
                 .spans(&tab.text, &language_from_path(tab.path.as_deref()), lines);
+        let spans = match (spans.first(), spans.last()) {
+            (Some(first), Some(last)) => {
+                let window = first.bytes.start..last.bytes.end;
+                overlay_matches(spans, &matches.within(window))
+            }
+            _ => spans,
+        };
         render::render(
             &RowsView {
                 text: &tab.text,
@@ -589,6 +595,7 @@ mod tests {
 
     use super::*;
     use crate::buffer::cursor::Motion;
+    use frext_core::highlight::{MatchBackground, MatchHighlights};
     use frext_core::palette::BASE;
 
     const GUTTER: u16 = 4;
@@ -623,12 +630,24 @@ mod tests {
         width: u16,
         height: u16,
     ) -> (Buffer, Option<Position>, HitMap) {
+        draw_with(view, tab, width, height, MatchHighlightsRef::default())
+    }
+
+    /// [`draw`] with search `matches` painted.
+    fn draw_with(
+        view: &mut BufferView,
+        tab: Option<&Tab>,
+        width: u16,
+        height: u16,
+        matches: MatchHighlightsRef<'_>,
+    ) -> (Buffer, Option<Position>, HitMap) {
         let mut buf = Buffer::empty(Rect::new(0, 0, width, height));
         let mut hits = HitMap::default();
         let caret = view.render(
             tab,
             Rect::new(0, 0, GUTTER, height),
             Rect::new(GUTTER, 0, width - GUTTER, height),
+            matches,
             &mut buf,
             &mut hits,
         );
@@ -828,6 +847,27 @@ mod tests {
     }
 
     #[test]
+    fn record_outside_edit_without_after_collapses_the_cursor() {
+        let mut tab = tab(1, "foo tail foo");
+        let mut view = BufferView::default();
+        let base = Instant::now();
+        draw(&mut view, Some(&tab), 20, 3);
+        view.set_selection(&tab, 0..3);
+        let before = tab.text.clone();
+        tab.text = "X tail X".to_owned();
+        view.record_outside_edit(&tab, &before, None, base);
+        // The diff spans "foo tail foo" -> "X tail X" from 0 to the end
+        // of the inserted text.
+        assert_eq!(view.selection(1), Some(8..8));
+        // With an `after`, the live cursor is the effects' to place.
+        view.set_selection(&tab, 0..1);
+        let before = tab.text.clone();
+        tab.text = "X tail Y".to_owned();
+        view.record_outside_edit(&tab, &before, Some(7..8), base);
+        assert_eq!(view.selection(1), Some(0..1));
+    }
+
+    #[test]
     fn record_outside_edit_handles_repeated_chars_and_unknown_tabs() {
         let mut tab = tab(1, "aaa");
         let mut view = BufferView::default();
@@ -835,7 +875,7 @@ mod tests {
         // An unknown tab gets view state for `before`, and its edit is
         // undoable.
         view.record_outside_edit(&tab, "zz", None, base);
-        assert_eq!(view.caret(1), Some(0));
+        assert_eq!(view.caret(1), Some(3));
         view.handle(&mut tab, EditAction::Undo, ms(base, 5));
         assert_eq!(tab.text, "zz");
         view.handle(&mut tab, EditAction::Redo, ms(base, 6));
@@ -1045,6 +1085,7 @@ mod tests {
             Some(&tab),
             Rect::new(0, 1, GUTTER, 5),
             Rect::new(GUTTER, 1, 8, 5),
+            MatchHighlightsRef::default(),
             &mut buf,
             &mut hits,
         );
@@ -1106,6 +1147,7 @@ mod tests {
             None,
             Rect::new(0, 0, GUTTER, 2),
             Rect::new(GUTTER, 0, 4, 2),
+            MatchHighlightsRef::default(),
             &mut buf,
             &mut hits,
         );
@@ -1115,6 +1157,96 @@ mod tests {
         assert_eq!(buf[(0, 0)].style().bg, Some(theme::color(BASE)));
         assert_eq!(buf[(6, 1)].style().bg, Some(theme::color(BASE)));
         assert_eq!(hits.hit(5, 1), Some(Target::Editor));
+    }
+
+    fn bg(buf: &Buffer, x: u16, y: u16) -> Option<ratatui::style::Color> {
+        buf[(x, y)].style().bg
+    }
+
+    #[test]
+    fn matches_on_a_visible_row_paint_their_cells() {
+        let tab = tab(1, "ab foo cd foo");
+        let mut view = BufferView::default();
+        let matches = MatchHighlights {
+            ranges: vec![3..6, 10..13],
+            current: Some(1),
+        };
+        let (buf, _, _) = draw_with(&mut view, Some(&tab), 20, 2, matches.as_ref());
+        let base = Some(theme::color(BASE));
+        let other = Some(theme::match_bg(MatchBackground::Other));
+        let current = Some(theme::match_bg(MatchBackground::Current));
+        for x in 3..6 {
+            assert_eq!(bg(&buf, GUTTER + x, 0), other, "column {x}");
+        }
+        for x in 10..13 {
+            assert_eq!(bg(&buf, GUTTER + x, 0), current, "column {x}");
+        }
+        for x in [2, 6, 9, 13] {
+            assert_eq!(bg(&buf, GUTTER + x, 0), base, "column {x}");
+        }
+    }
+
+    #[test]
+    fn a_match_scrolled_out_of_view_paints_nothing() {
+        let text = numbered(100);
+        let tab = tab(1, &text);
+        let mut view = BufferView::default();
+        draw(&mut view, Some(&tab), 12, 5);
+        view.wheel(&tab, 50);
+        let matches = MatchHighlights {
+            ranges: vec![0..1, text.len() - 3..text.len()],
+            current: Some(0),
+        };
+        let (buf, _, _) = draw_with(&mut view, Some(&tab), 12, 5, matches.as_ref());
+        assert_eq!(&row_text(&buf, 0)[..6], " 51 51");
+        for y in 0..5 {
+            for x in GUTTER..12 {
+                assert_eq!(bg(&buf, x, y), Some(theme::color(BASE)), "({x}, {y})");
+            }
+        }
+    }
+
+    #[test]
+    fn a_match_starting_above_the_viewport_paints_its_visible_part() {
+        let text = numbered(100);
+        let tab = tab(1, &text);
+        let mut view = BufferView::default();
+        draw(&mut view, Some(&tab), 12, 5);
+        view.wheel(&tab, 50);
+        // Line 50 is "50" and line 51 is "51"; all ASCII, so chars are bytes.
+        let line_50 = line_start(&text, 49);
+        let line_51 = line_start(&text, 50);
+        let matches = MatchHighlights {
+            ranges: std::iter::once(line_50 + 1..line_51 + 1).collect(),
+            current: None,
+        };
+        let (buf, _, _) = draw_with(&mut view, Some(&tab), 12, 5, matches.as_ref());
+        assert_eq!(&row_text(&buf, 0)[..6], " 51 51");
+        let base = Some(theme::color(BASE));
+        let other = Some(theme::match_bg(MatchBackground::Other));
+        for y in 0..5 {
+            for x in GUTTER..12 {
+                let want = if y == 0 && x == GUTTER { other } else { base };
+                assert_eq!(bg(&buf, x, y), want, "({x}, {y})");
+            }
+        }
+    }
+
+    #[test]
+    fn a_selected_cell_inside_a_match_keeps_the_selection_colour() {
+        let tab = tab(1, "ab foo cd foo");
+        let mut view = BufferView::default();
+        draw(&mut view, Some(&tab), 20, 2);
+        view.set_selection(&tab, 4..5);
+        let matches = MatchHighlights {
+            ranges: vec![3..6, 10..13],
+            current: None,
+        };
+        let (buf, _, _) = draw_with(&mut view, Some(&tab), 20, 2, matches.as_ref());
+        let other = Some(theme::match_bg(MatchBackground::Other));
+        assert_eq!(bg(&buf, GUTTER + 3, 0), other);
+        assert_eq!(bg(&buf, GUTTER + 4, 0), Some(theme::selection_bg()));
+        assert_eq!(bg(&buf, GUTTER + 5, 0), other);
     }
 
     #[test]

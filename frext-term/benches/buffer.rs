@@ -2,12 +2,14 @@
 //!
 //! Measures [`BufferView`] over a deterministic 5,000-line synthetic Rust
 //! source in an 80x24 terminal: typing and rendering in a warm view at
-//! line 2,500, and rendering with no change.
+//! line 2,500, rendering with no change, and rendering with every
+//! `self` highlighted as a search match.
 
 use std::hint::black_box;
 use std::time::Instant;
 
 use criterion::{Criterion, criterion_group, criterion_main};
+use frext_core::highlight::{MatchHighlights, MatchHighlightsRef};
 use frext_core::tab::Tab;
 use frext_term::buffer::BufferView;
 use frext_term::buffer::edit::EditAction;
@@ -83,8 +85,18 @@ const GUTTER: Rect = Rect::new(0, 0, 5, 24);
 const EDITOR: Rect = Rect::new(5, 0, 75, 24);
 
 fn render(view: &mut BufferView, tab: &Tab, buf: &mut Buffer, hits: &mut HitMap) {
+    render_with(view, tab, MatchHighlightsRef::default(), buf, hits);
+}
+
+fn render_with(
+    view: &mut BufferView,
+    tab: &Tab,
+    matches: MatchHighlightsRef<'_>,
+    buf: &mut Buffer,
+    hits: &mut HitMap,
+) {
     hits.clear();
-    black_box(view.render(Some(tab), GUTTER, EDITOR, buf, hits));
+    black_box(view.render(Some(tab), GUTTER, EDITOR, matches, buf, hits));
 }
 
 fn bench_buffer(c: &mut Criterion) {
@@ -94,6 +106,13 @@ fn bench_buffer(c: &mut Criterion) {
         .take(2_500)
         .map(|l| l.chars().count() + 1)
         .sum();
+    let line_2500_byte: usize = src.split('\n').take(2_500).map(|l| l.len() + 1).sum();
+    let ranges: Vec<_> = src
+        .match_indices("self")
+        .map(|(i, s)| i..i + s.len())
+        .collect();
+    let current = ranges.iter().position(|r| r.start >= line_2500_byte);
+    let matches = MatchHighlights { ranges, current };
     let mut tab = Tab::new_untitled(1);
     tab.text = src;
     tab.path = Some("bench.rs".into());
@@ -117,6 +136,9 @@ fn bench_buffer(c: &mut Criterion) {
     });
     group.bench_function("render_only_rust_5k_lines", |b| {
         b.iter(|| render(&mut view, &tab, &mut buf, &mut hits));
+    });
+    group.bench_function("render_with_matches_rust_5k_lines", |b| {
+        b.iter(|| render_with(&mut view, &tab, matches.as_ref(), &mut buf, &mut hits));
     });
     group.finish();
 }

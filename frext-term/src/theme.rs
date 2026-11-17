@@ -86,6 +86,22 @@ pub const fn input() -> Style {
     Style::new().fg(color(TEXT)).bg(color(SURFACE1))
 }
 
+/// Placeholder text drawn over an empty input field.
+#[must_use]
+pub const fn input_hint() -> Style {
+    Style::new().fg(color(OVERLAY0)).bg(color(SURFACE1))
+}
+
+/// A find-bar toggle that is on: distinct from [`hover_bg`], so an off
+/// toggle under the mouse does not look on.
+#[must_use]
+pub fn toggle_on() -> Style {
+    Style::new()
+        .fg(color(palette::accent()))
+        .bg(color(palette::selection().over(SURFACE0)))
+        .add_modifier(Modifier::BOLD)
+}
+
 /// The focused button in a popup.
 #[must_use]
 pub fn button_focused() -> Style {
@@ -224,6 +240,32 @@ mod tests {
     #[test]
     fn input_is_text_on_surface1() {
         assert_eq!(colours(input()), (Some(color(TEXT)), Some(color(SURFACE1))));
+    }
+
+    #[test]
+    fn input_hint_is_overlay0_on_surface1() {
+        assert_eq!(
+            colours(input_hint()),
+            (Some(color(OVERLAY0)), Some(color(SURFACE1)))
+        );
+    }
+
+    #[test]
+    fn toggle_on_is_bold_accent_on_selection_over_surface0() {
+        let style = toggle_on();
+        assert_eq!(
+            colours(style),
+            (
+                Some(color(palette::accent())),
+                Some(color(palette::selection().over(SURFACE0)))
+            )
+        );
+        assert!(style.add_modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn toggle_on_background_differs_from_hover() {
+        assert_ne!(toggle_on().bg, Some(hover_bg()));
     }
 
     #[test]
