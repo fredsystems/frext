@@ -6,9 +6,14 @@
 //! whitespace runs are skipped. Unlike egui, nothing here panics: every
 //! char index is clamped to the text.
 //!
-//! Lines intentionally differ from egui: [`line_at`] is the logical line
-//! without its line break, where egui's `select_line_at` over-selects at
-//! empty and one-char lines.
+//! Selection intentionally differs from egui in two places, while the word
+//! motions stay a faithful port:
+//!
+//! - [`word_at`] finds the word's end first and its start from that end,
+//!   where egui's `select_word_at` selects two words when the index is a
+//!   word's first char.
+//! - [`line_at`] is the logical line without its line break, where egui's
+//!   `select_line_at` over-selects at empty and one-char lines.
 
 use std::ops::Range;
 
@@ -66,7 +71,12 @@ pub fn previous_word_boundary(text: &str, char_idx: usize) -> usize {
 }
 
 /// The word around `char_idx`, clipped to its logical line (see
-/// [`line_at`]), as an ordered char range (egui's `select_word_at`).
+/// [`line_at`]), as an ordered char range.
+///
+/// The end is the next word boundary after `char_idx` and the start is the
+/// previous word boundary before that end. This intentionally differs from
+/// egui's `select_word_at`, which takes both boundaries from `char_idx` and
+/// so selects two words when `char_idx` is a word's first char.
 #[must_use]
 pub fn word_at(text: &str, char_idx: usize) -> Range<usize> {
     let num_chars = text.chars().count();
@@ -81,10 +91,10 @@ pub fn word_at(text: &str, char_idx: usize) -> Range<usize> {
         .saturating_sub(line.start)
         .min(line.end - line.start);
 
-    let min = previous_word_boundary(current_line_text, relative_idx);
-    let max = next_word_boundary(current_line_text, relative_idx);
+    let end = next_word_boundary(current_line_text, relative_idx);
+    let start = previous_word_boundary(current_line_text, end);
 
-    (line.start + min.min(max))..(line.start + min.max(max))
+    (line.start + start.min(end))..(line.start + start.max(end))
 }
 
 /// The logical line containing `char_idx`, as a char range without its
@@ -231,6 +241,13 @@ mod tests {
         let text = "hello world";
         assert_eq!(word_at(text, 2), 0..5);
         assert_eq!(word_at(text, 8), 6..11);
+    }
+
+    #[test]
+    fn word_at_a_words_first_char_selects_only_that_word() {
+        let text = "hello world";
+        assert_eq!(word_at(text, 6), 6..11);
+        assert_eq!(word_at(text, 0), 0..5);
     }
 
     #[test]
