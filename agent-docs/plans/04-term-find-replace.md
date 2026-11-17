@@ -1,6 +1,6 @@
 # 04 -- TUI find and replace
 
-- **Status:** pending merge
+- **Status:** complete
 - **Depends on:** 03
 - **Branch:** `feat/frext-term-find-replace` (one branch, one commit per
   subtask, one PR)

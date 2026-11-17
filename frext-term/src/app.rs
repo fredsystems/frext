@@ -3,7 +3,11 @@
 //!
 //! `TermApp` turns [`AppEvent`]s into [`Command`]s for the core
 //! [`Editor`] (or into local view changes), queues the [`Effect`]s the
-//! editor returns, and draws the whole screen into a ratatui [`Frame`].
+//! editor returns, and draws the whole screen into a ratatui [`Frame`]:
+//! the tab bar, the find bar, the sidebar (the workspace's file tree,
+//! see [`FileTree`]), the editor, the status line, and any open menu or
+//! prompt. While the sidebar has focus, keys the keymap leaves unbound go
+//! to the tree.
 
 use std::path::PathBuf;
 use std::time::Instant;
@@ -12,10 +16,11 @@ use crossterm::event::{
     Event, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use frext_core::editor::{
-    BufferChange, Command, Editor, EditorFocus, Effect, SearchBar, StepDirection,
+    BufferChange, Command, Editor, EditorFocus, Effect, FolderState, SearchBar, StepDirection,
 };
 use frext_core::lines::line_count;
 use frext_core::syntax::language_from_path;
+use frext_core::workspace::RowKind;
 use ratatui::Frame;
 use ratatui::layout::Position;
 
@@ -29,15 +34,12 @@ use crate::hit::{HitMap, Target};
 use crate::keymap::{self, Action, Focus, KeyContext};
 use crate::layout;
 use crate::menu::{ContextMenu, Enablement, MenuReply};
-use crate::paint;
 use crate::prompt::{PromptReply, PromptUi};
 use crate::status::{MessageKind, StatusLine};
 use crate::tab_bar;
 use crate::terminal::KeyboardMode;
-use crate::theme;
-
-/// The sidebar's width in columns, when shown.
-const SIDEBAR_WIDTH: u16 = 30;
+use crate::tree::{FileTree, Refresh, TreeFocus, TreeReply};
+use crate::tree_menu;
 
 /// Shown on startup when the kitty keyboard protocol is unavailable.
 const LEGACY_MESSAGE: &str = "Kitty keyboard protocol unavailable: use Ctrl+R for find and replace";
@@ -65,6 +67,7 @@ pub struct TermApp {
     prompt: PromptUi,
     menu: Option<ContextMenu<Command>>,
     find: FindBar,
+    tree: FileTree,
     buffer: BufferView,
     status: StatusLine,
     hovered: Option<Target>,
@@ -98,6 +101,7 @@ impl TermApp {
             prompt: PromptUi::new(base, home),
             menu: None,
             find: FindBar::new(),
+            tree: FileTree::new(),
             buffer: BufferView::default(),
             status,
             hovered: None,
@@ -282,6 +286,8 @@ impl TermApp {
                     }
                     FindReply::Handled | FindReply::Ignored => {}
                 }
+            } else if self.focus == Focus::Sidebar {
+                self.tree_key(key, now);
             }
             return;
         };
@@ -318,6 +324,23 @@ impl TermApp {
             },
             Action::FocusEditor => self.set_focus(Focus::Editor),
             Action::Edit(action) => self.edit(action, now),
+        }
+    }
+
+    /// Routes a key the keymap left unbound to the file tree, over rows
+    /// refreshed first so they include what earlier keys in the same
+    /// batch changed.
+    fn tree_key(&mut self, key: KeyEvent, now: Instant) {
+        if self.tree.refresh(self.editor.workspace()) == Refresh::Changed {
+            self.forget_layout();
+        }
+        match self.tree.handle_key(key) {
+            TreeReply::Send(command) => self.send(command, now),
+            TreeReply::OpenMenu { path, kind, anchor } => {
+                self.menu = Some(ContextMenu::new(tree_menu::entries(&path, kind), anchor));
+            }
+            TreeReply::Resized => self.forget_layout(),
+            TreeReply::Handled | TreeReply::Ignored => {}
         }
     }
 
@@ -359,6 +382,10 @@ impl TermApp {
     fn handle_menu_mouse(&mut self, mouse: MouseEvent, target: Option<Target>, now: Instant) {
         match mouse.kind {
             MouseEventKind::Moved | MouseEventKind::Drag(_) => {
+                if mouse.kind == MouseEventKind::Moved {
+                    // Sent only with no button held: a release was lost.
+                    self.tree.end_resize();
+                }
                 self.hover(target);
                 if let Some(menu) = self.menu.as_mut() {
                     menu.hover(match target {
@@ -367,7 +394,10 @@ impl TermApp {
                     });
                 }
             }
-            MouseEventKind::Up(MouseButton::Left) => self.buffer.mouse_up(),
+            MouseEventKind::Up(MouseButton::Left) => {
+                self.buffer.mouse_up();
+                self.tree.end_resize();
+            }
             MouseEventKind::Down(MouseButton::Left | MouseButton::Right) => {
                 if let Some(menu) = self.menu.as_mut() {
                     let reply = menu.click(target);
@@ -386,6 +416,10 @@ impl TermApp {
         }
         match mouse.kind {
             MouseEventKind::Moved | MouseEventKind::Drag(_) => {
+                if mouse.kind == MouseEventKind::Moved {
+                    // Sent only with no button held: a release was lost.
+                    self.tree.end_resize();
+                }
                 self.hover(target);
                 if mouse.kind == MouseEventKind::Drag(MouseButton::Left)
                     && self.buffer.is_dragging()
@@ -394,9 +428,26 @@ impl TermApp {
                 {
                     self.buffer.mouse_drag(tab, mouse.column, mouse.row);
                 }
+                if mouse.kind == MouseEventKind::Drag(MouseButton::Left) && self.tree.is_resizing()
+                {
+                    if self.prompt.is_open(&self.editor) {
+                        // A prompt opened mid-drag: the border stays put.
+                        self.tree.end_resize();
+                    } else {
+                        self.tree.drag_to(mouse.column);
+                        self.forget_layout();
+                    }
+                }
             }
-            MouseEventKind::Up(MouseButton::Left) => self.buffer.mouse_up(),
+            MouseEventKind::Up(MouseButton::Left) => {
+                self.buffer.mouse_up();
+                self.tree.end_resize();
+            }
             MouseEventKind::Down(MouseButton::Left) => {
+                if target != Some(Target::TreeBorder) {
+                    // A press elsewhere means the drag's release was lost.
+                    self.tree.end_resize();
+                }
                 if self.prompt.is_open(&self.editor) {
                     let reply = self
                         .prompt
@@ -449,8 +500,13 @@ impl TermApp {
                     Some(Target::FindClose) => self.send(Command::CloseSearch, now),
                     Some(Target::FindReplaceCurrent) => self.send(Command::ReplaceCurrent, now),
                     Some(Target::FindReplaceAll) => self.send(Command::ReplaceAll, now),
+                    Some(Target::TreeClose) => self.send(Command::CloseWorkspace, now),
+                    Some(Target::TreeRow(index)) => self.click_tree_row(index, now),
+                    Some(Target::TreeEmpty) => self.set_focus(Focus::Sidebar),
+                    Some(Target::TreeBorder) => self.tree.begin_resize(),
                     Some(
-                        Target::PromptPopup
+                        Target::TreeScrolled
+                        | Target::PromptPopup
                         | Target::PromptInput
                         | Target::PromptButton(_)
                         | Target::PromptCandidate(_)
@@ -461,29 +517,36 @@ impl TermApp {
                 }
             }
             MouseEventKind::Down(MouseButton::Right) => {
-                if self.prompt.is_open(&self.editor) || target != Some(Target::Editor) {
+                if self.prompt.is_open(&self.editor) {
                     return;
                 }
-                if let Some(tab) = self.editor.active_tab() {
-                    let selection = if self
-                        .buffer
-                        .selection(tab.id)
-                        .is_some_and(|chars| !chars.is_empty())
-                    {
-                        Enablement::Enabled
-                    } else {
-                        Enablement::Disabled
-                    };
-                    self.menu = Some(ContextMenu::new(
-                        editor_menu::entries(selection),
-                        Position::new(mouse.column, mouse.row),
-                    ));
-                    // The chosen command acts on the editor's selection.
-                    self.set_focus(Focus::Editor);
+                let at = Position::new(mouse.column, mouse.row);
+                match target {
+                    Some(Target::Editor) => self.open_editor_menu(at),
+                    Some(Target::TreeRow(index)) => {
+                        if let Some(row) = self.tree.row(index).cloned() {
+                            self.tree.select(index);
+                            self.menu = Some(ContextMenu::new(
+                                tree_menu::entries(&row.path, row.kind),
+                                at,
+                            ));
+                            self.set_focus(Focus::Sidebar);
+                        }
+                    }
+                    Some(Target::TreeEmpty) => {
+                        if let Some(workspace) = self.editor.workspace() {
+                            self.menu = Some(ContextMenu::new(
+                                tree_menu::dir_entries(&workspace.root),
+                                at,
+                            ));
+                            self.set_focus(Focus::Sidebar);
+                        }
+                    }
+                    _ => {}
                 }
             }
             MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
-                if self.prompt.is_open(&self.editor) || target != Some(Target::Editor) {
+                if self.prompt.is_open(&self.editor) {
                     return;
                 }
                 let rows = if mouse.kind == MouseEventKind::ScrollUp {
@@ -491,11 +554,83 @@ impl TermApp {
                 } else {
                     WHEEL_ROWS
                 };
-                if let Some(tab) = self.editor.active_tab() {
-                    self.buffer.wheel(tab, rows);
+                match target {
+                    Some(Target::Editor) => {
+                        if let Some(tab) = self.editor.active_tab() {
+                            self.buffer.wheel(tab, rows);
+                        }
+                    }
+                    Some(
+                        Target::TreeRow(_)
+                        | Target::TreeEmpty
+                        | Target::TreeBorder
+                        | Target::TreeScrolled,
+                    ) => {
+                        self.tree.wheel(rows);
+                        // The rows moved under their regions: later wheel
+                        // events in the batch still scroll, clicks do not.
+                        self.hits.retarget(|target| match target {
+                            Target::TreeRow(_) | Target::TreeEmpty => Target::TreeScrolled,
+                            other => other,
+                        });
+                        if matches!(self.hovered, Some(Target::TreeRow(_))) {
+                            self.hovered = None;
+                            self.status.set_hint(None);
+                        }
+                    }
+                    _ => {}
                 }
             }
             _ => {}
+        }
+    }
+
+    /// Opens the editor menu at `at`, its cut and copy enabled only over
+    /// a selection.
+    fn open_editor_menu(&mut self, at: Position) {
+        if let Some(tab) = self.editor.active_tab() {
+            let selection = if self
+                .buffer
+                .selection(tab.id)
+                .is_some_and(|chars| !chars.is_empty())
+            {
+                Enablement::Enabled
+            } else {
+                Enablement::Disabled
+            };
+            self.menu = Some(ContextMenu::new(editor_menu::entries(selection), at));
+            // The chosen command acts on the editor's selection.
+            self.set_focus(Focus::Editor);
+        }
+    }
+
+    /// A left click on tree row `index` (as last rendered): selects it,
+    /// then opens a file and focuses the editor, or toggles a folder and
+    /// focuses the sidebar.
+    fn click_tree_row(&mut self, index: usize, now: Instant) {
+        let Some(row) = self.tree.row(index).cloned() else {
+            return;
+        };
+        self.tree.select(index);
+        match row.kind {
+            RowKind::File => {
+                self.send(Command::OpenPath(row.path), now);
+                self.set_focus(Focus::Editor);
+            }
+            RowKind::Dir(state) => {
+                let state = match state {
+                    FolderState::Expanded => FolderState::Collapsed,
+                    FolderState::Collapsed => FolderState::Expanded,
+                };
+                self.send(
+                    Command::SetExpanded {
+                        dir: row.path,
+                        state,
+                    },
+                    now,
+                );
+                self.set_focus(Focus::Sidebar);
+            }
         }
     }
 
@@ -607,7 +742,8 @@ impl TermApp {
             .editor
             .active_tab()
             .map_or(0, |tab| layout::gutter_width(line_count(&tab.text)));
-        let sidebar_width = self.sidebar_shown().then_some(SIDEBAR_WIDTH);
+        self.tree.set_space(area.width.saturating_sub(gutter_width));
+        let sidebar_width = self.sidebar_shown().then(|| self.tree.width());
         let areas = layout::areas(
             area,
             find_bar::height(self.editor.search()),
@@ -636,7 +772,26 @@ impl TermApp {
         );
         self.settle_find_focus();
         let tab = self.editor.active_tab();
-        paint::fill(buf, areas.sidebar, theme::chrome());
+        if self.sidebar_shown() {
+            let focus = if self.focus == Focus::Sidebar {
+                TreeFocus::Focused
+            } else {
+                TreeFocus::Unfocused
+            };
+            let refresh = self.tree.render(
+                &self.editor,
+                focus,
+                self.hovered,
+                areas.sidebar,
+                buf,
+                &mut self.hits,
+            );
+            // A hovered row index refers to the rows before the change.
+            if refresh == Refresh::Changed && matches!(self.hovered, Some(Target::TreeRow(_))) {
+                self.hovered = None;
+                self.status.set_hint(None);
+            }
+        }
         let caret = self.buffer.render(
             tab,
             areas.gutter,
@@ -708,6 +863,8 @@ mod tests {
     use ratatui::buffer::Buffer;
 
     use super::*;
+    use crate::theme;
+    use crate::tree::{DEFAULT_WIDTH, MIN_EDITOR_WIDTH, MIN_WIDTH};
 
     fn temp_dir(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
@@ -1132,8 +1289,10 @@ mod tests {
 
         let buf = draw(&mut app);
         assert_eq!(buf[(31, 1)].symbol(), "1");
-        assert_eq!(buf[(0, 1)].bg, theme::chrome().bg.unwrap());
-        assert_eq!(buf[(29, 10)].bg, theme::chrome().bg.unwrap());
+        // The tree's header and its border column fill columns 0..30.
+        assert!(row_text(&buf, 1).starts_with(" [x] "));
+        assert_eq!(buf[(0, 10)].bg, theme::chrome().bg.unwrap());
+        assert_eq!(buf[(29, 10)].bg, theme::tree_border().bg.unwrap());
 
         app.handle(ctrl('e'), now);
         assert_eq!(app.focus, Focus::Sidebar);
@@ -1143,6 +1302,8 @@ mod tests {
         let buf = draw(&mut app);
         assert_eq!(buf[(1, 1)].symbol(), "1");
         assert_eq!(buf[(31, 1)].symbol(), " ");
+        assert!(!row_text(&buf, 1).contains("[x]"));
+        assert_ne!(buf[(29, 10)].bg, theme::tree_border().bg.unwrap());
 
         app.handle(ctrl('e'), now);
         assert_eq!(app.focus, Focus::Editor);
@@ -1150,6 +1311,7 @@ mod tests {
         app.handle(ctrl('b'), now);
         let buf = draw(&mut app);
         assert_eq!(buf[(31, 1)].symbol(), "1");
+        assert!(row_text(&buf, 1).starts_with(" [x] "));
         fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -1586,6 +1748,16 @@ mod tests {
         app.handle(ctrl('c'), Instant::now());
         app.handle(ctrl('e'), Instant::now());
         assert_eq!(app.focus, Focus::Sidebar);
+        // Select `a.txt` in the drawn tree, so Enter below opens the file
+        // that is already open rather than editing it.
+        app.handle(key(KeyCode::Down, KeyModifiers::NONE), Instant::now());
+        let buf = draw(&mut app);
+        assert!(
+            row_text(&buf, 2).contains("a.txt"),
+            "{:?}",
+            row_text(&buf, 2)
+        );
+        assert_eq!(app.tree.selected(), Some(file.as_path()));
         for event in [
             ctrl('a'),
             ctrl('x'),
@@ -2903,6 +3075,704 @@ mod tests {
         app.handle(mouse(MouseEventKind::Moved, x, 1), Instant::now());
         assert_eq!(app.hovered, None);
         assert_eq!(app.status.hint(), None);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// An app over a workspace `ws` holding `docs/`, `src/main.rs`,
+    /// `Cargo.toml` and `README.md`, drawn once. Its tree rows are 0
+    /// `docs`, 1 `src`, 2 `Cargo.toml` and 3 `README.md`, drawn from
+    /// screen row 2 (under the tab bar and the tree's header).
+    fn tree_app(tag: &str) -> (PathBuf, PathBuf, TermApp) {
+        let dir = temp_dir(tag);
+        let ws = dir.join("ws");
+        fs::create_dir_all(ws.join("docs")).unwrap();
+        fs::create_dir_all(ws.join("src")).unwrap();
+        fs::write(ws.join("src").join("main.rs"), "fn main() {}\n").unwrap();
+        fs::write(ws.join("Cargo.toml"), "[package]\n").unwrap();
+        fs::write(ws.join("README.md"), "# ws\n").unwrap();
+        let editor = open_editor(&dir, &[], Some(&ws));
+        let mut app = TermApp::new(editor, KeyboardMode::Enhanced, ws.clone(), None);
+        draw(&mut app);
+        (dir, ws, app)
+    }
+
+    /// The screen row of tree row `index` with the tree scrolled to the
+    /// top.
+    fn tree_y(index: u16) -> u16 {
+        2 + index
+    }
+
+    /// The sidebar's text at screen row `y` (the border excluded).
+    fn sidebar_text(app: &TermApp, buf: &Buffer, y: u16) -> String {
+        let width = app.tree.width() - 1;
+        row_text(buf, y).chars().take(usize::from(width)).collect()
+    }
+
+    #[test]
+    fn the_first_frame_shows_the_tree_header_and_rows() {
+        let (dir, _ws, mut app) = tree_app("tree-first-frame");
+        let buf = draw(&mut app);
+        let root = app.editor().workspace().unwrap().display_root();
+        let header = sidebar_text(&app, &buf, 1);
+        // The root is cut at the border: 24 cells from column 5 to 29.
+        let shown: String = root.chars().take(24).collect();
+        assert!(header.starts_with(&format!(" [x] {shown}")), "{header:?}");
+        assert!(sidebar_text(&app, &buf, tree_y(0)).starts_with(" > / docs "));
+        assert!(sidebar_text(&app, &buf, tree_y(1)).starts_with(" > / src "));
+        assert!(sidebar_text(&app, &buf, tree_y(2)).starts_with("     Cargo.toml "));
+        assert!(sidebar_text(&app, &buf, tree_y(3)).starts_with("     README.md "));
+        assert_eq!(sidebar_text(&app, &buf, tree_y(4)).trim(), "");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn right_expands_and_left_collapses_a_folder_from_the_keyboard() {
+        let (dir, ws, mut app) = tree_app("tree-expand");
+        let src = ws.join("src");
+        app.handle(ctrl('e'), Instant::now());
+        assert_eq!(app.focus, Focus::Sidebar);
+        press(&mut app, KeyCode::Down, KeyModifiers::NONE, 2);
+        assert_eq!(app.tree.selected(), Some(src.as_path()));
+
+        app.handle(key(KeyCode::Right, KeyModifiers::NONE), Instant::now());
+        assert!(app.editor().workspace().unwrap().is_expanded(&src));
+        let buf = draw(&mut app);
+        assert!(sidebar_text(&app, &buf, tree_y(1)).starts_with(" v / src "));
+        assert!(sidebar_text(&app, &buf, tree_y(2)).starts_with("       main.rs "));
+        assert!(sidebar_text(&app, &buf, tree_y(3)).starts_with("     Cargo.toml "));
+
+        app.handle(key(KeyCode::Left, KeyModifiers::NONE), Instant::now());
+        assert!(!app.editor().workspace().unwrap().is_expanded(&src));
+        let buf = draw(&mut app);
+        assert!(sidebar_text(&app, &buf, tree_y(1)).starts_with(" > / src "));
+        assert!(sidebar_text(&app, &buf, tree_y(2)).starts_with("     Cargo.toml "));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_second_key_in_the_same_batch_sees_the_expanded_rows() {
+        let (dir, ws, mut app) = tree_app("tree-batch");
+        app.handle(ctrl('e'), Instant::now());
+        press(&mut app, KeyCode::Down, KeyModifiers::NONE, 2);
+        // No render between expanding `src` and stepping into it.
+        app.handle(key(KeyCode::Right, KeyModifiers::NONE), Instant::now());
+        app.handle(key(KeyCode::Right, KeyModifiers::NONE), Instant::now());
+        let main = ws.join("src").join("main.rs");
+        assert_eq!(app.tree.selected(), Some(main.as_path()));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn enter_on_a_file_opens_it_and_keeps_focus_in_the_tree() {
+        let (dir, ws, mut app) = tree_app("tree-enter");
+        let cargo = ws.join("Cargo.toml");
+        app.handle(ctrl('e'), Instant::now());
+        press(&mut app, KeyCode::Down, KeyModifiers::NONE, 3);
+        assert_eq!(app.tree.selected(), Some(cargo.as_path()));
+
+        app.handle(key(KeyCode::Enter, KeyModifiers::NONE), Instant::now());
+        let tab = app.editor().active_tab().unwrap();
+        assert_eq!(tab.path.as_deref(), Some(cargo.as_path()));
+        assert_eq!(tab.text, "[package]\n");
+        assert_eq!(app.focus, Focus::Sidebar);
+
+        let buf = draw(&mut app);
+        let y = tree_y(2);
+        let x = column_of(&row_text(&buf, y), "Cargo.toml");
+        assert_eq!(buf[(x, y)].fg, theme::tree_active().fg.unwrap());
+        let readme = column_of(&row_text(&buf, tree_y(3)), "README.md");
+        assert_ne!(
+            buf[(readme, tree_y(3))].fg,
+            theme::tree_active().fg.unwrap()
+        );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn shift_f10_opens_the_file_menu_and_rename_renames_the_file() {
+        let (dir, ws, mut app) = tree_app("tree-rename");
+        let cargo = ws.join("Cargo.toml");
+        app.handle(ctrl('e'), Instant::now());
+        press(&mut app, KeyCode::Down, KeyModifiers::NONE, 3);
+
+        app.handle(key(KeyCode::F(10), KeyModifiers::SHIFT), Instant::now());
+        // Cargo.toml's name column: the sidebar's x 0, plus 1, no indent,
+        // the marker and its space (2) and the icon (2); on screen row 4.
+        let anchor = Position::new(5, tree_y(2));
+        assert_eq!(
+            app.menu,
+            Some(ContextMenu::new(tree_menu::file_entries(&cargo), anchor))
+        );
+        let buf = draw(&mut app);
+        // The first item sits under the menu's top border.
+        let first = row_text(&buf, anchor.y + 1);
+        let open: String = first.chars().skip(usize::from(anchor.x)).collect();
+        assert!(open.starts_with("\u{2502} Open"), "{first:?}");
+        assert!((0..24).any(|y| row_text(&buf, y).contains("Rename\u{2026}")));
+
+        // Open, Copy path, Copy relative path, Reveal, then Rename….
+        press(&mut app, KeyCode::Down, KeyModifiers::NONE, 5);
+        app.handle(key(KeyCode::Enter, KeyModifiers::NONE), Instant::now());
+        assert!(app.menu.is_none());
+        assert!(matches!(app.editor().prompt(), Some(Prompt::Name(_))));
+        let buf = draw(&mut app);
+        assert!((0..24).any(|y| row_text(&buf, y).contains("New name")));
+
+        press(
+            &mut app,
+            KeyCode::Backspace,
+            KeyModifiers::NONE,
+            "Cargo.toml".len(),
+        );
+        type_text(&mut app, "Renamed.toml");
+        app.handle(key(KeyCode::Enter, KeyModifiers::NONE), Instant::now());
+        assert!(app.editor().prompt().is_none());
+        let renamed = ws.join("Renamed.toml");
+        assert!(!cargo.exists());
+        assert_eq!(fs::read_to_string(&renamed).unwrap(), "[package]\n");
+
+        let buf = draw(&mut app);
+        let rows: Vec<String> = (2..6).map(|y| sidebar_text(&app, &buf, y)).collect();
+        assert!(
+            rows.iter().any(|row| row.contains("Renamed.toml")),
+            "{rows:?}"
+        );
+        assert!(
+            !rows.iter().any(|row| row.contains("Cargo.toml")),
+            "{rows:?}"
+        );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn angle_brackets_resize_the_sidebar_down_to_its_minimum() {
+        let (dir, _ws, mut app) = tree_app("tree-resize");
+        // The border is the sidebar's last column; the gutter " 1 "
+        // starts right after it.
+        let assert_gutter_at = |buf: &Buffer, x: u16| {
+            assert_eq!(buf[(x - 1, 10)].bg, theme::tree_border().bg.unwrap());
+            assert_ne!(buf[(x, 10)].bg, theme::tree_border().bg.unwrap());
+            assert_eq!(buf[(x, 1)].symbol(), " ");
+            assert_eq!(buf[(x + 1, 1)].symbol(), "1");
+        };
+        let start = DEFAULT_WIDTH;
+        assert_gutter_at(&draw(&mut app), start);
+        app.handle(ctrl('e'), Instant::now());
+
+        app.handle(key(KeyCode::Char('>'), KeyModifiers::NONE), Instant::now());
+        assert_gutter_at(&draw(&mut app), start + 1);
+
+        app.handle(key(KeyCode::Char('<'), KeyModifiers::SHIFT), Instant::now());
+        assert_gutter_at(&draw(&mut app), start);
+        app.handle(key(KeyCode::Char('<'), KeyModifiers::NONE), Instant::now());
+        assert_gutter_at(&draw(&mut app), start - 1);
+
+        press(&mut app, KeyCode::Char('<'), KeyModifiers::NONE, 40);
+        assert_eq!(app.tree.width(), MIN_WIDTH);
+        assert_gutter_at(&draw(&mut app), MIN_WIDTH);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn esc_in_the_tree_returns_focus_to_the_editor() {
+        let (dir, _ws, mut app) = tree_app("tree-esc");
+        app.handle(ctrl('e'), Instant::now());
+        press(&mut app, KeyCode::Down, KeyModifiers::NONE, 1);
+        assert_eq!(app.focus, Focus::Sidebar);
+        app.handle(key(KeyCode::Esc, KeyModifiers::NONE), Instant::now());
+        assert_eq!(app.focus, Focus::Editor);
+        // Back in the editor, Down moves the caret, not the tree.
+        let before = app.tree.selected().map(Path::to_path_buf);
+        press(&mut app, KeyCode::Down, KeyModifiers::NONE, 1);
+        assert_eq!(app.tree.selected().map(Path::to_path_buf), before);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The `[x]` in the tree's header.
+    const TREE_CLOSE: (u16, u16) = (2, 1);
+
+    #[test]
+    fn clicking_the_tree_close_closes_the_workspace() {
+        let (dir, _ws, mut app) = tree_app("tree-click-close");
+        for x in 1..=3 {
+            assert_eq!(app.hits.hit(x, 1), Some(Target::TreeClose));
+        }
+        left_click(&mut app, TREE_CLOSE.0, TREE_CLOSE.1);
+        assert!(app.editor().workspace().is_none());
+        let buf = draw(&mut app);
+        // The gutter is back at the left edge.
+        assert!(
+            row_text(&buf, 1).starts_with(" 1 "),
+            "{:?}",
+            row_text(&buf, 1)
+        );
+        assert_ne!(buf[(0, 10)].bg, theme::tree_border().bg.unwrap());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn clicking_a_folder_row_toggles_it_and_focuses_the_sidebar() {
+        let (dir, ws, mut app) = tree_app("tree-click-folder");
+        let src = ws.join("src");
+        assert_eq!(app.hits.hit(5, tree_y(1)), Some(Target::TreeRow(1)));
+        left_click(&mut app, 5, tree_y(1));
+        assert!(app.editor().workspace().unwrap().is_expanded(&src));
+        assert_eq!(app.tree.selected(), Some(src.as_path()));
+        assert_eq!(app.focus, Focus::Sidebar);
+        let buf = draw(&mut app);
+        assert!(sidebar_text(&app, &buf, tree_y(2)).starts_with("       main.rs "));
+
+        left_click(&mut app, 5, tree_y(1));
+        assert!(!app.editor().workspace().unwrap().is_expanded(&src));
+        assert_eq!(app.focus, Focus::Sidebar);
+        let buf = draw(&mut app);
+        assert!(sidebar_text(&app, &buf, tree_y(2)).starts_with("     Cargo.toml "));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn clicking_a_file_row_opens_it_and_focuses_the_editor() {
+        let (dir, ws, mut app) = tree_app("tree-click-file");
+        let cargo = ws.join("Cargo.toml");
+        app.handle(ctrl('e'), Instant::now());
+        assert_eq!(app.focus, Focus::Sidebar);
+        draw(&mut app);
+        left_click(&mut app, 8, tree_y(2));
+        let tab = app.editor().active_tab().unwrap();
+        assert_eq!(tab.path.as_deref(), Some(cargo.as_path()));
+        assert_eq!(app.tree.selected(), Some(cargo.as_path()));
+        assert_eq!(app.focus, Focus::Editor);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn clicking_the_empty_tree_area_focuses_the_sidebar() {
+        let (dir, _ws, mut app) = tree_app("tree-click-empty");
+        assert_eq!(app.hits.hit(5, tree_y(6)), Some(Target::TreeEmpty));
+        left_click(&mut app, 5, tree_y(6));
+        assert_eq!(app.focus, Focus::Sidebar);
+        assert_eq!(app.tree.selected(), None);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn right_clicks_on_the_tree_open_its_menus_at_the_mouse() {
+        let (dir, ws, mut app) = tree_app("tree-right-click");
+        let cargo = ws.join("Cargo.toml");
+        let src = ws.join("src");
+        let root = app.editor().workspace().unwrap().root.clone();
+
+        right_click(&mut app, 8, tree_y(2));
+        assert_eq!(
+            app.menu,
+            Some(ContextMenu::new(
+                tree_menu::file_entries(&cargo),
+                Position::new(8, tree_y(2))
+            ))
+        );
+        assert_eq!(app.tree.selected(), Some(cargo.as_path()));
+        assert_eq!(app.focus, Focus::Sidebar);
+        app.handle(key(KeyCode::Esc, KeyModifiers::NONE), Instant::now());
+
+        draw(&mut app);
+        right_click(&mut app, 6, tree_y(1));
+        assert_eq!(
+            app.menu,
+            Some(ContextMenu::new(
+                tree_menu::dir_entries(&src),
+                Position::new(6, tree_y(1))
+            ))
+        );
+        assert_eq!(app.tree.selected(), Some(src.as_path()));
+        app.handle(key(KeyCode::Esc, KeyModifiers::NONE), Instant::now());
+
+        // The header has no menu.
+        draw(&mut app);
+        right_click(&mut app, 10, 1);
+        assert!(app.menu.is_none());
+
+        draw(&mut app);
+        right_click(&mut app, 4, tree_y(4));
+        assert_eq!(
+            app.menu,
+            Some(ContextMenu::new(
+                tree_menu::dir_entries(&root),
+                Position::new(4, tree_y(4))
+            ))
+        );
+
+        // "New file…" is the root menu's first item.
+        draw(&mut app);
+        let item = (6, menu_row(tree_y(4), 0));
+        assert_eq!(app.hits.hit(item.0, item.1), Some(Target::MenuItem(0)));
+        left_click(&mut app, item.0, item.1);
+        assert!(app.menu.is_none());
+        assert!(matches!(app.editor().prompt(), Some(Prompt::Name(_))));
+
+        type_text(&mut app, "notes.txt");
+        app.handle(key(KeyCode::Enter, KeyModifiers::NONE), Instant::now());
+        assert!(app.editor().prompt().is_none());
+        let created = root.join("notes.txt");
+        assert!(created.is_file());
+        let tab = app.editor().active_tab().unwrap();
+        assert_eq!(tab.path.as_deref(), Some(created.as_path()));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn dragging_the_border_resizes_the_sidebar_and_clamps() {
+        let (dir, _ws, mut app) = tree_app("tree-drag");
+        let border = DEFAULT_WIDTH - 1;
+        assert_eq!(app.hits.hit(border, 10), Some(Target::TreeBorder));
+        let now = Instant::now();
+
+        app.handle(mouse(left(MouseEventKind::Down), border, 10), now);
+        assert!(app.tree.is_resizing());
+        // The border follows the mouse: at column 39 the sidebar is 40 wide.
+        app.handle(mouse(left(MouseEventKind::Drag), 39, 10), now);
+        assert_eq!(app.tree.width(), 40);
+        app.handle(mouse(left(MouseEventKind::Up), 39, 10), now);
+        assert!(!app.tree.is_resizing());
+        let buf = draw(&mut app);
+        assert_eq!(buf[(39, 10)].bg, theme::tree_border().bg.unwrap());
+        assert_ne!(buf[(40, 10)].bg, theme::tree_border().bg.unwrap());
+        assert_eq!(buf[(41, 1)].symbol(), "1");
+
+        // After the release a drag does nothing.
+        app.handle(mouse(left(MouseEventKind::Drag), 50, 10), now);
+        assert_eq!(app.tree.width(), 40);
+
+        app.handle(mouse(left(MouseEventKind::Down), 39, 10), now);
+        app.handle(mouse(left(MouseEventKind::Drag), 2, 10), now);
+        assert_eq!(app.tree.width(), MIN_WIDTH);
+        // The widest leaves the editor text 20 columns past the gutter " 1 ".
+        app.handle(mouse(left(MouseEventKind::Drag), 79, 10), now);
+        assert_eq!(app.tree.width(), 80 - 3 - MIN_EDITOR_WIDTH);
+        app.handle(mouse(left(MouseEventKind::Up), 79, 10), now);
+        assert!(!app.tree.is_resizing());
+        let buf = draw(&mut app);
+        assert_eq!(buf[(56, 10)].bg, theme::tree_border().bg.unwrap());
+        assert_ne!(buf[(57, 10)].bg, theme::tree_border().bg.unwrap());
+        // The gutter is columns 57 to 59; the text is the last 20.
+        assert_eq!(buf[(58, 1)].symbol(), "1");
+        assert_eq!(app.hits.hit(59, 10), None);
+        assert_eq!(app.hits.hit(60, 10), Some(Target::Editor));
+        assert_eq!(app.hits.hit(79, 10), Some(Target::Editor));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_release_while_the_menu_is_open_ends_a_border_drag() {
+        let (dir, _ws, mut app) = tree_app("tree-drag-menu");
+        app.tree.begin_resize();
+        app.menu = Some(ContextMenu::new(
+            tree_menu::dir_entries(Path::new("/")),
+            Position::new(5, 5),
+        ));
+        app.handle(mouse(left(MouseEventKind::Up), 5, 5), Instant::now());
+        assert!(!app.tree.is_resizing());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_move_without_a_button_ends_a_border_drag() {
+        let (dir, _ws, mut app) = tree_app("tree-drag-moved");
+        let border = DEFAULT_WIDTH - 1;
+        let now = Instant::now();
+        app.handle(mouse(left(MouseEventKind::Down), border, 10), now);
+        assert!(app.tree.is_resizing());
+        // A drag does not end it.
+        app.handle(mouse(left(MouseEventKind::Drag), 34, 10), now);
+        assert!(app.tree.is_resizing());
+        assert_eq!(app.tree.width(), 35);
+        draw(&mut app);
+        app.handle(mouse(MouseEventKind::Moved, 34, 10), now);
+        assert!(!app.tree.is_resizing());
+        app.handle(mouse(left(MouseEventKind::Drag), 50, 10), now);
+        assert_eq!(app.tree.width(), 35);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_press_on_the_editor_ends_a_border_drag() {
+        let (dir, _ws, mut app) = tree_app("tree-drag-press");
+        let border = DEFAULT_WIDTH - 1;
+        let now = Instant::now();
+        app.handle(mouse(left(MouseEventKind::Down), border, 10), now);
+        assert!(app.tree.is_resizing());
+        assert_eq!(app.hits.hit(50, 10), Some(Target::Editor));
+        app.handle(mouse(left(MouseEventKind::Down), 50, 10), now);
+        assert!(!app.tree.is_resizing());
+        app.handle(mouse(left(MouseEventKind::Drag), 60, 10), now);
+        assert_eq!(app.tree.width(), DEFAULT_WIDTH);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_move_while_the_menu_is_open_ends_a_border_drag() {
+        let (dir, _ws, mut app) = tree_app("tree-drag-menu-moved");
+        app.tree.begin_resize();
+        app.menu = Some(ContextMenu::new(
+            tree_menu::dir_entries(Path::new("/")),
+            Position::new(5, 5),
+        ));
+        app.handle(mouse(left(MouseEventKind::Drag), 6, 6), Instant::now());
+        assert!(app.tree.is_resizing());
+        app.handle(mouse(MouseEventKind::Moved, 6, 6), Instant::now());
+        assert!(!app.tree.is_resizing());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn narrowing_after_the_terminal_shrank_moves_the_border_at_once() {
+        let (dir, _ws, mut app) = tree_app("tree-shrink");
+        let border = DEFAULT_WIDTH - 1;
+        let now = Instant::now();
+        app.handle(mouse(left(MouseEventKind::Down), border, 10), now);
+        app.handle(mouse(left(MouseEventKind::Drag), 59, 10), now);
+        app.handle(mouse(left(MouseEventKind::Up), 59, 10), now);
+        // 80 columns less the gutter " 1 " and the editor's 20.
+        assert_eq!(app.tree.width(), 57);
+
+        // In 40 columns the sidebar is clamped to 40 - 3 - 20 = 17, its
+        // border at 16.
+        let buf = draw_sized(&mut app, 40, 24);
+        assert_eq!(app.tree.width(), 17);
+        assert_eq!(buf[(16, 10)].bg, theme::tree_border().bg.unwrap());
+        app.handle(ctrl('e'), now);
+        app.handle(key(KeyCode::Char('<'), KeyModifiers::NONE), now);
+        let buf = draw_sized(&mut app, 40, 24);
+        assert_eq!(buf[(15, 10)].bg, theme::tree_border().bg.unwrap());
+        assert_ne!(buf[(16, 10)].bg, theme::tree_border().bg.unwrap());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_tree_key_after_a_change_on_disk_drops_the_hit_map() {
+        let (dir, ws, mut app) = tree_app("tree-key-refresh");
+        app.handle(ctrl('e'), Instant::now());
+        press(&mut app, KeyCode::Down, KeyModifiers::NONE, 1);
+        assert_eq!(app.hits.hit(5, tree_y(0)), Some(Target::TreeRow(0)));
+        fs::write(ws.join("new.txt"), "").unwrap();
+        // No render between the change and the key.
+        press(&mut app, KeyCode::Down, KeyModifiers::NONE, 1);
+        assert_eq!(app.hits.hit(5, tree_y(0)), None);
+        assert_eq!(app.hits.hit(DEFAULT_WIDTH - 1, 10), None);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn clicking_the_tree_close_with_the_tree_focused_focuses_the_editor() {
+        let (dir, _ws, mut app) = tree_app("tree-close-focused");
+        app.handle(ctrl('e'), Instant::now());
+        assert_eq!(app.focus, Focus::Sidebar);
+        left_click(&mut app, TREE_CLOSE.0, TREE_CLOSE.1);
+        assert!(app.editor().workspace().is_none());
+        assert_eq!(app.focus, Focus::Editor);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_wheel_scrolls_a_long_tree_and_stops_at_the_end() {
+        let dir = temp_dir("tree-wheel");
+        let ws = dir.join("ws");
+        fs::create_dir_all(&ws).unwrap();
+        for n in 0..40 {
+            fs::write(ws.join(format!("f{n:02}.txt")), "").unwrap();
+        }
+        let editor = open_editor(&dir, &[], Some(&ws));
+        let mut app = TermApp::new(editor, KeyboardMode::Enhanced, ws.clone(), None);
+        let first_row = |app: &mut TermApp| {
+            let buf = draw(app);
+            sidebar_text(app, &buf, tree_y(0)).trim().to_owned()
+        };
+        assert_eq!(first_row(&mut app), "f00.txt");
+
+        app.handle(mouse(MouseEventKind::ScrollDown, 5, 10), Instant::now());
+        assert_eq!(first_row(&mut app), "f03.txt");
+        // Over the border too.
+        app.handle(
+            mouse(MouseEventKind::ScrollDown, DEFAULT_WIDTH - 1, 10),
+            Instant::now(),
+        );
+        assert_eq!(first_row(&mut app), "f06.txt");
+
+        // 21 rows fit (screen rows 2 to 22): the last top is row 19.
+        for _ in 0..10 {
+            app.handle(mouse(MouseEventKind::ScrollDown, 5, 10), Instant::now());
+            draw(&mut app);
+        }
+        let buf = draw(&mut app);
+        assert_eq!(sidebar_text(&app, &buf, tree_y(0)).trim(), "f19.txt");
+        assert_eq!(sidebar_text(&app, &buf, 22).trim(), "f39.txt");
+
+        app.handle(mouse(MouseEventKind::ScrollUp, 5, 10), Instant::now());
+        assert_eq!(first_row(&mut app), "f16.txt");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn hovering_the_tree_close_shows_its_hint() {
+        let (dir, _ws, mut app) = tree_app("tree-hover-close");
+        app.handle(
+            mouse(MouseEventKind::Moved, TREE_CLOSE.0, TREE_CLOSE.1),
+            Instant::now(),
+        );
+        assert_eq!(app.status.hint(), Some("Close file tree"));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn clicks_on_the_tree_with_a_prompt_open_do_nothing() {
+        let (dir, ws, mut app) = tree_app("tree-click-prompt");
+        let src = ws.join("src");
+        let tabs = app.editor().tabs().len();
+        let border = DEFAULT_WIDTH - 1;
+        let events = [
+            mouse(left(MouseEventKind::Down), 5, tree_y(1)),
+            mouse(left(MouseEventKind::Down), 5, tree_y(2)),
+            mouse(left(MouseEventKind::Down), TREE_CLOSE.0, TREE_CLOSE.1),
+            mouse(left(MouseEventKind::Down), 5, tree_y(4)),
+            mouse(MouseEventKind::Down(MouseButton::Right), 5, tree_y(2)),
+            mouse(MouseEventKind::Down(MouseButton::Right), 5, tree_y(4)),
+            mouse(left(MouseEventKind::Down), border, tree_y(1)),
+            mouse(MouseEventKind::ScrollDown, 5, tree_y(1)),
+        ];
+        for event in events {
+            // Each event meets a freshly drawn prompt: a click outside it
+            // only dismisses it.
+            app.handle(ctrl('o'), Instant::now());
+            draw(&mut app);
+            assert!(app.prompt.is_open(&app.editor));
+            for (x, y) in [(5, tree_y(1)), (5, tree_y(2)), (5, tree_y(4))] {
+                assert!(
+                    matches!(
+                        app.hits.hit(x, y),
+                        Some(Target::TreeRow(_) | Target::TreeEmpty)
+                    ),
+                    "{x},{y}"
+                );
+            }
+            assert_eq!(app.hits.hit(border, tree_y(1)), Some(Target::TreeBorder));
+            app.handle(event, Instant::now());
+            app.handle(mouse(left(MouseEventKind::Drag), 40, 10), Instant::now());
+            app.handle(key(KeyCode::Esc, KeyModifiers::NONE), Instant::now());
+
+            assert!(app.menu.is_none());
+            assert!(app.editor().workspace().is_some());
+            assert!(!app.editor().workspace().unwrap().is_expanded(&src));
+            assert_eq!(app.editor().tabs().len(), tabs);
+            assert_eq!(app.tree.selected(), None);
+            assert!(!app.tree.is_resizing());
+            assert_eq!(app.tree.width(), DEFAULT_WIDTH);
+            assert_eq!(app.focus, Focus::Editor);
+        }
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// An app over a workspace of 40 files, `f00.txt` to `f39.txt`,
+    /// drawn once.
+    fn long_tree_app(tag: &str) -> (PathBuf, PathBuf, TermApp) {
+        let dir = temp_dir(tag);
+        let ws = dir.join("ws");
+        fs::create_dir_all(&ws).unwrap();
+        for n in 0..40 {
+            fs::write(ws.join(format!("f{n:02}.txt")), "").unwrap();
+        }
+        let editor = open_editor(&dir, &[], Some(&ws));
+        let mut app = TermApp::new(editor, KeyboardMode::Enhanced, ws.clone(), None);
+        draw(&mut app);
+        (dir, ws, app)
+    }
+
+    #[test]
+    fn a_batch_of_wheel_events_scrolls_by_all_of_them() {
+        let (dir, _ws, mut app) = long_tree_app("tree-wheel-batch");
+        // No render between the three events.
+        for _ in 0..3 {
+            app.handle(mouse(MouseEventKind::ScrollDown, 5, 10), Instant::now());
+        }
+        assert_eq!(app.hits.hit(5, 10), Some(Target::TreeScrolled));
+        let buf = draw(&mut app);
+        assert_eq!(sidebar_text(&app, &buf, tree_y(0)).trim(), "f09.txt");
+        assert_eq!(app.hits.hit(5, 10), Some(Target::TreeRow(17)));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn clicks_after_a_wheel_event_in_the_same_batch_do_nothing() {
+        let (dir, ws, mut app) = long_tree_app("tree-wheel-click");
+        let tabs = app.editor().tabs().len();
+        app.handle(mouse(MouseEventKind::Moved, 5, tree_y(1)), Instant::now());
+        assert_eq!(app.hovered, Some(Target::TreeRow(1)));
+        app.handle(mouse(MouseEventKind::ScrollDown, 5, 10), Instant::now());
+        assert_eq!(app.hovered, None);
+        assert_eq!(app.status.hint(), None);
+        // The border keeps its target.
+        assert_eq!(
+            app.hits.hit(DEFAULT_WIDTH - 1, 10),
+            Some(Target::TreeBorder)
+        );
+
+        left_click(&mut app, 5, tree_y(1));
+        right_click(&mut app, 5, tree_y(1));
+        right_click(&mut app, 5, tree_y(30));
+        assert_eq!(app.editor().tabs().len(), tabs);
+        assert_eq!(app.tree.selected(), None);
+        assert!(app.menu.is_none());
+        assert_eq!(app.focus, Focus::Editor);
+
+        // After a render the click lands on the row now drawn there.
+        draw(&mut app);
+        left_click(&mut app, 5, tree_y(1));
+        let f04 = ws.join("f04.txt");
+        assert_eq!(
+            app.editor().active_tab().unwrap().path.as_deref(),
+            Some(f04.as_path())
+        );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_prompt_opened_mid_drag_ends_the_drag() {
+        let (dir, _ws, mut app) = tree_app("tree-drag-prompt");
+        let border = DEFAULT_WIDTH - 1;
+        let now = Instant::now();
+        app.handle(mouse(left(MouseEventKind::Down), border, 10), now);
+        app.handle(mouse(left(MouseEventKind::Drag), 34, 10), now);
+        assert_eq!(app.tree.width(), 35);
+        app.handle(ctrl('o'), now);
+        assert!(app.prompt.is_open(&app.editor));
+        assert!(app.tree.is_resizing());
+
+        app.handle(mouse(left(MouseEventKind::Drag), 50, 10), now);
+        assert_eq!(app.tree.width(), 35);
+        assert!(!app.tree.is_resizing());
+
+        app.handle(key(KeyCode::Esc, KeyModifiers::NONE), now);
+        app.handle(mouse(left(MouseEventKind::Drag), 60, 10), now);
+        assert_eq!(app.tree.width(), 35);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_stale_hovered_row_is_dropped_for_good_after_a_refresh() {
+        let (dir, ws, mut app) = tree_app("tree-stale-hover");
+        let y = tree_y(1);
+        app.handle(mouse(MouseEventKind::Moved, 5, y), Instant::now());
+        assert_eq!(app.hovered, Some(Target::TreeRow(1)));
+        let buf = draw(&mut app);
+        assert_eq!(buf[(0, y)].bg, theme::hover_bg());
+
+        // Removing `docs` moves `Cargo.toml` into row 1.
+        fs::remove_dir_all(ws.join("docs")).unwrap();
+        for _ in 0..2 {
+            let buf = draw(&mut app);
+            assert!(sidebar_text(&app, &buf, y).starts_with("     Cargo.toml "));
+            assert_ne!(buf[(0, y)].bg, theme::hover_bg());
+            assert_eq!(app.hovered, None);
+            assert_eq!(app.status.hint(), None);
+        }
         fs::remove_dir_all(&dir).unwrap();
     }
 }

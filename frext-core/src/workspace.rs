@@ -8,6 +8,8 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
+use crate::editor::FolderState;
+
 /// A directory opened in the sidebar, with the set of expanded sub-folders.
 ///
 /// The expanded set is stored so the tree reopens exactly as the user left
@@ -140,6 +142,72 @@ pub fn read_dir_split(dir: &Path) -> (Vec<PathBuf>, Vec<PathBuf>) {
     (dirs, files)
 }
 
+/// What a [`TreeRow`] shows: a folder (with its open/closed state) or a file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RowKind {
+    /// A directory, expanded or collapsed.
+    Dir(FolderState),
+    /// Anything that is not a directory (symlinks included).
+    File,
+}
+
+/// One visible line of the file tree, as listed by [`visible_rows`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TreeRow {
+    /// The entry's full path.
+    pub path: PathBuf,
+    /// Nesting level below the root: the root's children are depth 0.
+    pub depth: usize,
+    /// Whether the entry is a folder (and its state) or a file.
+    pub kind: RowKind,
+}
+
+/// The rows of the file tree as currently visible, top to bottom.
+///
+/// The root's children are listed at depth 0, folders first and then files,
+/// each sorted as [`read_dir_split`] sorts them. A folder that
+/// [`Workspace::is_expanded`] reports as expanded is immediately followed by
+/// its own rows one level deeper; collapsed folders are not descended into,
+/// so an expanded folder inside a collapsed one is not listed.
+///
+/// This re-reads the file system on every call, but only the root and the
+/// expanded folders reachable from it are read. An unreadable or missing
+/// root gives no rows.
+#[must_use]
+pub fn visible_rows(workspace: &Workspace) -> Vec<TreeRow> {
+    let mut rows = Vec::new();
+    push_rows(workspace, &workspace.root, 0, &mut rows);
+    rows
+}
+
+/// Append the rows for the children of `dir`, at `depth`, to `rows`.
+fn push_rows(workspace: &Workspace, dir: &Path, depth: usize, rows: &mut Vec<TreeRow>) {
+    let (dirs, files) = read_dir_split(dir);
+
+    for path in dirs {
+        let expanded = workspace.is_expanded(&path);
+        let state = if expanded {
+            FolderState::Expanded
+        } else {
+            FolderState::Collapsed
+        };
+        rows.push(TreeRow {
+            path: path.clone(),
+            depth,
+            kind: RowKind::Dir(state),
+        });
+        if expanded {
+            push_rows(workspace, &path, depth + 1, rows);
+        }
+    }
+
+    rows.extend(files.into_iter().map(|path| TreeRow {
+        path,
+        depth,
+        kind: RowKind::File,
+    }));
+}
+
 #[cfg(test)]
 mod tests {
     // `unwrap` is acceptable in test code: a panic on an unexpected `Err`
@@ -226,5 +294,175 @@ mod tests {
         assert_eq!(file_names, vec!["avocado.txt", "Banana.txt"]);
 
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A fresh, uniquely named temp directory path (not yet created).
+    fn temp_root(tag: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "frext-ws-rows-{tag}-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
+    /// Build the fixture tree used by the `visible_rows` tests:
+    ///
+    /// ```text
+    /// root/
+    ///   alpha/
+    ///     inner/
+    ///       deep.txt
+    ///     a1.txt
+    ///   beta/
+    ///     b1.txt
+    ///   empty/
+    ///   top.txt
+    /// ```
+    fn fixture(tag: &str) -> PathBuf {
+        let root = temp_root(tag);
+        std::fs::create_dir_all(root.join("alpha/inner")).unwrap();
+        std::fs::create_dir_all(root.join("beta")).unwrap();
+        std::fs::create_dir_all(root.join("empty")).unwrap();
+        std::fs::write(root.join("alpha/inner/deep.txt"), "d").unwrap();
+        std::fs::write(root.join("alpha/a1.txt"), "a").unwrap();
+        std::fs::write(root.join("beta/b1.txt"), "b").unwrap();
+        std::fs::write(root.join("top.txt"), "t").unwrap();
+        root
+    }
+
+    fn dir_row(path: PathBuf, depth: usize, state: FolderState) -> TreeRow {
+        TreeRow {
+            path,
+            depth,
+            kind: RowKind::Dir(state),
+        }
+    }
+
+    fn file_row(path: PathBuf, depth: usize) -> TreeRow {
+        TreeRow {
+            path,
+            depth,
+            kind: RowKind::File,
+        }
+    }
+
+    #[test]
+    fn visible_rows_nothing_expanded_lists_root_children() {
+        let root = fixture("none");
+        let ws = Workspace::new(root.clone());
+
+        let rows = visible_rows(&ws);
+
+        assert_eq!(
+            rows,
+            vec![
+                dir_row(root.join("alpha"), 0, FolderState::Collapsed),
+                dir_row(root.join("beta"), 0, FolderState::Collapsed),
+                dir_row(root.join("empty"), 0, FolderState::Collapsed),
+                file_row(root.join("top.txt"), 0),
+            ]
+        );
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn visible_rows_one_folder_expanded_nests_its_children() {
+        let root = fixture("one");
+        let mut ws = Workspace::new(root.clone());
+        ws.set_expanded(&root.join("alpha"), true);
+
+        let rows = visible_rows(&ws);
+
+        assert_eq!(
+            rows,
+            vec![
+                dir_row(root.join("alpha"), 0, FolderState::Expanded),
+                dir_row(root.join("alpha/inner"), 1, FolderState::Collapsed),
+                file_row(root.join("alpha/a1.txt"), 1),
+                dir_row(root.join("beta"), 0, FolderState::Collapsed),
+                dir_row(root.join("empty"), 0, FolderState::Collapsed),
+                file_row(root.join("top.txt"), 0),
+            ]
+        );
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn visible_rows_two_levels_expanded_reach_depth_two() {
+        let root = fixture("two");
+        let mut ws = Workspace::new(root.clone());
+        ws.set_expanded(&root.join("alpha"), true);
+        ws.set_expanded(&root.join("alpha/inner"), true);
+
+        let rows = visible_rows(&ws);
+
+        assert_eq!(
+            rows,
+            vec![
+                dir_row(root.join("alpha"), 0, FolderState::Expanded),
+                dir_row(root.join("alpha/inner"), 1, FolderState::Expanded),
+                file_row(root.join("alpha/inner/deep.txt"), 2),
+                file_row(root.join("alpha/a1.txt"), 1),
+                dir_row(root.join("beta"), 0, FolderState::Collapsed),
+                dir_row(root.join("empty"), 0, FolderState::Collapsed),
+                file_row(root.join("top.txt"), 0),
+            ]
+        );
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn visible_rows_hides_expanded_folder_inside_collapsed_one() {
+        let root = fixture("hidden");
+        let mut ws = Workspace::new(root.clone());
+        ws.set_expanded(&root.join("alpha/inner"), true);
+
+        let rows = visible_rows(&ws);
+
+        assert_eq!(
+            rows,
+            vec![
+                dir_row(root.join("alpha"), 0, FolderState::Collapsed),
+                dir_row(root.join("beta"), 0, FolderState::Collapsed),
+                dir_row(root.join("empty"), 0, FolderState::Collapsed),
+                file_row(root.join("top.txt"), 0),
+            ]
+        );
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn visible_rows_missing_root_is_empty() {
+        let root = temp_root("missing");
+        let ws = Workspace::new(root);
+
+        assert!(visible_rows(&ws).is_empty());
+    }
+
+    #[test]
+    fn visible_rows_empty_expanded_folder_is_just_its_row() {
+        let root = fixture("empty");
+        let mut ws = Workspace::new(root.clone());
+        ws.set_expanded(&root.join("empty"), true);
+
+        let rows = visible_rows(&ws);
+
+        assert_eq!(
+            rows,
+            vec![
+                dir_row(root.join("alpha"), 0, FolderState::Collapsed),
+                dir_row(root.join("beta"), 0, FolderState::Collapsed),
+                dir_row(root.join("empty"), 0, FolderState::Expanded),
+                file_row(root.join("top.txt"), 0),
+            ]
+        );
+
+        std::fs::remove_dir_all(&root).unwrap();
     }
 }

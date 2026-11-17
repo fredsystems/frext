@@ -53,6 +53,18 @@ pub enum Target {
     FindReplaceCurrent,
     /// The find bar's "replace all matches" button.
     FindReplaceAll,
+    /// The file tree's close button.
+    TreeClose,
+    /// The file-tree row at this index in the tree's rows.
+    TreeRow(usize),
+    /// The file tree's area below its last row.
+    TreeEmpty,
+    /// The file tree's resizable border.
+    TreeBorder,
+    /// A file-tree row or empty area whose rows have scrolled since the
+    /// last render: the wheel still scrolls over it, but clicks do
+    /// nothing, as they could land on a row that has moved.
+    TreeScrolled,
 }
 
 impl Target {
@@ -76,6 +88,8 @@ impl Target {
             Self::FindClose => Some("Close (Esc)"),
             Self::FindReplaceCurrent => Some("Replace the current match (Enter in With)"),
             Self::FindReplaceAll => Some("Replace all matches"),
+            Self::TreeClose => Some("Close file tree"),
+            Self::TreeBorder => Some("Drag to resize (< / > in the tree)"),
             Self::SelectTab(_)
             | Self::PromptPopup
             | Self::PromptInput
@@ -85,7 +99,10 @@ impl Target {
             | Self::MenuPopup
             | Self::MenuItem(_)
             | Self::FindPattern
-            | Self::FindReplacement => None,
+            | Self::FindReplacement
+            | Self::TreeRow(_)
+            | Self::TreeEmpty
+            | Self::TreeScrolled => None,
         }
     }
 }
@@ -117,6 +134,14 @@ impl HitMap {
             .rev()
             .find(|(rect, _)| rect.contains(point))
             .map(|&(_, target)| target)
+    }
+
+    /// Replaces every region's target with `f` of it, keeping the
+    /// regions themselves.
+    pub fn retarget(&mut self, f: impl Fn(Target) -> Target) {
+        for (_, target) in &mut self.regions {
+            *target = f(*target);
+        }
     }
 }
 
@@ -223,5 +248,46 @@ mod tests {
             Some(Target::FindOption(SearchOption::Regex))
         );
         assert_eq!(map.hit(43, 0), Some(Target::Editor));
+    }
+
+    #[test]
+    fn tree_hints() {
+        assert_eq!(Target::TreeClose.hint(), Some("Close file tree"));
+        assert_eq!(
+            Target::TreeBorder.hint(),
+            Some("Drag to resize (< / > in the tree)")
+        );
+        assert_eq!(Target::TreeRow(0).hint(), None);
+        assert_eq!(Target::TreeEmpty.hint(), None);
+        assert_eq!(Target::TreeScrolled.hint(), None);
+    }
+
+    #[test]
+    fn retarget_maps_only_what_the_closure_changes() {
+        let mut map = HitMap::default();
+        map.push(Rect::new(0, 0, 30, 24), Target::TreeEmpty);
+        map.push(Rect::new(0, 4, 29, 1), Target::TreeRow(3));
+        map.push(Rect::new(29, 0, 1, 24), Target::TreeBorder);
+        map.push(Rect::new(40, 0, 3, 1), Target::Save);
+        map.retarget(|target| match target {
+            Target::TreeRow(_) | Target::TreeEmpty => Target::TreeScrolled,
+            other => other,
+        });
+        assert_eq!(map.hit(5, 4), Some(Target::TreeScrolled));
+        assert_eq!(map.hit(5, 5), Some(Target::TreeScrolled));
+        assert_eq!(map.hit(29, 4), Some(Target::TreeBorder));
+        assert_eq!(map.hit(41, 0), Some(Target::Save));
+        assert_eq!(map.hit(50, 10), None);
+    }
+
+    #[test]
+    fn tree_row_region_resolves() {
+        let mut map = HitMap::default();
+        map.push(Rect::new(0, 0, 30, 24), Target::TreeEmpty);
+        map.push(Rect::new(0, 4, 29, 1), Target::TreeRow(3));
+        map.push(Rect::new(29, 0, 1, 24), Target::TreeBorder);
+        assert_eq!(map.hit(5, 4), Some(Target::TreeRow(3)));
+        assert_eq!(map.hit(5, 5), Some(Target::TreeEmpty));
+        assert_eq!(map.hit(29, 4), Some(Target::TreeBorder));
     }
 }
