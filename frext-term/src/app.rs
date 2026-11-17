@@ -5,12 +5,11 @@
 //! [`Editor`] (or into local view changes), queues the [`Effect`]s the
 //! editor returns, and draws the whole screen into a ratatui [`Frame`].
 
-use std::ops::Range;
 use std::path::PathBuf;
 use std::time::Instant;
 
 use crossterm::event::{Event, KeyEvent, KeyEventKind, MouseButton, MouseEvent, MouseEventKind};
-use frext_core::editor::{Command, Editor, Effect};
+use frext_core::editor::{BufferChange, Command, Editor, EditorFocus, Effect};
 use frext_core::lines::line_count;
 use frext_core::syntax::language_from_path;
 use ratatui::Frame;
@@ -18,7 +17,8 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::Style;
 
-use crate::editor_view::EditorView;
+use crate::buffer::edit::{Applied, EditAction};
+use crate::buffer::{BufferView, WHEEL_ROWS};
 use crate::events::AppEvent;
 use crate::hit::{HitMap, Target};
 use crate::keymap::{self, Action, Focus, KeyContext};
@@ -32,17 +32,11 @@ use crate::theme;
 /// The sidebar's width in columns, when shown.
 const SIDEBAR_WIDTH: u16 = 30;
 
-/// How many lines one mouse-wheel notch scrolls.
-const WHEEL_LINES: i32 = 3;
-
 /// Shown on startup when the kitty keyboard protocol is unavailable.
 const LEGACY_MESSAGE: &str = "Kitty keyboard protocol unavailable: use Ctrl+R for find and replace";
 
 /// Shown when a find key is pressed before the find bar exists.
 const FIND_BAR_MESSAGE: &str = "Find bar is not available yet";
-
-/// Shown when text is pasted outside a prompt.
-const PASTE_MESSAGE: &str = "Editing arrives in a later version";
 
 /// Whether the user wants the sidebar shown (when there is a workspace).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -65,11 +59,10 @@ pub struct TermApp {
     focus: Focus,
     sidebar: SidebarVisibility,
     prompt: PromptUi,
-    view: EditorView,
+    buffer: BufferView,
     status: StatusLine,
     hovered: Option<Target>,
     hits: HitMap,
-    last_editor_height: u16,
     effects: Vec<Effect>,
     quit: Quit,
 }
@@ -97,11 +90,10 @@ impl TermApp {
             focus: Focus::Editor,
             sidebar: SidebarVisibility::Shown,
             prompt: PromptUi::new(base, home),
-            view: EditorView::default(),
+            buffer: BufferView::default(),
             status,
             hovered: None,
             hits: HitMap::default(),
-            last_editor_height: 0,
             effects: Vec::new(),
             quit: Quit::Running,
         }
@@ -146,20 +138,22 @@ impl TermApp {
         }
     }
 
-    /// Routes one event. Effects are queued, not applied: call
-    /// [`Self::apply_effects`] after a batch of events.
+    /// Routes one event, then applies the effects it queued, so the next
+    /// event in the same batch sees them.
     pub fn handle(&mut self, event: AppEvent, now: Instant) {
         self.prompt.sync(&self.editor);
         self.settle_focus();
         match event {
             AppEvent::Input(Event::Key(key)) => self.handle_key(key, now),
-            AppEvent::Input(Event::Mouse(mouse)) => self.handle_mouse(mouse),
+            AppEvent::Input(Event::Mouse(mouse)) => self.handle_mouse(mouse, now),
             AppEvent::Input(Event::Paste(text)) => {
                 if self.prompt.is_open(&self.editor) {
                     self.prompt.handle_paste(&mut self.editor, &text);
-                } else {
-                    self.status
-                        .set_message(PASTE_MESSAGE, MessageKind::Info, now);
+                } else if self.focus == Focus::Editor
+                    && let Some(view) = self.editor.active_view_mut()
+                {
+                    let applied = self.buffer.insert_text(view.tab, &text, now);
+                    self.after_edit(applied);
                 }
             }
             AppEvent::Input(Event::Resize(..)) => self.forget_layout(),
@@ -169,6 +163,24 @@ impl TermApp {
             }
             AppEvent::InputClosed => self.quit = Quit::Requested,
         }
+        self.apply_effects();
+    }
+
+    /// Persists an edit the buffer view made to the active tab.
+    fn after_edit(&mut self, applied: Applied) {
+        if applied == Applied::Edited {
+            self.editor.commit_edit();
+            // The dirty marker changes the tab's width in the tab bar.
+            self.forget_layout();
+        }
+    }
+
+    /// Applies `action` to the active tab through the buffer view.
+    fn edit(&mut self, action: EditAction, now: Instant) {
+        if let Some(view) = self.editor.active_view_mut() {
+            let applied = self.buffer.handle(view.tab, action, now);
+            self.after_edit(applied);
+        }
     }
 
     fn handle_key(&mut self, key: KeyEvent, now: Instant) {
@@ -177,7 +189,7 @@ impl TermApp {
         }
         if self.prompt.is_open(&self.editor) {
             match self.prompt.handle_key(&mut self.editor, key) {
-                PromptReply::Send(command) => self.send(command),
+                PromptReply::Send(command) => self.send(command, now),
                 PromptReply::Handled | PromptReply::Ignored => {}
             }
             return;
@@ -193,7 +205,7 @@ impl TermApp {
         match action {
             Action::Command(command) => {
                 let find = matches!(command, Command::OpenSearch(_));
-                self.send(command);
+                self.send(command, now);
                 if find {
                     self.status
                         .set_message(FIND_BAR_MESSAGE, MessageKind::Info, now);
@@ -218,15 +230,11 @@ impl TermApp {
                 }
             }
             Action::FocusEditor => self.focus = Focus::Editor,
-            Action::Scroll(by) => {
-                if let Some(tab) = self.editor.active_tab() {
-                    self.view.scroll(tab, by, self.last_editor_height);
-                }
-            }
+            Action::Edit(action) => self.edit(action, now),
         }
     }
 
-    fn handle_mouse(&mut self, mouse: MouseEvent) {
+    fn handle_mouse(&mut self, mouse: MouseEvent, now: Instant) {
         let target = self.hits.hit(mouse.column, mouse.row);
         match mouse.kind {
             MouseEventKind::Moved | MouseEventKind::Drag(_) => {
@@ -239,15 +247,17 @@ impl TermApp {
                         .prompt
                         .handle_click(&mut self.editor, target, mouse.column);
                     if let PromptReply::Send(command) = reply {
-                        self.send(command);
+                        self.send(command, now);
                     }
                     return;
                 }
                 match target {
-                    Some(Target::NewTab) => self.send(Command::NewTab),
-                    Some(Target::Save) => self.send(Command::Save),
-                    Some(Target::SelectTab(index)) => self.send(Command::SelectTab(index)),
-                    Some(Target::CloseTab(index)) => self.send(Command::RequestClose(index)),
+                    Some(Target::NewTab) => self.send(Command::NewTab, now),
+                    Some(Target::Save) => self.send(Command::Save, now),
+                    Some(Target::SelectTab(index)) => self.send(Command::SelectTab(index), now),
+                    Some(Target::CloseTab(index)) => {
+                        self.send(Command::RequestClose(index), now);
+                    }
                     Some(Target::OpenFile) => self.open_file_prompt(),
                     Some(Target::Editor) => self.focus = Focus::Editor,
                     Some(
@@ -263,13 +273,13 @@ impl TermApp {
                 if self.prompt.is_open(&self.editor) || target != Some(Target::Editor) {
                     return;
                 }
-                let lines = if mouse.kind == MouseEventKind::ScrollUp {
-                    -WHEEL_LINES
+                let rows = if mouse.kind == MouseEventKind::ScrollUp {
+                    -WHEEL_ROWS
                 } else {
-                    WHEEL_LINES
+                    WHEEL_ROWS
                 };
                 if let Some(tab) = self.editor.active_tab() {
-                    self.view.wheel(tab, lines);
+                    self.buffer.wheel(tab, rows);
                 }
             }
             _ => {}
@@ -277,8 +287,39 @@ impl TermApp {
     }
 
     /// Applies `command` and queues the effects it returns.
-    fn send(&mut self, command: Command) {
+    ///
+    /// The editor's selection (while it has focus) is passed to core
+    /// first. A text-editing command is recorded in the active tab's undo
+    /// history as one group.
+    fn send(&mut self, command: Command, now: Instant) {
+        let selection = match self.focus {
+            Focus::Editor => self
+                .editor
+                .active_tab()
+                .and_then(|tab| self.buffer.selection(tab.id)),
+            Focus::Sidebar => None,
+        };
+        self.editor.set_selection(selection);
+        let edits_text = matches!(
+            command,
+            Command::Cut
+                | Command::Paste
+                | Command::ApplySuggestion { .. }
+                | Command::ReplaceCurrent
+                | Command::ReplaceAll
+        );
+        let before = self
+            .editor
+            .active_tab()
+            .filter(|_| edits_text)
+            .map(|tab| (tab.id, tab.text.clone()));
         let outcome = self.editor.apply(command);
+        if outcome.buffer == BufferChange::Edited
+            && let Some((id, before)) = before
+            && let Some(tab) = self.editor.active_tab().filter(|tab| tab.id == id)
+        {
+            self.buffer.record_outside_edit(tab, &before, now);
+        }
         self.effects.extend(outcome.effects);
         self.prompt.sync(&self.editor);
         self.forget_layout();
@@ -300,34 +341,33 @@ impl TermApp {
         self.hovered = None;
     }
 
-    /// Carries out the queued effects, then drops the scroll position of
-    /// tabs that no longer exist.
-    ///
-    /// Before the editor gains a caret, `SetSelection` only supplies the
-    /// range a following `RevealSelection` for the same tab centres on.
+    /// Carries out the queued effects, then drops the view state of tabs
+    /// that no longer exist.
     pub fn apply_effects(&mut self) {
-        let mut selection: Option<(u64, Range<usize>)> = None;
         for effect in std::mem::take(&mut self.effects) {
             match effect {
-                Effect::SetSelection { tab_id, chars, .. } => {
-                    log::debug!("selection {chars:?} in tab {tab_id} ignored (no caret yet)");
-                    selection = Some((tab_id, chars));
+                Effect::SetSelection {
+                    tab_id,
+                    chars,
+                    focus,
+                } => {
+                    if let Some(tab) = self.editor.tabs().iter().find(|tab| tab.id == tab_id) {
+                        self.buffer.set_selection(tab, chars);
+                    }
+                    if focus == EditorFocus::Focus {
+                        self.focus = Focus::Editor;
+                    }
                 }
                 Effect::RevealSelection { tab_id } => {
-                    let Some((_, chars)) = selection.as_ref().filter(|(id, _)| *id == tab_id)
-                    else {
-                        continue;
-                    };
                     if let Some(tab) = self.editor.active_tab().filter(|tab| tab.id == tab_id) {
-                        self.view
-                            .reveal(tab, chars.clone(), self.last_editor_height);
+                        self.buffer.reveal(tab);
                     }
                 }
                 Effect::FocusPromptField => self.prompt.focus_field(&self.editor),
                 Effect::FocusSearchField => {}
             }
         }
-        self.view
+        self.buffer
             .forget(self.editor.tabs().iter().map(|tab| tab.id));
     }
 
@@ -344,7 +384,6 @@ impl TermApp {
             sidebar_width,
             gutter_width,
         );
-        self.last_editor_height = areas.editor.height;
 
         let active = self.editor.active_index();
         let items = tab_bar::items(self.editor.tabs(), active, areas.tab_bar.width);
@@ -359,7 +398,8 @@ impl TermApp {
         );
         fill(buf, areas.find_bar, theme::chrome());
         fill(buf, areas.sidebar, theme::chrome());
-        self.view
+        let caret = self
+            .buffer
             .render(tab, areas.gutter, areas.editor, buf, &mut self.hits);
 
         let (left, right) = tab.map_or_else(
@@ -382,7 +422,10 @@ impl TermApp {
         );
         self.status.render(areas.status, buf, &left, &right);
 
-        if let Some(position) = self.prompt.render(&self.editor, area, buf, &mut self.hits) {
+        let prompt_cursor = self.prompt.render(&self.editor, area, buf, &mut self.hits);
+        let editor_cursor =
+            caret.filter(|_| self.focus == Focus::Editor && !self.prompt.is_open(&self.editor));
+        if let Some(position) = prompt_cursor.or(editor_cursor) {
             frame.set_cursor_position(position);
         }
     }
@@ -513,7 +556,6 @@ mod tests {
         let status = row_text(&buf, 23);
         assert!(status.starts_with(" src/notes.txt "), "{status:?}");
         assert!(status.ends_with("txt \u{b7} 3 lines "), "{status:?}");
-        assert_eq!(app.last_editor_height, 22);
         fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -768,25 +810,22 @@ mod tests {
     }
 
     #[test]
-    fn paste_goes_to_the_prompt_or_sets_a_message() {
+    fn paste_goes_to_the_prompt_or_the_caret() {
         let dir = temp_dir("paste");
         let file = dir.join("pasted.txt");
         fs::write(&file, "x").unwrap();
         let mut app = app(&dir, &[], KeyboardMode::Enhanced);
         let now = Instant::now();
         app.handle(AppEvent::Input(Event::Paste("abc".to_owned())), now);
-        assert_eq!(
-            app.status.message(),
-            Some((PASTE_MESSAGE, MessageKind::Info))
-        );
+        assert_eq!(app.editor().active_tab().unwrap().text, "abc");
+        assert_eq!(app.status.message(), None);
 
         app.handle(ctrl('o'), now);
         app.handle(AppEvent::Input(Event::Paste("pasted.txt".to_owned())), now);
         app.handle(key(KeyCode::Enter, KeyModifiers::NONE), now);
-        assert_eq!(
-            app.editor().active_tab().unwrap().path.as_deref(),
-            Some(file.as_path())
-        );
+        let tab = app.editor().active_tab().unwrap();
+        assert_eq!(tab.path.as_deref(), Some(file.as_path()));
+        assert_eq!(tab.text, "x");
         fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -801,7 +840,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_mode_binds_ctrl_r_but_not_ctrl_h() {
+    fn legacy_mode_binds_ctrl_r_and_ctrl_h_is_not_replace() {
         let dir = temp_dir("legacy");
         let mut app = app(&dir, &[], KeyboardMode::Legacy);
         assert_eq!(
@@ -823,7 +862,6 @@ mod tests {
         let buf = draw(&mut app);
         assert_eq!(row_text(&buf, 1).trim(), "");
         assert!(row_text(&buf, 2).starts_with(" 1 "));
-        assert_eq!(app.last_editor_height, 21);
 
         app.handle(key(KeyCode::Esc, KeyModifiers::NONE), now);
         assert!(!app.editor().search().is_open());
@@ -914,13 +952,27 @@ mod tests {
     }
 
     #[test]
-    fn keys_scroll_by_the_editor_height() {
+    fn the_view_follows_the_caret() {
         let dir = temp_dir("keys-scroll");
         let file = long_file(&dir);
         let mut app = app(&dir, &[file], KeyboardMode::Enhanced);
         let now = Instant::now();
         draw(&mut app);
 
+        // 101 rows (the trailing newline adds one) in 22: the last 22.
+        app.handle(key(KeyCode::End, KeyModifiers::CONTROL), now);
+        let buf = draw(&mut app);
+        assert!(row_text(&buf, 1).starts_with(" 80 line 80 "));
+
+        app.handle(key(KeyCode::Home, KeyModifiers::CONTROL), now);
+        let buf = draw(&mut app);
+        assert!(row_text(&buf, 1).starts_with("  1 line 1 "));
+
+        // A page is 21 rows: the first stays on screen, the second
+        // scrolls just enough.
+        app.handle(key(KeyCode::PageDown, KeyModifiers::NONE), now);
+        let buf = draw(&mut app);
+        assert!(row_text(&buf, 1).starts_with("  1 line 1 "));
         app.handle(key(KeyCode::PageDown, KeyModifiers::NONE), now);
         let buf = draw(&mut app);
         assert!(row_text(&buf, 1).starts_with(" 22 line 22 "));
@@ -928,39 +980,318 @@ mod tests {
         app.handle(key(KeyCode::Down, KeyModifiers::NONE), now);
         let buf = draw(&mut app);
         assert!(row_text(&buf, 1).starts_with(" 23 line 23 "));
-
-        app.handle(key(KeyCode::Home, KeyModifiers::CONTROL), now);
-        let buf = draw(&mut app);
-        assert!(row_text(&buf, 1).starts_with("  1 line 1 "));
+        let tab_id = app.editor().active_tab().unwrap().id;
+        assert_eq!(
+            app.buffer.caret(tab_id),
+            Some(text_index(&app, "line 44\n"))
+        );
         fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// The char index of `needle` in the active tab's text.
+    fn text_index(app: &TermApp, needle: &str) -> usize {
+        let text = &app.editor().active_tab().unwrap().text;
+        text[..text.find(needle).unwrap()].chars().count()
+    }
+
     #[test]
-    fn reveal_selection_centres_the_last_set_selection() {
+    fn reveal_selection_centres_the_caret() {
         let dir = temp_dir("reveal");
         let file = long_file(&dir);
         let mut app = app(&dir, &[file], KeyboardMode::Enhanced);
         draw(&mut app);
         let tab_id = app.editor().active_tab().unwrap().id;
-        let text = app.editor().active_tab().unwrap().text.clone();
-        let start = text.find("line 50\n").unwrap();
+        let start = text_index(&app, "line 50\n");
         app.effects.push(Effect::SetSelection {
             tab_id,
             chars: start..start + 4,
-            focus: frext_core::editor::EditorFocus::Keep,
+            focus: EditorFocus::Keep,
         });
         app.effects.push(Effect::RevealSelection { tab_id });
         app.apply_effects();
         assert!(app.effects.is_empty());
+        assert_eq!(app.buffer.selection(tab_id), Some(start..start + 4));
         // Line 50 (index 49) centred in 22 rows: top index 38.
         let buf = draw(&mut app);
         assert!(row_text(&buf, 1).starts_with(" 39 line 39 "));
 
-        // A reveal with no selection in the same drain does nothing.
-        app.effects.push(Effect::RevealSelection { tab_id });
+        // A reveal for another tab does nothing.
+        app.handle(key(KeyCode::Home, KeyModifiers::CONTROL), Instant::now());
+        app.effects
+            .push(Effect::RevealSelection { tab_id: tab_id + 1 });
         app.apply_effects();
         let buf = draw(&mut app);
-        assert!(row_text(&buf, 1).starts_with(" 39 line 39 "));
+        assert!(row_text(&buf, 1).starts_with("  1 line 1 "));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// An app over one file holding `text`, drawn once.
+    fn app_with_text(dir: &Path, text: &str, keyboard: KeyboardMode) -> TermApp {
+        let file = dir.join("text.txt");
+        fs::write(&file, text).unwrap();
+        let mut app = app(dir, &[file], keyboard);
+        draw(&mut app);
+        app
+    }
+
+    fn text_of(app: &TermApp) -> &str {
+        &app.editor().active_tab().unwrap().text
+    }
+
+    fn press(app: &mut TermApp, code: KeyCode, modifiers: KeyModifiers, times: usize) {
+        for _ in 0..times {
+            app.handle(key(code, modifiers), Instant::now());
+        }
+    }
+
+    fn type_text(app: &mut TermApp, text: &str) {
+        for c in text.chars() {
+            app.handle(key(KeyCode::Char(c), KeyModifiers::NONE), Instant::now());
+        }
+    }
+
+    #[test]
+    fn typing_shows_the_text_marks_dirty_and_writes_the_swap() {
+        let dir = temp_dir("typing");
+        let mut app = app(&dir, &[], KeyboardMode::Enhanced);
+        draw(&mut app);
+        type_text(&mut app, "hi");
+        let tab = app.editor().active_tab().unwrap();
+        assert_eq!(tab.text, "hi");
+        assert!(tab.is_dirty());
+        let swap = dir
+            .join("state")
+            .join("swap")
+            .join(format!("{}.swp", tab.id));
+        assert_eq!(fs::read_to_string(swap).unwrap(), "hi");
+        let buf = draw(&mut app);
+        assert!(row_text(&buf, 1).starts_with(" 1 hi "));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn select_all_then_backspace_in_one_batch_empties_the_buffer() {
+        let dir = temp_dir("select-all");
+        let mut app = app_with_text(&dir, "hello\nworld", KeyboardMode::Enhanced);
+        let now = Instant::now();
+        app.handle(ctrl('a'), now);
+        app.handle(key(KeyCode::Backspace, KeyModifiers::NONE), now);
+        assert_eq!(text_of(&app), "");
+        assert!(app.editor().active_tab().unwrap().is_dirty());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn cut_then_undo_restores_the_text() {
+        let dir = temp_dir("cut-undo");
+        let mut app = app_with_text(&dir, "hello world", KeyboardMode::Enhanced);
+        press(&mut app, KeyCode::Right, KeyModifiers::SHIFT, 6);
+        app.handle(ctrl('x'), Instant::now());
+        assert_eq!(text_of(&app), "world");
+        let tab_id = app.editor().active_tab().unwrap().id;
+        assert_eq!(app.buffer.selection(tab_id), Some(0..0));
+        app.handle(ctrl('z'), Instant::now());
+        assert_eq!(text_of(&app), "hello world");
+        assert_eq!(app.buffer.selection(tab_id), Some(0..6));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn copy_and_paste_go_through_the_clipboard() {
+        let dir = temp_dir("copy-paste");
+        let mut app = app_with_text(&dir, "hello world", KeyboardMode::Enhanced);
+        press(&mut app, KeyCode::Right, KeyModifiers::SHIFT, 5);
+        app.handle(ctrl('c'), Instant::now());
+        assert_eq!(text_of(&app), "hello world");
+        assert!(!app.editor().active_tab().unwrap().is_dirty());
+
+        app.handle(key(KeyCode::End, KeyModifiers::CONTROL), Instant::now());
+        app.handle(ctrl('v'), Instant::now());
+        assert_eq!(text_of(&app), "hello worldhello");
+        let tab_id = app.editor().active_tab().unwrap().id;
+        assert_eq!(app.buffer.caret(tab_id), Some(16));
+        // The paste is one undo step.
+        app.handle(ctrl('z'), Instant::now());
+        assert_eq!(text_of(&app), "hello world");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn bracketed_paste_inserts_at_the_caret() {
+        let dir = temp_dir("bracketed");
+        let mut app = app_with_text(&dir, "ab", KeyboardMode::Enhanced);
+        app.handle(key(KeyCode::Right, KeyModifiers::NONE), Instant::now());
+        app.handle(
+            AppEvent::Input(Event::Paste("X\r\nY\rZ".to_owned())),
+            Instant::now(),
+        );
+        assert_eq!(text_of(&app), "aX\nY\nZb");
+        assert!(app.editor().active_tab().unwrap().is_dirty());
+        app.handle(ctrl('z'), Instant::now());
+        assert_eq!(text_of(&app), "ab");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn undo_and_both_redo_keys() {
+        let dir = temp_dir("undo-redo");
+        let mut app = app(&dir, &[], KeyboardMode::Enhanced);
+        draw(&mut app);
+        type_text(&mut app, "a");
+        app.handle(ctrl('z'), Instant::now());
+        assert_eq!(text_of(&app), "");
+        app.handle(
+            key(
+                KeyCode::Char('Z'),
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+            ),
+            Instant::now(),
+        );
+        assert_eq!(text_of(&app), "a");
+        app.handle(ctrl('z'), Instant::now());
+        assert_eq!(text_of(&app), "");
+        app.handle(ctrl('y'), Instant::now());
+        assert_eq!(text_of(&app), "a");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Draws `app` and returns the terminal cursor, if it is shown.
+    fn frame_cursor(app: &mut TermApp) -> Option<ratatui::layout::Position> {
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        terminal
+            .backend()
+            .cursor_visible()
+            .then(|| terminal.backend().cursor_position())
+    }
+
+    #[test]
+    fn the_caret_is_the_frame_cursor_only_in_the_editor() {
+        let dir = temp_dir("caret-cursor");
+        let ws = dir.join("ws");
+        fs::create_dir_all(&ws).unwrap();
+        let editor = open_editor(&dir, &[], Some(&ws));
+        let mut app = TermApp::new(editor, KeyboardMode::Enhanced, ws.clone(), None);
+        app.handle(ctrl('b'), Instant::now());
+        draw(&mut app);
+        type_text(&mut app, "hi");
+        // The gutter " 1 " is three columns wide.
+        assert_eq!(
+            frame_cursor(&mut app),
+            Some(ratatui::layout::Position { x: 5, y: 1 })
+        );
+
+        app.handle(ctrl('o'), Instant::now());
+        let cursor = frame_cursor(&mut app).unwrap();
+        assert_ne!(cursor, ratatui::layout::Position { x: 5, y: 1 });
+        app.handle(key(KeyCode::Esc, KeyModifiers::NONE), Instant::now());
+
+        app.handle(ctrl('b'), Instant::now());
+        app.handle(ctrl('e'), Instant::now());
+        assert_eq!(app.focus, Focus::Sidebar);
+        assert_eq!(frame_cursor(&mut app), None);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn set_selection_with_focus_moves_focus_from_the_sidebar() {
+        let dir = temp_dir("focus-effect");
+        let ws = dir.join("ws");
+        fs::create_dir_all(&ws).unwrap();
+        let file = ws.join("a.txt");
+        fs::write(&file, "hello").unwrap();
+        let editor = open_editor(&dir, std::slice::from_ref(&file), Some(&ws));
+        let mut app = TermApp::new(editor, KeyboardMode::Enhanced, ws.clone(), None);
+        draw(&mut app);
+        app.handle(ctrl('e'), Instant::now());
+        assert_eq!(app.focus, Focus::Sidebar);
+        let tab_id = app.editor().active_tab().unwrap().id;
+
+        app.effects.push(Effect::SetSelection {
+            tab_id,
+            chars: 1..3,
+            focus: EditorFocus::Keep,
+        });
+        app.apply_effects();
+        assert_eq!(app.focus, Focus::Sidebar);
+        assert_eq!(app.buffer.selection(tab_id), Some(1..3));
+
+        app.effects.push(Effect::SetSelection {
+            tab_id,
+            chars: 2..2,
+            focus: EditorFocus::Focus,
+        });
+        app.apply_effects();
+        assert_eq!(app.focus, Focus::Editor);
+        assert_eq!(app.buffer.selection(tab_id), Some(2..2));
+
+        // A selection for a tab that does not exist is dropped.
+        app.effects.push(Effect::SetSelection {
+            tab_id: tab_id + 100,
+            chars: 0..1,
+            focus: EditorFocus::Keep,
+        });
+        app.apply_effects();
+        assert_eq!(app.buffer.selection(tab_id + 100), None);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn legacy_ctrl_h_deletes_a_char() {
+        let dir = temp_dir("legacy-ctrl-h");
+        let mut app = app_with_text(&dir, "ab", KeyboardMode::Legacy);
+        app.handle(key(KeyCode::End, KeyModifiers::NONE), Instant::now());
+        app.handle(ctrl('h'), Instant::now());
+        assert_eq!(text_of(&app), "a");
+        assert!(!app.editor().search().is_open());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn editing_keys_do_nothing_while_the_sidebar_has_focus() {
+        let dir = temp_dir("sidebar-keys");
+        let ws = dir.join("ws");
+        fs::create_dir_all(&ws).unwrap();
+        let file = ws.join("a.txt");
+        fs::write(&file, "hello").unwrap();
+        let editor = open_editor(&dir, std::slice::from_ref(&file), Some(&ws));
+        let mut app = TermApp::new(editor, KeyboardMode::Legacy, ws.clone(), None);
+        draw(&mut app);
+        app.handle(
+            AppEvent::Input(Event::Paste("p".to_owned())),
+            Instant::now(),
+        );
+        app.handle(ctrl('a'), Instant::now());
+        app.handle(ctrl('c'), Instant::now());
+        app.handle(ctrl('e'), Instant::now());
+        assert_eq!(app.focus, Focus::Sidebar);
+        for event in [
+            ctrl('a'),
+            ctrl('x'),
+            ctrl('v'),
+            ctrl('z'),
+            ctrl('y'),
+            ctrl('h'),
+            key(KeyCode::Char('q'), KeyModifiers::NONE),
+            key(KeyCode::Backspace, KeyModifiers::NONE),
+            key(KeyCode::Enter, KeyModifiers::NONE),
+            AppEvent::Input(Event::Paste("zz".to_owned())),
+        ] {
+            app.handle(event, Instant::now());
+        }
+        assert_eq!(app.focus, Focus::Sidebar);
+        assert_eq!(text_of(&app), "phello");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn send_passes_the_selection_to_core() {
+        let dir = temp_dir("seed-search");
+        let mut app = app_with_text(&dir, "hello world", KeyboardMode::Enhanced);
+        press(&mut app, KeyCode::Right, KeyModifiers::SHIFT, 5);
+        app.handle(ctrl('f'), Instant::now());
+        assert!(app.editor().search().is_open());
+        assert_eq!(app.editor().search().query().pattern, "hello");
         fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -969,7 +1300,7 @@ mod tests {
         let dir = temp_dir("tick");
         let mut app = app(&dir, &[], KeyboardMode::Enhanced);
         let start = Instant::now();
-        app.handle(AppEvent::Input(Event::Paste("x".to_owned())), start);
+        app.handle(ctrl('f'), start);
         app.handle(AppEvent::Tick, start + Duration::from_secs(3));
         assert!(app.status.message().is_some());
         app.handle(AppEvent::Tick, start + Duration::from_secs(4));
