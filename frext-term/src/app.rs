@@ -230,6 +230,13 @@ impl TermApp {
     /// Persists an edit the buffer view made to the active tab.
     fn after_edit(&mut self, applied: Applied) {
         if applied == Applied::Edited {
+            // The caret places the edit for the search-within-selection
+            // scope, so core needs it before the commit.
+            let selection = self
+                .editor
+                .active_tab()
+                .and_then(|tab| self.buffer.selection(tab.id));
+            self.editor.set_selection(selection);
             self.editor.commit_edit();
             // The dirty marker changes the tab's width in the tab bar.
             self.forget_layout();
@@ -2400,6 +2407,65 @@ mod tests {
                 "{m:?} outside {line_two:?}"
             );
         }
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn typing_repeated_text_before_an_in_selection_scope_moves_it() {
+        let dir = temp_dir("find-in-selection-repeated");
+        let mut app = app_with_text(&dir, "foo foo foo", KeyboardMode::Enhanced);
+        press(&mut app, KeyCode::Right, KeyModifiers::NONE, 4);
+        press(&mut app, KeyCode::Right, KeyModifiers::SHIFT, 3);
+        assert_eq!(app.buffer.selection(active_id(&app)), Some(4..7));
+        app.handle(ctrl('f'), Instant::now());
+        assert_eq!(app.editor().search().query().pattern, "foo");
+        app.handle(alt('l'), Instant::now());
+        assert_eq!(app.editor().search().count_label(), "1/1");
+
+        // The start of the text is on row 2 below the open bar.
+        draw(&mut app);
+        left_click(&mut app, 3, 2);
+        assert_eq!(app.focus, Focus::Editor);
+        type_text(&mut app, "foo ");
+
+        assert_eq!(text_of(&app), "foo foo foo foo");
+        assert_eq!(app.editor().search().count_label(), "1/1");
+        assert_eq!(
+            app.editor().search().matches(),
+            std::slice::from_ref(&(8..11))
+        );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn pasting_repeated_text_after_an_in_selection_scope_leaves_it() {
+        let dir = temp_dir("find-in-selection-repeated-paste");
+        let mut app = app_with_text(&dir, "foo foo foo", KeyboardMode::Enhanced);
+        press(&mut app, KeyCode::Right, KeyModifiers::NONE, 4);
+        press(&mut app, KeyCode::Right, KeyModifiers::SHIFT, 3);
+        app.handle(ctrl('f'), Instant::now());
+        app.handle(alt('l'), Instant::now());
+        assert_eq!(
+            app.editor().search().matches(),
+            std::slice::from_ref(&(4..7))
+        );
+
+        // Click just past the scope (char 7, on row 2 below the open bar)
+        // and paste: only the caret after the paste tells core the text
+        // went after the scope rather than before it.
+        draw(&mut app);
+        left_click(&mut app, 10, 2);
+        assert_eq!(app.focus, Focus::Editor);
+        app.handle(
+            AppEvent::Input(Event::Paste(" foo".to_owned())),
+            Instant::now(),
+        );
+
+        assert_eq!(text_of(&app), "foo foo foo foo");
+        assert_eq!(
+            app.editor().search().matches(),
+            std::slice::from_ref(&(4..7))
+        );
         fs::remove_dir_all(&dir).unwrap();
     }
 

@@ -312,6 +312,10 @@ impl Editor {
     /// The view mutated the active buffer (through
     /// [`Self::active_view_mut`]): persist its swap file and, while the find
     /// bar is open, refresh the matches so they track the edit.
+    ///
+    /// Report the selection after the edit with [`Self::set_selection`]
+    /// first: its end is the caret that places the edit in repeated text,
+    /// so a search-within-selection scope moves with the text it covers.
     pub fn commit_edit(&mut self) {
         self.persist_active_swap();
         if self.search.is_open() {

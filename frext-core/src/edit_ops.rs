@@ -53,17 +53,60 @@ pub fn replace_range(text: &mut String, start: usize, end: usize, insert: &str) 
     lo + insert.chars().count()
 }
 
+/// Map the char range `range` through one edit that replaced the `removed`
+/// chars starting at char `at` with `inserted` chars.
+///
+/// A start before `at` is kept, and an end at or before `at` is kept. A
+/// boundary at or after `at + removed` shifts by `inserted - removed`. A start
+/// inside the removed text moves to `at`, and an end inside it moves to
+/// `at + inserted`. So text inserted exactly at either boundary lands outside
+/// the range. The result always has `start <= end`.
+#[must_use]
+pub fn shift_range(
+    range: Range<usize>,
+    at: usize,
+    removed: usize,
+    inserted: usize,
+) -> Range<usize> {
+    let removed_end = at.saturating_add(removed);
+    let shift = |x: usize| x.saturating_sub(removed).saturating_add(inserted);
+    let start = if range.start < at {
+        range.start
+    } else if range.start >= removed_end {
+        shift(range.start)
+    } else {
+        at
+    };
+    let end = if range.end <= at {
+        range.end
+    } else if range.end >= removed_end {
+        shift(range.end)
+    } else {
+        at.saturating_add(inserted)
+    };
+    start.min(end)..end
+}
+
 /// Map the char range `range` of `before` onto `after`, the same buffer after
 /// one edit, so it keeps covering the same text.
 ///
-/// The edit is located from the common prefix and suffix (in chars) of the two
-/// strings. A position before the edit is unchanged, and one after it shifts
-/// by the change in length. A start inside the edit moves to the edit start,
-/// and an end inside it moves to the end of the inserted text. The result is
-/// clamped so `start <= end <= after`'s char count; identical strings return
-/// `range` unchanged apart from that clamp.
+/// The edit is the minimal one between the two strings: everything outside
+/// their common prefix and (non-overlapping) common suffix, in chars. In
+/// repeated text the same edit can sit at several positions that all turn
+/// `before` into `after` (inserting `"a"` anywhere in `"aaa"`), so `caret`,
+/// the char caret the view reported after the edit, picks one: preferably
+/// the position whose inserted text ends at the caret, else the one that
+/// starts at the caret, else the end of the common prefix. The range is
+/// then moved through that edit with [`shift_range`] and clamped to
+/// `after`'s char count; identical strings return `range` unchanged apart
+/// from that clamp.
 #[must_use]
-pub fn track_range(range: Range<usize>, before: &str, after: &str) -> Range<usize> {
+pub fn track_range(
+    range: Range<usize>,
+    before: &str,
+    after: &str,
+    caret: Option<usize>,
+) -> Range<usize> {
     let before_len = before.chars().count();
     let after_len = after.chars().count();
     let prefix = before
@@ -71,31 +114,32 @@ pub fn track_range(range: Range<usize>, before: &str, after: &str) -> Range<usiz
         .zip(after.chars())
         .take_while(|(a, b)| a == b)
         .count();
-    // The suffix never overlaps the prefix in either string.
-    let suffix = before
+    let suffix_full = before
         .chars()
         .rev()
         .zip(after.chars().rev())
-        .take(before_len.min(after_len).saturating_sub(prefix))
         .take_while(|(a, b)| a == b)
         .count();
-    let old_end = before_len.saturating_sub(suffix);
-    let new_end = after_len.saturating_sub(suffix);
+    // The suffix of the minimal edit never overlaps the prefix in either
+    // string.
+    let suffix = suffix_full.min(before_len.min(after_len).saturating_sub(prefix));
+    let removed = before_len.saturating_sub(prefix + suffix);
+    let inserted = after_len.saturating_sub(prefix + suffix);
 
-    let map = |x: usize, inside: usize| {
-        if x <= prefix {
-            x
-        } else if x >= old_end {
-            // `x >= before_len - suffix` and `after_len >= suffix`, so this
-            // never underflows before saturating.
-            (x + after_len).saturating_sub(before_len)
-        } else {
-            inside
-        }
+    // The edit can start at any `x` in `lowest..=prefix`: `before` and
+    // `after` agree on their first `x` chars, and on everything after the
+    // edit when its tail fits in the full common suffix.
+    let lowest = before_len.saturating_sub(removed + suffix_full).min(prefix);
+    let valid = |x: usize| (lowest..=prefix).contains(&x);
+    let at = match caret {
+        Some(c) if c >= inserted && valid(c - inserted) => c - inserted,
+        Some(c) if valid(c) => c,
+        _ => prefix,
     };
-    let end = map(range.end, new_end).min(after_len);
-    let start = map(range.start, prefix).min(end);
-    start..end
+
+    let mapped = shift_range(range, at, removed, inserted);
+    let end = mapped.end.min(after_len);
+    mapped.start.min(end)..end
 }
 
 #[cfg(test)]
@@ -173,49 +217,175 @@ mod tests {
 
     #[test]
     fn track_range_shifts_past_an_insert_before_it() {
-        assert_eq!(track_range(6..11, "hello world", "XXhello world"), 8..13);
+        assert_eq!(
+            track_range(6..11, "hello world", "XXhello world", None),
+            8..13
+        );
     }
 
     #[test]
     fn track_range_ignores_an_insert_after_it() {
-        assert_eq!(track_range(0..5, "hello world", "hello world!"), 0..5);
+        assert_eq!(track_range(0..5, "hello world", "hello world!", None), 0..5);
     }
 
     #[test]
     fn track_range_moves_a_deleted_start_to_the_edit_start() {
         // "bcd" (chars 1..4) is deleted; the range "cde" keeps only "e".
-        assert_eq!(track_range(2..5, "abcdef", "aef"), 1..2);
+        assert_eq!(track_range(2..5, "abcdef", "aef", None), 1..2);
     }
 
     #[test]
     fn track_range_extends_over_an_insert_inside_it() {
         // "XY" is inserted at char 2, inside "bcd" (chars 1..4).
-        assert_eq!(track_range(1..4, "abcdef", "abXYcdef"), 1..6);
+        assert_eq!(track_range(1..4, "abcdef", "abXYcdef", None), 1..6);
     }
 
     #[test]
     fn track_range_collapses_onto_a_replacement_spanning_it() {
         // "bcde" (chars 1..5) becomes "Z", swallowing the range "cd".
-        assert_eq!(track_range(2..4, "abcdef", "aZf"), 1..2);
+        assert_eq!(track_range(2..4, "abcdef", "aZf", None), 1..2);
     }
 
     #[test]
     fn track_range_leaves_identical_text_alone_but_clamps() {
-        assert_eq!(track_range(1..2, "abc", "abc"), 1..2);
-        assert_eq!(track_range(1..10, "abc", "abc"), 1..3);
+        assert_eq!(track_range(1..2, "abc", "abc", None), 1..2);
+        assert_eq!(track_range(1..10, "abc", "abc", None), 1..3);
     }
 
     #[test]
     fn track_range_counts_chars_not_bytes() {
         // "本" (char 1) shifts by one char, not by the inserted byte count.
-        assert_eq!(track_range(1..2, "日本語", "x日本語"), 2..3);
-        assert_eq!(track_range(0..2, "日本語", "日本語éé"), 0..2);
+        assert_eq!(track_range(1..2, "日本語", "x日本語", None), 2..3);
+        assert_eq!(track_range(0..2, "日本語", "日本語éé", None), 0..2);
     }
 
     #[test]
     fn track_range_handles_empty_text() {
-        assert_eq!(track_range(0..0, "", "abc"), 0..0);
-        assert_eq!(track_range(1..2, "abc", ""), 0..0);
-        assert_eq!(track_range(0..0, "", ""), 0..0);
+        assert_eq!(track_range(0..0, "", "abc", None), 0..0);
+        assert_eq!(track_range(1..2, "abc", "", None), 0..0);
+        assert_eq!(track_range(0..0, "", "", None), 0..0);
+    }
+
+    #[test]
+    fn shift_range_shifts_past_an_edit_before_it() {
+        // "xy" (chars 1..3) becomes "z": the range after it moves back one.
+        assert_eq!(shift_range(5..8, 1, 2, 1), 4..7);
+    }
+
+    #[test]
+    fn shift_range_ignores_an_edit_after_it() {
+        assert_eq!(shift_range(1..3, 5, 2, 7), 1..3);
+    }
+
+    #[test]
+    fn shift_range_moves_an_overlapped_start_to_the_edit_start() {
+        // Chars 2..6 are replaced by 1 char; the range 4..8 keeps 6..8.
+        assert_eq!(shift_range(4..8, 2, 4, 1), 2..5);
+    }
+
+    #[test]
+    fn shift_range_moves_an_overlapped_end_to_the_inserted_end() {
+        // Chars 3..7 are replaced by 2 chars; the range 1..5 keeps 1..3 plus
+        // the inserted text.
+        assert_eq!(shift_range(1..5, 3, 4, 2), 1..5);
+        assert_eq!(shift_range(1..5, 3, 4, 0), 1..3);
+    }
+
+    #[test]
+    fn shift_range_puts_an_insertion_at_the_start_outside() {
+        assert_eq!(shift_range(4..7, 4, 0, 3), 7..10);
+    }
+
+    #[test]
+    fn shift_range_puts_an_insertion_at_the_end_outside() {
+        assert_eq!(shift_range(4..7, 7, 0, 3), 4..7);
+    }
+
+    #[test]
+    fn shift_range_collapses_onto_a_replacement_spanning_it() {
+        assert_eq!(shift_range(3..5, 1, 6, 2), 1..3);
+    }
+
+    #[test]
+    fn shift_range_handles_deleting_everything() {
+        assert_eq!(shift_range(2..5, 0, 9, 0), 0..0);
+        assert_eq!(shift_range(0..9, 0, 9, 0), 0..0);
+    }
+
+    #[test]
+    fn shift_range_never_overflows() {
+        assert_eq!(shift_range(5..usize::MAX, 0, 0, 3), 8..usize::MAX);
+        assert_eq!(shift_range(0..1, usize::MAX, usize::MAX, 1), 0..1);
+    }
+
+    #[test]
+    fn track_range_aligns_an_insertion_in_repeated_text_with_the_caret() {
+        // An "a" typed at 0 leaves the caret at 1; "aaa" (2..5) moves on.
+        assert_eq!(track_range(2..5, "aaaaZ", "aaaaaZ", Some(1)), 3..6);
+        // "foo " typed at 0 leaves the caret at 4; the middle "foo" moves on.
+        assert_eq!(
+            track_range(4..7, "foo foo foo", "foo foo foo foo", Some(4)),
+            8..11
+        );
+    }
+
+    #[test]
+    fn track_range_without_a_caret_uses_the_common_prefix() {
+        assert_eq!(track_range(2..5, "aaaaZ", "aaaaaZ", None), 2..6);
+        assert_eq!(
+            track_range(4..7, "foo foo foo", "foo foo foo foo", None),
+            4..7
+        );
+    }
+
+    #[test]
+    fn track_range_aligns_a_deletion_with_a_caret_at_its_start() {
+        // The Delete key removes the "a" at 0, leaving the caret at 0.
+        assert_eq!(track_range(2..4, "aaaa", "aaa", Some(0)), 1..3);
+        // Without the caret the deletion is placed at the end.
+        assert_eq!(track_range(2..4, "aaaa", "aaa", None), 2..3);
+    }
+
+    #[test]
+    fn track_range_ignores_a_caret_no_alignment_allows() {
+        // The edit can only be at char 6; a caret elsewhere is ignored.
+        assert_eq!(
+            track_range(0..5, "hello world", "hello XXworld", Some(2)),
+            0..5
+        );
+        assert_eq!(
+            track_range(6..11, "hello world", "hello XXworld", Some(2)),
+            8..13
+        );
+    }
+
+    #[test]
+    fn track_range_alignments_reproduce_the_edit() {
+        // Every alignment the caret can pick turns `before` into `after`.
+        let cases = [
+            ("aaaaZ", "aaaaaZ"),
+            ("foo foo foo", "foo foo foo foo"),
+            ("aaaa", "aaa"),
+            ("abab", "ababab"),
+            ("xabab", "xab"),
+        ];
+        for (before, after) in cases {
+            let before_len = before.chars().count();
+            let after_len = after.chars().count();
+            for caret in 0..=after_len {
+                // A one-char range at every position, tracked with this
+                // caret, must cover the same char in `after`.
+                for i in 0..before_len {
+                    let mapped = track_range(i..i + 1, before, after, Some(caret));
+                    if mapped.len() == 1 {
+                        assert_eq!(
+                            before.chars().nth(i),
+                            after.chars().nth(mapped.start),
+                            "{before:?} -> {after:?}, caret {caret}, char {i}"
+                        );
+                    }
+                }
+            }
+        }
     }
 }

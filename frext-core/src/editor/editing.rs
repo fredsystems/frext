@@ -29,7 +29,10 @@ impl Editor {
         let Some(tab) = self.tabs.get_mut(self.active) else {
             return Outcome::default();
         };
+        let old_len = tab.text.chars().count();
         let caret = edit_ops::delete_range(&mut tab.text, selection.start, selection.end);
+        let removed = old_len.saturating_sub(tab.text.chars().count());
+        self.track_scope_edit(caret, removed, 0);
         self.edited_with_caret(caret)
     }
 
@@ -59,7 +62,11 @@ impl Editor {
         let Some(tab) = self.tabs.get_mut(self.active) else {
             return Outcome::default();
         };
+        let old_len = tab.text.chars().count();
         let caret = edit_ops::replace_range(&mut tab.text, selection.start, selection.end, &clip);
+        let inserted = clip.chars().count();
+        let removed = (old_len + inserted).saturating_sub(tab.text.chars().count());
+        self.track_scope_edit(caret.saturating_sub(inserted), removed, inserted);
         self.edited_with_caret(caret)
     }
 
@@ -94,10 +101,11 @@ impl Editor {
         if tab.text.get(bytes.clone()) != Some(flagged) {
             return Outcome::default();
         }
-        let caret = tab.text.get(..bytes.start).map_or(0, |s| s.chars().count())
-            + replacement.chars().count();
+        let at = tab.text.get(..bytes.start).map_or(0, |s| s.chars().count());
+        let inserted = replacement.chars().count();
         tab.text.replace_range(bytes, replacement);
-        self.edited_with_caret(caret)
+        self.track_scope_edit(at, flagged.chars().count(), inserted);
+        self.edited_with_caret(at + inserted)
     }
 
     /// Add `word` to the personal dictionary, saving it unless the

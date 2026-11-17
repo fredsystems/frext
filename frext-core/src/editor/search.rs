@@ -209,26 +209,43 @@ impl Editor {
     }
 
     /// The captured search-within-selection scope as a byte range of the
-    /// active buffer, after moving it through any edit made since it was
-    /// last mapped. `None` (search the whole buffer) when the option is off,
-    /// nothing was captured, the scope belongs to another tab, or it is
-    /// empty.
+    /// active buffer, after moving it through any view edit made since it
+    /// was last mapped (aligned with the caret the view reported). `None`
+    /// (search the whole buffer) when the option is off, nothing was
+    /// captured, the scope belongs to another tab, or it is empty.
     fn scope_bytes(&mut self) -> Option<Range<usize>> {
         if !self.search.in_selection {
             return None;
         }
+        let caret = self.active_selection().map(|selection| selection.end);
         let tab = self.tabs.get(self.active)?;
         let scope = self.search.scope.as_mut()?;
         if scope.tab_id != tab.id {
             return None;
         }
         if scope.base != tab.text {
-            scope.chars = edit_ops::track_range(scope.chars.clone(), &scope.base, &tab.text);
+            scope.chars = edit_ops::track_range(scope.chars.clone(), &scope.base, &tab.text, caret);
             scope.base.clone_from(&tab.text);
         }
         let start = offsets::byte_of_char(&tab.text, scope.chars.start);
         let end = offsets::byte_of_char(&tab.text, scope.chars.end);
         (start < end).then_some(start..end)
+    }
+
+    /// A core command just replaced the `removed` chars at char `at` of the
+    /// active buffer with `inserted` chars: move the active tab's scope, if
+    /// any, through that edit and re-base it on the new text. Call it after
+    /// mutating the text and before re-finding.
+    pub(super) fn track_scope_edit(&mut self, at: usize, removed: usize, inserted: usize) {
+        let Some(tab) = self.tabs.get(self.active) else {
+            return;
+        };
+        if let Some(scope) = self.search.scope.as_mut()
+            && scope.tab_id == tab.id
+        {
+            scope.chars = edit_ops::shift_range(scope.chars.clone(), at, removed, inserted);
+            scope.base.clone_from(&tab.text);
+        }
     }
 
     /// Close the find bar, clearing the live match cache so highlights
@@ -245,13 +262,15 @@ impl Editor {
     pub(super) fn recompute_matches(&mut self) {
         self.search.error = None;
         self.search.matches.clear();
+        // Refreshed even with no pattern, so the scope follows each edit
+        // rather than one merged diff of several.
+        let scope = self.scope_bytes();
 
         if self.search.query.is_empty() {
             self.search.current = None;
             return;
         }
 
-        let scope = self.scope_bytes();
         let Some(tab) = self.tabs.get(self.active) else {
             self.search.current = None;
             return;
@@ -372,7 +391,13 @@ impl Editor {
         else {
             return Outcome::default();
         };
+        let at = offsets::char_of_byte(&tab.text, range.start);
+        let removed = tab.text.get(range.clone()).map_or(0, |m| m.chars().count());
+        let old_len = tab.text.chars().count();
+        let new_len = new_text.chars().count();
         tab.text = new_text;
+        let inserted = (new_len + removed).saturating_sub(old_len);
+        self.track_scope_edit(at, removed, inserted);
         self.persist_active_swap();
         // Keep the cursor near where we just replaced.
         self.recompute_matches();
@@ -416,6 +441,7 @@ impl Editor {
             return BufferChange::Unchanged;
         };
 
+        let scoped = scope.is_some();
         let new_text = match scope {
             Some(scope) => matcher.replace_all_in(&tab.text, scope, &self.search.replacement),
             None => matcher.replace_all(&tab.text, &self.search.replacement),
@@ -423,7 +449,18 @@ impl Editor {
         let change = if new_text == tab.text {
             BufferChange::Unchanged
         } else {
+            let old_len = tab.text.chars().count();
+            let new_len = new_text.chars().count();
             tab.text = new_text;
+            // Every replacement lies inside the scope, so only its end moves.
+            if scoped && let Some(scope) = self.search.scope.as_mut() {
+                scope.chars.end = scope
+                    .chars
+                    .end
+                    .saturating_add(new_len)
+                    .saturating_sub(old_len);
+                scope.base.clone_from(&tab.text);
+            }
             self.persist_active_swap();
             BufferChange::Edited
         };
@@ -1320,6 +1357,160 @@ mod tests {
         editor.commit_edit();
 
         assert_eq!(editor.search().matches(), [2..3, 4..5]);
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A view edit: report the caret the edit leaves, set the text, commit.
+    fn view_edit(editor: &mut Editor, text: &str, caret: usize) {
+        editor.set_selection(Some(caret..caret));
+        editor.active_view_mut().unwrap().tab.text = text.to_owned();
+        editor.commit_edit();
+    }
+
+    /// An editor on `text` with the find bar open, `pattern` searched and
+    /// search-within-selection captured over `scope` (chars).
+    fn scoped(dir: &Path, text: &str, pattern: &str, scope: Range<usize>) -> Editor {
+        let mut editor = editor_with_two_tabs(dir, text, "");
+        editor.apply(Command::OpenSearch(SearchBar::Find));
+        find(&mut editor, pattern);
+        editor.set_selection(Some(scope));
+        editor.apply(Command::ToggleSearchOption(SearchOption::InSelection));
+        editor
+    }
+
+    #[test]
+    fn edits_with_an_empty_pattern_still_move_the_scope() {
+        let dir = temp_dir("scope-empty-pattern");
+        let mut editor = scoped(&dir, "foo\nfoo\nfoo", "foo", 4..7);
+        assert_eq!(editor.search().matches(), std::slice::from_ref(&(4..7)));
+        find(&mut editor, "");
+
+        view_edit(&mut editor, "Xfoo\nfoo\nfoo", 1);
+        view_edit(&mut editor, "Xfoo\nfoo\nfooY", 13);
+        find(&mut editor, "foo");
+        assert_eq!(editor.search().matches(), std::slice::from_ref(&(5..8)));
+
+        *editor.search_replacement_mut() = "z".to_owned();
+        editor.apply(Command::ReplaceAll);
+        assert_eq!(editor.active_tab().unwrap().text, "Xfoo\nz\nfooY");
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_view_edit_in_repeated_text_moves_the_scope_with_the_caret() {
+        let dir = temp_dir("scope-repeated-view-edit");
+        let mut editor = scoped(&dir, "foo foo foo", "foo", 4..7);
+        assert_eq!(editor.search().matches(), std::slice::from_ref(&(4..7)));
+
+        // "foo " typed at the start leaves the caret at 4.
+        view_edit(&mut editor, "foo foo foo foo", 4);
+
+        assert_eq!(editor.search().matches(), std::slice::from_ref(&(8..11)));
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_paste_in_repeated_text_moves_the_scope_exactly() {
+        let dir = temp_dir("scope-repeated-paste");
+        let mut editor = scoped(&dir, "foo foo foo", "foo", 4..7);
+        editor.clipboard.write_text("foo ".to_owned());
+        editor.set_selection(Some(0..0));
+        editor.apply(Command::Paste);
+        assert_eq!(editor.active_tab().unwrap().text, "foo foo foo foo");
+        assert_eq!(editor.search().matches(), std::slice::from_ref(&(8..11)));
+        fs::remove_dir_all(&dir).unwrap();
+
+        // Pasted right after the scope, the text stays outside it, even
+        // though the stale reported caret (7) would place the edit before it.
+        let dir = temp_dir("scope-repeated-paste-after");
+        let mut editor = scoped(&dir, "foo foo foo", "foo", 4..7);
+        editor.clipboard.write_text(" foo".to_owned());
+        editor.set_selection(Some(7..7));
+        editor.apply(Command::Paste);
+        assert_eq!(editor.active_tab().unwrap().text, "foo foo foo foo");
+        assert_eq!(editor.search().matches(), std::slice::from_ref(&(4..7)));
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn applying_a_suggestion_before_the_scope_moves_it_exactly() {
+        let dir = temp_dir("scope-apply-suggestion");
+        let mut editor = scoped(&dir, "foo foo foo", "foo", 4..7);
+        // The caret sits at the end of the buffer, where a text diff would
+        // place the inserted "foo " after the scope's start.
+        editor.set_selection(Some(11..11));
+
+        editor.apply(Command::ApplySuggestion {
+            bytes: 0..3,
+            flagged: "foo".to_owned(),
+            replacement: "foo foo".to_owned(),
+        });
+
+        assert_eq!(editor.active_tab().unwrap().text, "foo foo foo foo");
+        assert_eq!(editor.search().matches(), std::slice::from_ref(&(8..11)));
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_cut_before_the_scope_moves_it_exactly() {
+        let dir = temp_dir("scope-cut");
+        let mut editor = scoped(&dir, "foo foo foo", "foo", 4..7);
+        // Cut the first "foo ": a diff could equally have removed the scope's
+        // own "foo ".
+        editor.set_selection(Some(0..4));
+        editor.apply(Command::Cut);
+        assert_eq!(editor.active_tab().unwrap().text, "foo foo");
+        assert_eq!(editor.search().matches(), std::slice::from_ref(&(0..3)));
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn replace_current_inside_the_scope_keeps_the_rest_of_it() {
+        let dir = temp_dir("scope-replace-current");
+        let mut editor = in_selection_over_line_one(&dir, "");
+        *editor.search_replacement_mut() = "bbb".to_owned();
+
+        editor.apply(Command::ReplaceCurrent);
+        assert_eq!(editor.active_tab().unwrap().text, "bbb a\na a");
+        assert_eq!(editor.search().matches(), std::slice::from_ref(&(4..5)));
+
+        editor.apply(Command::ReplaceCurrent);
+        assert_eq!(editor.active_tab().unwrap().text, "bbb bbb\na a");
+        assert!(editor.search().matches().is_empty());
+
+        // The scope now covers exactly the rewritten line 1.
+        find(&mut editor, "b");
+        assert_eq!(editor.search().matches().len(), 6);
+        assert!(editor.search().matches().iter().all(|m| m.end <= 7));
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn replace_all_inside_the_scope_then_an_edit_stays_correct() {
+        let dir = temp_dir("scope-replace-all-then-edit");
+        // The scope is the first "aa"; each "a" in it becomes "aa".
+        let mut editor = scoped(&dir, "aa aa", "a", 0..2);
+        assert_eq!(editor.search().matches(), [0..1, 1..2]);
+        *editor.search_replacement_mut() = "aa".to_owned();
+
+        editor.apply(Command::ReplaceAll);
+        assert_eq!(editor.active_tab().unwrap().text, "aaaa aa");
+        assert_eq!(editor.search().matches(), [0..1, 1..2, 2..3, 3..4]);
+
+        // An "a" typed after the space stays outside the scope.
+        view_edit(&mut editor, "aaaa aaa", 6);
+        assert_eq!(editor.search().matches(), [0..1, 1..2, 2..3, 3..4]);
+
+        // One typed at the start lands outside it too.
+        view_edit(&mut editor, "Xaaaa aaa", 1);
+        assert_eq!(editor.search().matches(), [1..2, 2..3, 3..4, 4..5]);
 
         fs::remove_dir_all(&dir).unwrap();
     }
