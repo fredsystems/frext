@@ -1,5 +1,6 @@
 [workspace]
-members = ["frext-core", "frext", "frext-term"]
+members = ["frext-core", "frext", "frext-term", "xtask"]
+default-members = ["frext-core", "frext", "frext-term"]
 resolver = "3"
 
 [workspace.package]
