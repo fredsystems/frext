@@ -598,7 +598,7 @@ impl TermApp {
             } else {
                 Enablement::Disabled
             };
-            self.menu = Some(ContextMenu::new(editor_menu::entries(selection), at));
+            self.menu = Some(ContextMenu::new(editor_menu::entries(selection, None), at));
             // The chosen command acts on the editor's selection.
             self.set_focus(Focus::Editor);
         }
@@ -2084,7 +2084,7 @@ mod tests {
         assert_eq!(
             menu,
             &ContextMenu::new(
-                editor_menu::entries(Enablement::Enabled),
+                editor_menu::entries(Enablement::Enabled, None),
                 Position::new(20, 1),
             )
         );
@@ -2102,7 +2102,7 @@ mod tests {
         assert_eq!(
             app.menu.as_ref().unwrap(),
             &ContextMenu::new(
-                editor_menu::entries(Enablement::Disabled),
+                editor_menu::entries(Enablement::Disabled, None),
                 Position::new(10, 1)
             )
         );
