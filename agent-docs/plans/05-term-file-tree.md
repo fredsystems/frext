@@ -672,8 +672,9 @@ Deliverable: tests (`left_click`, `right_click`, `mouse` helpers):
   row the folder menu; the empty area the folder menu for the root;
   choosing `New file…` from the root menu opens the new-file prompt,
   and submitting a name creates and opens the file
-- dragging the border from its column to column 40 makes the sidebar
-  40 wide (the gutter moves), and a drag past the limits clamps
+- dragging the border from its column to column 39 makes the sidebar
+  40 wide (the border sits under the mouse; the gutter moves), and a
+  drag past the limits clamps
 - the wheel over a long tree (40 files in a 24-row terminal) scrolls
   it, and stops at the end
 - hovering `[x]` shows `Close file tree` on the status line
