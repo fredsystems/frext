@@ -1,6 +1,6 @@
 # 03 -- TUI buffer view (editor widget)
 
-- **Status:** pending merge
+- **Status:** complete
 - **Depends on:** 02
 - **Branch:** `feat/frext-term-buffer-view` (one branch, one commit per
   subtask, one PR)

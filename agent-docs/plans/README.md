@@ -39,8 +39,8 @@ That boundary is what keeps the two front ends honest.
 | --- | ----------------------------------------------------------------- | ------------- | ---------- |
 | 01  | [Core extraction (`frext-core`)](01-core-extraction.md)           | complete      | none       |
 | 02  | [`frext-term` shell](02-term-shell.md)                            | complete      | 01         |
-| 03  | [TUI buffer view (editor widget)](03-term-buffer-view.md)         | pending merge | 02         |
-| 04  | [TUI find and replace](04-term-find-replace.md)                   | stub          | 03         |
+| 03  | [TUI buffer view (editor widget)](03-term-buffer-view.md)         | complete      | 02         |
+| 04  | [TUI find and replace](04-term-find-replace.md)                   | active        | 03         |
 | 05  | [TUI file-tree sidebar](05-term-file-tree.md)                     | stub          | 02         |
 | 06  | [Terminal capabilities and undercurl](06-term-capabilities.md)    | stub          | 02         |
 | 07  | [TUI proofreading](07-term-proofreading.md)                       | stub          | 03, 06     |
