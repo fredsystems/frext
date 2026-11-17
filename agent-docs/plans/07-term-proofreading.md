@@ -14,7 +14,7 @@ fix-it menu as the GUI: Harper's message, suggested replacements,
 ## Task summary
 
 - Underlines: for each diagnostic from
-  `ActiveView::proofread.diagnostics(tab.id, &tab.text)`, cells covering
+  `Editor::proofread().diagnostics(tab.id, &tab.text)`, cells covering
   its char range get `Modifier::UNDERLINED` plus `underline_color` from
   `palette::spelling_squiggle()` (red) or `grammar_squiggle()` (green).
   `FrextBackend` (plan 06) turns that into undercurl, or a straight
@@ -82,7 +82,8 @@ These come from reading the current code: `frext-core`'s
     `begin_frame`, the worker calls it after each result, the `Wake`
     batch ends `next_batch`, and every batch is followed by
     `begin_frame` (which polls) and a full redraw. No new wiring is
-    needed; 07.3 pins it with a test that drives the same path.
+    needed. 07.3 pins notify, poll and the next draw; the waker's
+    `Wake` hop is covered by `events.rs`'s tests.
   - `ApplySuggestion` is already in `TermApp::send`'s list of edits
     recorded as one undo group. `AddToDictionary` and `Ignore` return
     no effects.
@@ -163,12 +164,15 @@ These come from reading the current code: `frext-core`'s
   rendered rect and layout):
   - `pub fn char_at_cell(&self, tab: &Tab, column: u16, row: u16) ->
     Option<usize>`: `None` when the cell is outside the editor rect
-    or the view has no layout for `tab`; else the same char
-    `char_at_cell` gives a click there.
+    or the view has no fresh layout for `tab` (see `caret_cell`); else
+    the same char `char_at_cell` gives a click there. (07.9 replaces it
+    with `grapheme_at_cell`.)
   - `pub fn caret_cell(&self, tab: &Tab) -> Option<Position>`: the
     caret's screen cell, computed by the same function `render` uses
-    (so `None` when scrolled off or past the right edge, or when the
-    view does not know `tab`).
+    (so `None` when scrolled off or past the right edge). Both queries
+    are `None` when the view does not know `tab`, or its stored layout
+    is stale for `tab`'s current text or the rect's width (a private
+    `fresh_layout` checks the text hash and wrap width).
   - `pub const fn rect(&self) -> Rect`: the editor rect of the last
     render (the keyboard menu's fallback anchor is its top-left).
 - **The keyboard binding.** `keymap::Action::OpenEditorMenu`, returned
@@ -312,8 +316,9 @@ Deliverable: tests in `render.rs` (build `Diagnostic` values
 directly; their fields are public):
 
 - a spelling diagnostic underlines exactly its cells: each has
-  `Modifier::UNDERLINED` and `underline_color ==
-  Some(theme::squiggle(Spelling))`; the cells before and after do not
+  `Modifier::UNDERLINED` and an `underline_color` of
+  `theme::squiggle(Spelling)` (ratatui 0.30 stores a plain `Color`;
+  `Reset` means none); the cells before and after do not
 - grammar uses `theme::squiggle(Grammar)`
 - a diagnostic across a soft wrap is underlined on both rows, and the
   cell after the last char of a line (the newline cell) is not, even
@@ -495,32 +500,180 @@ on right-click; do NOT proceed further.
 
 Stop: report files changed and verification; await review.
 
-### 07.7 -- Cleanup (deferred): keyboard menu after an unrendered edit
+### 07.7 -- Cleanup: keyboard menu after an unrendered core edit
 
-Surface point: 07.6 (`8090026`), reported by its implementer.
+Surface point: 07.6, reported by its implementer; the trigger was
+corrected by the adversarial branch review.
 
-Impact: `BufferView::caret_cell` returns `None` when the tab's stored
-layout is stale (its text changed since the last render). If an edit
-and Shift+F10 / Menu arrive in the same input batch, there has been no
-render in between, so the keyboard menu opens at the editor's top-left
-instead of below the caret. The diagnostic is still found correctly
-(`diagnostic_at` reads the live text). A render follows every batch,
-so this needs typing and the menu key within one read.
+Impact: an edit made through a core command (Ctrl+X / Ctrl+V,
+`ApplySuggestion`, Replace / Replace all) goes through
+`BufferView::record_outside_edit`, which updates the view's text hash
+but not its layout. Typing does not have the problem (`after_change`
+re-lays out). Until the next render, `fresh_layout` rejects the stale
+layout, so `caret_cell` is `None` and Shift+F10 / Menu opens the menu
+at the editor's top-left instead of below the caret.
 
-Scope of fix: `frext-term/src/buffer/mod.rs` (and a test in
-`frext-term/src/app.rs`).
+Resolution: fixed in 07.9 (`record_outside_edit` refreshes the
+layout), with the regression test in 07.12.
 
-Suggested approach: give `BufferView` a `&mut self` variant that runs
-`prepare` (re-layout and keep the caret visible, as `render` does)
-before computing the cell, and call it from
-`TermApp::open_editor_menu_at_caret`.
+### 07.8 -- 07.12: Review fixes (adversarial branch review)
 
-Verification: an app test that types a char and presses Shift+F10 in
-one batch, with no draw in between, gets `ContextMenu::below` at the
-caret's cell; the standard ritual.
+Three read-only reviewers (rendering and buffer; app, menus and keys;
+spec and process) reviewed the branch. Accepted findings, grouped into
+subtasks below. Not fixed here: the repo's `.markdownlint-cli2.yaml`
+does not disable MD060 while the pre-commit config does (pre-existing,
+repo-wide); and whether a legacy terminal's Menu key (`CSI 29 ~`)
+reaches crossterm as `KeyCode::Menu` (added to the smoke checklist).
 
-Scheduling: independent of everything else in this plan; may land
-after 07 merges, under a later plan's cleanup.
+Decisions:
+
+- **A clicked cell is not a caret position.** `diagnostic_at`'s
+  inclusive end is right for a caret (between chars) and wrong for a
+  cell (one char): a right-click on the space after a flagged word, or
+  past the end of a line ending in one, opened that word's menu, and a
+  click on a grammar diagnostic starting exactly where a spelling one
+  ends opened the spelling menu. Core gains
+  `proofread::state::Probe { Caret, Cell }` and a free function
+  `diagnostic_in(diagnostics: &[&Diagnostic], char_idx, probe)`
+  (spelling first; `Caret` end-inclusive, `Cell` half-open);
+  `Proofreading::diagnostic_at` delegates to it with `Caret`,
+  unchanged. Right-click uses `Cell` on the grapheme under the mouse,
+  and nothing past a row's content.
+- **One diagnostics pass per frame.** The status line looks up the
+  caret's diagnostic in the `Vec` already built for drawing
+  (`diagnostic_in(.., Probe::Caret)`), not via `diagnostic_at`.
+- **The status message** is shown only while the editor has focus, as
+  one line (`split_whitespace` joined by single spaces), and only when
+  that line is not empty; otherwise the path, as before.
+- **The keyboard menu never covers the caret's row** when the area has
+  room on either side: `Below` opens below if it fits, else above if
+  it fits, else on the side with more room with its height cut to that
+  room (the menu then scrolls, as a clamped menu already does). Only a
+  one-row area overlaps.
+- **Underline by grapheme, not first char.** A grapheme is underlined
+  when any diagnostic intersects its chars (`char_idx ..
+  char_idx + grapheme.chars().count()`), spelling first, so a
+  diagnostic starting on a combining mark is still drawn. The per-frame
+  `visible_diagnostics` `Vec` goes: the painter walks
+  `view.diagnostics` directly with its forward index.
+- **Long flagged words in labels** are shortened to `MESSAGE_WIDTH`
+  display columns with a trailing `…` in `Add “…” to dictionary` and
+  `Remove “…”`; the command keeps the full word.
+- **One menu-key rule.** `keymap::is_menu_key` becomes `pub(crate)` and
+  the file tree uses it instead of its own copy.
+
+#### 07.8 -- Core: `Probe` and `diagnostic_in`
+
+Scope: `frext-core/src/proofread/state.rs`.
+
+What: `#[derive(Debug, Clone, Copy, PartialEq, Eq)] pub enum Probe {
+Caret, Cell }` (documented: a caret sits between chars, so a
+diagnostic's end counts; a cell is one char, so it does not) and
+`#[must_use] pub fn diagnostic_in<'a>(diagnostics: &[&'a Diagnostic],
+char_idx: usize, probe: Probe) -> Option<&'a Diagnostic>`, with
+`diagnostic_at`'s spelling preference. `Proofreading::diagnostic_at`
+calls it with `Probe::Caret`; its doc points at `diagnostic_in`.
+
+Deliverable: tests: `Caret` matches at `chars.end`, `Cell` does not;
+both match at `chars.start`; overlapping spelling wins in both; a
+grammar diagnostic starting at a spelling one's end wins for `Cell` at
+that index; empty slice is `None`; every existing `diagnostic_at` test
+passes unchanged.
+
+#### 07.9 -- Buffer: grapheme under a cell, fresh layout after core edits
+
+Scope: `frext-term/src/buffer/wrap.rs`, `frext-term/src/buffer/mod.rs`.
+
+What:
+
+- `WrapLayout::grapheme_at(&self, text, row, column) -> Option<usize>`:
+  the first char of the grapheme whose cells contain `column` on
+  visual row `row`; `None` past the row's content or past the last row.
+- `BufferView::char_at_cell` is replaced by `grapheme_at_cell(&self,
+  tab, column, row) -> Option<usize>` over `grapheme_at`, with the same
+  rect and freshness checks.
+- `record_outside_edit` refreshes the tab's layout (`refresh_layout`
+  at `wrap_width(self.rect)`) after updating `known` (resolves 07.7).
+- `fresh_layout` also requires `view.known` to equal the text's hash.
+- Docs: `Overlays::diagnostics` states they are sorted by start and may
+  overlap; the module doc mentions `Overlays` and the read-only queries;
+  `caret_cell`'s doc names the stale-layout case.
+
+Deliverable: tests: `grapheme_at` on a wide char's second cell, a tab's
+last cell, past the end of a row and past the last row; the old
+`char_at_cell` tests ported (with an exact expected char instead of
+`> 0`); a cell past the end of a line is `None`; after
+`record_outside_edit`, `caret_cell` is `Some` without a render;
+`caret_cell` is `None` when the caret's column is past the right edge;
+`grapheme_at_cell` on the last editor column; `None` after
+`render(None, ..)` at a different width.
+
+#### 07.10 -- Render: underline by grapheme, no per-frame allocation
+
+Scope: `frext-term/src/buffer/render.rs`, `frext-term/src/theme.rs`,
+`frext-term/benches/buffer.rs`.
+
+What: the grapheme rule and the `Vec` removal decided above; skip the
+lookup entirely when there are no diagnostics. Test helper `squiggle()`
+returns the non-`Reset` colour and only checks `UNDERLINED` when a
+colour is present (a colourless syntax underline is valid); drop the
+redundant `Color` import and duplicate assertion; `theme`'s squiggle
+test asserts the RGB values. Bench: rename the `char` local, use
+`str::get`, and assert in setup that one render draws a spelling
+squiggle. Capture `before` / compare as in 07.2, and rerun
+`render_only` against itself once to report the noise level.
+
+Deliverable: tests: a diagnostic starting on a combining mark
+underlines its grapheme; a diagnostic starting above the top row
+continues into view; grammar over three rows with spelling on the last
+(the forward index across rows, including a row cut at the right
+edge); a syntax-underlined span inside a diagnostic gets the colour and
+outside keeps `Reset`; CRLF (`"wrrod\r\nx"`, `0..7`) underlines five
+cells and not the newline cell.
+
+#### 07.11 -- Menus and keys
+
+Scope: `frext-term/src/menu.rs`, `frext-term/src/editor_menu.rs`,
+`frext-term/src/keymap.rs`, `frext-term/src/tree.rs`.
+
+What: the `Below` placement decided above; `ContextMenu::anchored(entries,
+MenuAnchor)` with `new` and `below` delegating to it; label shortening;
+a comment on `No suggestions`'s never-sent value; `editor_menu`'s module
+doc says "under the click or the caret"; `keymap`'s module doc wording
+("Shift+F10, or F22 / Menu plain or with Shift"); `is_menu_key`
+`pub(crate)`, used by `FileTree::handle_key`.
+
+Deliverable: tests: for every `cell.y` in an area of height ≥ 2 and a
+menu taller than either side, `Below`'s rect does not contain the
+caret row; the side with more room is chosen and the height cut;
+`anchored` matches `new` / `below`; a 200-char flagged word gives
+labels no wider than `MESSAGE_WIDTH` + the fixed text, while the
+command carries the full word; exact full lists for grammar and for no
+suggestions (including `No suggestions`'s value); menu keys in legacy
+keyboard mode; every existing tree key test passes.
+
+#### 07.12 -- App: right-click by cell, status line, tests
+
+Scope: `frext-term/src/app.rs`.
+
+What: right-click uses `grapheme_at_cell` and `diagnostic_in(..,
+Probe::Cell)` over `proofread.diagnostics(..)`; the keyboard menu uses
+`Probe::Caret`; the status line decisions above, reusing the drawing
+`Vec`; `open_editor_menu` builds with `ContextMenu::anchored`. The
+proofreading app tests move into a nested `mod proofreading` in the
+test module; the gutter width comes from `layout::gutter_width`;
+`underline_of` is as strict as `render.rs`'s helper; the repaint test
+is renamed to what it pins (notify, poll, next draw).
+
+Deliverable: tests: right-click on the space after `tset` and past the
+end of its line opens the plain menu; caret just after `tset` shows
+the message and the menu key opens its menu; a status message with a
+newline renders on one line; an empty message shows the path; with the
+sidebar focused the path is shown; Ctrl+X then Shift+F10 with no draw
+in between opens `below` the caret cell (07.7).
+
+Every review-fix subtask: the standard ritual; do NOT touch files
+outside its scope; one commit each, reviewed before committing.
 
 ## Manual smoke checklist
 
@@ -542,3 +695,5 @@ undercurl, then tmux):
    menu below the caret, and above it near the bottom of the screen.
 7. A word added in the TUI is not flagged in the GUI after a restart
    (shared dictionary).
+8. In a legacy terminal (no kitty keyboard protocol), the Menu key
+   opens the editor menu.
