@@ -455,7 +455,11 @@ impl TermApp {
                         | Target::PromptButton(_)
                         | Target::PromptCandidate(_)
                         | Target::MenuPopup
-                        | Target::MenuItem(_),
+                        | Target::MenuItem(_)
+                        | Target::TreeClose
+                        | Target::TreeRow(_)
+                        | Target::TreeEmpty
+                        | Target::TreeBorder,
                     )
                     | None => {}
                 }

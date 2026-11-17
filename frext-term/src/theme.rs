@@ -150,6 +150,33 @@ pub const fn replacement() -> Style {
     Style::new().fg(color(palette::gutter())).bg(color(BASE))
 }
 
+/// The file-tree row of the active tab's file.
+#[must_use]
+pub const fn tree_active() -> Style {
+    Style::new()
+        .fg(color(palette::accent()))
+        .bg(color(MANTLE))
+        .add_modifier(Modifier::BOLD)
+}
+
+/// The background of the file-tree row under the keyboard cursor.
+#[must_use]
+pub fn tree_cursor_bg() -> Color {
+    color(palette::selection().over(SURFACE0))
+}
+
+/// The file tree's resizable border.
+#[must_use]
+pub const fn tree_border() -> Style {
+    Style::new().bg(color(SURFACE0))
+}
+
+/// The file tree's border while hovered or being dragged.
+#[must_use]
+pub const fn tree_border_active() -> Style {
+    Style::new().bg(color(palette::accent()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -338,5 +365,35 @@ mod tests {
             colours(replacement()),
             (Some(color(palette::gutter())), Some(color(BASE)))
         );
+    }
+
+    #[test]
+    fn tree_active_is_bold_accent_on_mantle() {
+        let style = tree_active();
+        assert_eq!(
+            colours(style),
+            (Some(color(palette::accent())), Some(color(MANTLE)))
+        );
+        assert!(style.add_modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn tree_cursor_bg_is_selection_over_surface0() {
+        assert_eq!(tree_cursor_bg(), color(palette::selection().over(SURFACE0)));
+        assert_ne!(tree_cursor_bg(), color(SURFACE0));
+    }
+
+    #[test]
+    fn tree_border_is_surface0_bg() {
+        assert_eq!(colours(tree_border()), (None, Some(color(SURFACE0))));
+    }
+
+    #[test]
+    fn tree_border_active_is_accent_bg() {
+        assert_eq!(
+            colours(tree_border_active()),
+            (None, Some(color(palette::accent())))
+        );
+        assert_ne!(tree_border_active().bg, tree_border().bg);
     }
 }
