@@ -1083,3 +1083,59 @@ Run in a real terminal (kitty or freminal, then a legacy terminal):
    Copy, Paste, Select all, Find…, and Save work.
 8. Legacy terminal: Backspace deletes, and Ctrl+R still opens replace.
 9. A 5,000-line file stays responsive while typing at the bottom.
+
+### 03.14 -- Review fixes (PR #41)
+
+Surfaced by the Copilot and CodeRabbit reviews of PR #41 (`29f6cba`),
+including CodeRabbit's out-of-diff comment. All of them come from this
+plan's own code. Each lands as its own commit with a regression test,
+followed by the standard ritual.
+
+- **A -- Double-click on a word's first char selects two words.**
+  `word_at("hello world", 6)` is `0..11`, because egui's
+  `select_word_at` takes the previous-word boundary from the clicked
+  index itself (the GUI has the same bug). Fix: `word_at` takes the
+  next boundary `e` from the index, then the previous boundary from `e`,
+  giving `6..11`. The word motions stay a faithful egui port. This is a
+  second intentional difference from egui, after `line_at`.
+  (`buffer/words.rs`)
+- **B -- Ctrl+Home / Ctrl+End do not reveal an unmoved caret.** With
+  the caret at 0 and the view wheel-scrolled down, Ctrl+Home returns
+  `Unchanged` and nothing scrolls. Fix: `BufferView::handle` keeps the
+  caret visible after every `Move`, whatever it returns.
+  (`buffer/mod.rs`)
+- **C -- Redo after a core edit restores the wrong caret.** The
+  prefix/suffix diff is ambiguous in repeated text (pasting `a` at the
+  start of `aaa` records the caret as 4, not 1). Fix:
+  `record_outside_edit` takes `after: Option<Range<usize>>`. `send`
+  passes the range of the outcome's `SetSelection` effect for that tab
+  when there is one (Cut, Paste, ApplySuggestion), and the diff end is
+  used only when there is none (ReplaceCurrent, ReplaceAll).
+  (`buffer/mod.rs`, `app.rs`)
+- **D -- A core edit into a never-rendered tab is not undoable.**
+  Ctrl+N then Ctrl+V in one batch reaches `record_outside_edit` before
+  the new tab has view state, so nothing is recorded. Fix: a missing
+  view state is created from `before` (hash and all) and the edit is
+  then recorded as usual. (`buffer/mod.rs`)
+- **E -- Core commands and focus changes do not break the typing
+  group.** The plan requires both. Fix: `BufferView::break_group(tab_id)`,
+  called by `send` before it applies a command, and a `TermApp::set_focus`
+  that breaks the active tab's group whenever the focus actually
+  changes, used everywhere focus is assigned. (`buffer/mod.rs`,
+  `app.rs`)
+- **F -- An edit that joins graphemes leaves the caret inside one.**
+  Deleting the `\n` of `"a\n\u{301}b"` at caret 1 leaves the caret
+  inside `á`, so the next keystroke snaps it back before `a`. Fix: the
+  caret after any edit snaps **up** to the next full-text grapheme
+  boundary (a `pub(crate) fn snap_up` beside `snap_down`), for both
+  deletions and insertions that join. (`buffer/edit.rs`,
+  `buffer/cursor.rs`)
+- **G -- A drag can continue on another tab.** Fix: `Drag` records the
+  tab id from `mouse_down`, and `mouse_drag` ignores any other tab.
+  (`buffer/mod.rs`)
+- **H -- The menu can highlight entries it cannot draw.** On a terminal
+  shorter than the menu, Up highlights an off-screen entry and Enter
+  runs it. Fix: `render` shows a window of entries that always contains
+  the highlighted one (start = `highlighted + 1 - inner.height` when
+  that is positive, else 0), and its hit rows keep the entries'
+  original indices. (`menu.rs`)
