@@ -2258,6 +2258,39 @@ mod tests {
     }
 
     #[test]
+    fn typing_before_an_in_selection_scope_keeps_the_matches_inside_it() {
+        let dir = temp_dir("find-in-selection-edit");
+        let mut app = app_with_text(&dir, "a a\na a", KeyboardMode::Enhanced);
+        press(&mut app, KeyCode::Down, KeyModifiers::NONE, 1);
+        press(&mut app, KeyCode::End, KeyModifiers::SHIFT, 1);
+        assert_eq!(app.buffer.selection(active_id(&app)), Some(4..7));
+        app.handle(ctrl('f'), Instant::now());
+        assert_eq!(app.editor().search().query().pattern, "a a");
+        press(&mut app, KeyCode::Backspace, KeyModifiers::NONE, 3);
+        type_text(&mut app, "a");
+        app.handle(alt('l'), Instant::now());
+        assert_eq!(app.editor().search().count_label(), "1/2");
+
+        // Line 1 is on row 2 below the open bar.
+        draw(&mut app);
+        left_click(&mut app, 3, 2);
+        assert_eq!(app.focus, Focus::Editor);
+        type_text(&mut app, "xx");
+
+        let text = text_of(&app);
+        assert_eq!(text, "xxa a\na a");
+        assert_eq!(app.editor().search().count_label(), "1/2");
+        let line_two = text.find('\n').unwrap() + 1..text.len();
+        for m in app.editor().search().matches() {
+            assert!(
+                line_two.start <= m.start && m.end <= line_two.end,
+                "{m:?} outside {line_two:?}"
+            );
+        }
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn legacy_ctrl_h_in_the_find_field_deletes_a_char() {
         let dir = temp_dir("find-legacy-ctrl-h");
         let mut app = app_with_text(&dir, "abc", KeyboardMode::Legacy);

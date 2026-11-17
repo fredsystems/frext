@@ -6,10 +6,16 @@ use std::ops::Range;
 use super::{
     BufferChange, Editor, EditorFocus, Effect, Outcome, SearchBar, SearchOption, StepDirection,
 };
-use crate::{highlight::MatchHighlights, offsets, search::SearchQuery};
+use crate::{edit_ops, highlight::MatchHighlights, offsets, search::SearchQuery};
 
 /// Live state for the find/replace bar. Only the query itself survives
 /// across sessions.
+///
+/// Search-within-selection works on a scope captured from the editor's
+/// selection when the option is turned on (or the bar is reopened with it
+/// on), not on the live selection: stepping to a match selects it, and that
+/// must not shrink the scope. Edits to the buffer move the scope with the
+/// text it covers.
 #[derive(Debug, Default)]
 pub struct SearchState {
     /// The search query and its toggles (persisted in the session).
@@ -20,8 +26,12 @@ pub struct SearchState {
     replace_open: bool,
     /// The replacement text for find/replace.
     replacement: String,
-    /// Restrict matches to the editor's current selection when `true`.
+    /// Restrict matches to the captured selection `scope` when `true`.
     in_selection: bool,
+    /// The selection search-within-selection is restricted to, captured when
+    /// the option was turned on; `None` when there was no selection to
+    /// capture.
+    scope: Option<SearchScope>,
     /// Cached match byte ranges for the active buffer (recomputed whenever
     /// the query, the toggles or the buffer change).
     matches: Vec<Range<usize>>,
@@ -29,6 +39,18 @@ pub struct SearchState {
     current: Option<usize>,
     /// The most recent regex-compile error message, shown inline.
     error: Option<String>,
+}
+
+/// A captured search-within-selection scope.
+#[derive(Debug)]
+struct SearchScope {
+    /// The id of the tab the scope belongs to.
+    tab_id: u64,
+    /// The scope as a char range of `base`.
+    chars: Range<usize>,
+    /// The tab's text `chars` was last mapped against; when the buffer no
+    /// longer matches it, `chars` is moved through the edit.
+    base: String,
 }
 
 impl SearchState {
@@ -52,7 +74,8 @@ impl SearchState {
         self.replace_open
     }
 
-    /// Whether matches are restricted to the editor's current selection.
+    /// Whether matches are restricted to the selection captured when the
+    /// option was turned on.
     #[must_use]
     pub fn in_selection(&self) -> bool {
         self.in_selection
@@ -106,7 +129,8 @@ impl SearchState {
 impl Editor {
     /// Open the find bar, seeding the pattern from the editor's current
     /// selection when there is a non-empty, single-line one, and request
-    /// keyboard focus for the find field.
+    /// keyboard focus for the find field. While search-within-selection is
+    /// on, a non-empty selection also becomes the new scope.
     pub(super) fn open_search(&mut self, bar: SearchBar) -> Outcome {
         if let Some(selected) = self.active_selection_text()
             && !selected.is_empty()
@@ -119,6 +143,11 @@ impl Editor {
             // Plain mode for a seeded literal, so regex metacharacters in
             // the selected text match literally.
             self.search.query.regex = false;
+        }
+        if self.search.in_selection
+            && let Some(scope) = self.capture_scope()
+        {
+            self.search.scope = Some(scope);
         }
         self.search.open = true;
         self.search.replace_open = bar == SearchBar::FindReplace;
@@ -146,12 +175,52 @@ impl Editor {
         tab.text.get(range).map(str::to_owned)
     }
 
+    /// The active tab's non-empty selection as a search-within-selection
+    /// scope, or `None` without one.
+    fn capture_scope(&self) -> Option<SearchScope> {
+        let chars = self.active_selection()?;
+        let chars = chars.start.min(chars.end)..chars.start.max(chars.end);
+        if chars.is_empty() {
+            return None;
+        }
+        let tab = self.tabs.get(self.active)?;
+        Some(SearchScope {
+            tab_id: tab.id,
+            chars,
+            base: tab.text.clone(),
+        })
+    }
+
+    /// The captured search-within-selection scope as a byte range of the
+    /// active buffer, after moving it through any edit made since it was
+    /// last mapped. `None` (search the whole buffer) when the option is off,
+    /// nothing was captured, the scope belongs to another tab, or it is
+    /// empty.
+    fn scope_bytes(&mut self) -> Option<Range<usize>> {
+        if !self.search.in_selection {
+            return None;
+        }
+        let tab = self.tabs.get(self.active)?;
+        let scope = self.search.scope.as_mut()?;
+        if scope.tab_id != tab.id {
+            return None;
+        }
+        if scope.base != tab.text {
+            scope.chars = edit_ops::track_range(scope.chars.clone(), &scope.base, &tab.text);
+            scope.base.clone_from(&tab.text);
+        }
+        let start = offsets::byte_of_char(&tab.text, scope.chars.start);
+        let end = offsets::byte_of_char(&tab.text, scope.chars.end);
+        (start < end).then_some(start..end)
+    }
+
     /// Close the find bar, clearing the live match cache so highlights
-    /// vanish.
+    /// vanish, and dropping the search-within-selection scope.
     pub(super) fn close_search(&mut self) {
         self.search.open = false;
         self.search.matches.clear();
         self.search.current = None;
+        self.search.scope = None;
     }
 
     /// Recompute the match set for the active buffer from the current query.
@@ -165,7 +234,7 @@ impl Editor {
             return;
         }
 
-        let selection = self.selection_bytes();
+        let scope = self.scope_bytes();
         let Some(tab) = self.tabs.get(self.active) else {
             self.search.current = None;
             return;
@@ -180,12 +249,10 @@ impl Editor {
             }
         };
 
-        // Search-within-selection restricts to the active selection's bytes.
-        let matches = match (self.search.in_selection, selection) {
-            (true, Some(scope)) if scope.start < scope.end => {
-                matcher.find_matches_in(&tab.text, scope)
-            }
-            _ => matcher.find_matches(&tab.text),
+        // Search-within-selection restricts to the captured scope's bytes.
+        let matches = match scope {
+            Some(scope) => matcher.find_matches_in(&tab.text, scope),
+            None => matcher.find_matches(&tab.text),
         };
 
         self.search.matches = matches;
@@ -228,7 +295,9 @@ impl Editor {
         }
     }
 
-    /// Flip one search toggle, then re-find.
+    /// Flip one search toggle, then re-find. Turning search-within-selection
+    /// on captures the active selection as its scope; turning it off drops
+    /// the scope.
     pub(super) fn toggle_search_option(&mut self, option: SearchOption) {
         let flag = match option {
             SearchOption::CaseSensitive => &mut self.search.query.case_sensitive,
@@ -237,6 +306,13 @@ impl Editor {
             SearchOption::InSelection => &mut self.search.in_selection,
         };
         *flag = !*flag;
+        if option == SearchOption::InSelection {
+            self.search.scope = if self.search.in_selection {
+                self.capture_scope()
+            } else {
+                None
+            };
+        }
         self.recompute_matches();
     }
 
@@ -286,7 +362,9 @@ impl Editor {
         BufferChange::Edited
     }
 
-    /// Replace every match in the active buffer with the replacement text.
+    /// Replace every match in the active buffer (or, with
+    /// search-within-selection on, in its captured scope) with the
+    /// replacement text.
     pub(super) fn replace_all(&mut self) -> BufferChange {
         if self.search.query.is_empty() {
             return BufferChange::Unchanged;
@@ -299,10 +377,7 @@ impl Editor {
             }
         };
         // The same scope `recompute_matches` searches within.
-        let scope = match (self.search.in_selection, self.selection_bytes()) {
-            (true, Some(scope)) if scope.start < scope.end => Some(scope),
-            _ => None,
-        };
+        let scope = self.scope_bytes();
         let Some(tab) = self.tabs.get_mut(self.active) else {
             return BufferChange::Unchanged;
         };
@@ -1009,6 +1084,120 @@ mod tests {
 
         assert_eq!(outcome.buffer, BufferChange::Edited);
         assert_eq!(editor.active_tab().unwrap().text, "dog dog");
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// An editor on "a a\na a" (plus `other` in a second tab) with "a"
+    /// searched in the open bar and search-within-selection captured over
+    /// line 1 (chars 0..3).
+    fn in_selection_over_line_one(dir: &Path, other: &str) -> Editor {
+        let mut editor = editor_with_two_tabs(dir, "a a\na a", other);
+        editor.apply(Command::OpenSearch(SearchBar::Find));
+        find(&mut editor, "a");
+        editor.set_selection(Some(0..3));
+        editor.apply(Command::ToggleSearchOption(SearchOption::InSelection));
+        assert_eq!(editor.search().matches(), [0..1, 2..3]);
+        editor
+    }
+
+    #[test]
+    fn replace_all_after_a_step_replaces_the_whole_captured_scope() {
+        let dir = temp_dir("scope-step-replace-all");
+        let mut editor = in_selection_over_line_one(&dir, "");
+        *editor.search_replacement_mut() = "x".to_owned();
+
+        // Stepping selects the second match, as the front ends report.
+        editor.apply(Command::StepMatch(StepDirection::Forward));
+        editor.set_selection(Some(2..3));
+        assert_eq!(editor.search().matches(), [0..1, 2..3]);
+
+        let outcome = editor.apply(Command::ReplaceAll);
+
+        assert_eq!(outcome.buffer, BufferChange::Edited);
+        assert_eq!(editor.active_tab().unwrap().text, "x x\na a");
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn an_edit_before_the_scope_shifts_it() {
+        let dir = temp_dir("scope-shift");
+        let mut editor = in_selection_over_line_one(&dir, "");
+
+        editor.active_view_mut().unwrap().tab.text = "zza a\na a".to_owned();
+        editor.commit_edit();
+
+        assert_eq!(editor.search().matches(), [2..3, 4..5]);
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_scope_is_ignored_on_another_tab() {
+        let dir = temp_dir("scope-other-tab");
+        let mut editor = in_selection_over_line_one(&dir, "a a a");
+        let first = editor.active_index();
+        let other = editor
+            .tabs()
+            .iter()
+            .position(|t| t.text == "a a a")
+            .unwrap();
+
+        editor.apply(Command::SelectTab(other));
+        assert_eq!(editor.search().matches(), [0..1, 2..3, 4..5]);
+
+        // Back on its own tab, the scope applies again.
+        editor.apply(Command::SelectTab(first));
+        assert_eq!(editor.search().matches(), [0..1, 2..3]);
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn toggling_in_selection_off_drops_the_scope() {
+        let dir = temp_dir("scope-toggle-off");
+        let mut editor = in_selection_over_line_one(&dir, "");
+
+        editor.apply(Command::ToggleSearchOption(SearchOption::InSelection));
+        assert_eq!(editor.search().matches().len(), 4);
+
+        // Turning it back on without a selection does not revive the old
+        // scope.
+        editor.set_selection(None);
+        editor.apply(Command::ToggleSearchOption(SearchOption::InSelection));
+        assert!(editor.search().in_selection());
+        assert_eq!(editor.search().matches().len(), 4);
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn closing_search_drops_the_scope() {
+        let dir = temp_dir("scope-close");
+        let mut editor = in_selection_over_line_one(&dir, "");
+
+        editor.apply(Command::CloseSearch);
+        editor.set_selection(None);
+        editor.apply(Command::OpenSearch(SearchBar::Find));
+
+        assert!(editor.search().in_selection());
+        assert_eq!(editor.search().matches().len(), 4);
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn opening_search_with_in_selection_on_recaptures_the_scope() {
+        let dir = temp_dir("scope-reopen");
+        let mut editor = in_selection_over_line_one(&dir, "");
+
+        // Select line 2 and reopen the bar (which also seeds "a a").
+        editor.set_selection(Some(4..7));
+        editor.apply(Command::OpenSearch(SearchBar::Find));
+        find(&mut editor, "a");
+
+        assert_eq!(editor.search().matches(), [4..5, 6..7]);
 
         fs::remove_dir_all(&dir).unwrap();
     }

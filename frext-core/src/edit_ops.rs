@@ -6,6 +6,8 @@
 //! I/O makes the splice logic straightforward to unit-test; the app layer
 //! wires them to the live `TextEdit` state and the OS clipboard.
 
+use std::ops::Range;
+
 /// Normalise a possibly-reversed selection to `(lo, hi)` character indices,
 /// clamped to the buffer's character length.
 fn normalize(text: &str, start: usize, end: usize) -> (usize, usize) {
@@ -49,6 +51,51 @@ pub fn replace_range(text: &mut String, start: usize, end: usize, insert: &str) 
     let hi_byte = crate::offsets::byte_of_char(text, hi);
     text.replace_range(lo_byte..hi_byte, insert);
     lo + insert.chars().count()
+}
+
+/// Map the char range `range` of `before` onto `after`, the same buffer after
+/// one edit, so it keeps covering the same text.
+///
+/// The edit is located from the common prefix and suffix (in chars) of the two
+/// strings. A position before the edit is unchanged, and one after it shifts
+/// by the change in length. A start inside the edit moves to the edit start,
+/// and an end inside it moves to the end of the inserted text. The result is
+/// clamped so `start <= end <= after`'s char count; identical strings return
+/// `range` unchanged apart from that clamp.
+#[must_use]
+pub fn track_range(range: Range<usize>, before: &str, after: &str) -> Range<usize> {
+    let before_len = before.chars().count();
+    let after_len = after.chars().count();
+    let prefix = before
+        .chars()
+        .zip(after.chars())
+        .take_while(|(a, b)| a == b)
+        .count();
+    // The suffix never overlaps the prefix in either string.
+    let suffix = before
+        .chars()
+        .rev()
+        .zip(after.chars().rev())
+        .take(before_len.min(after_len).saturating_sub(prefix))
+        .take_while(|(a, b)| a == b)
+        .count();
+    let old_end = before_len.saturating_sub(suffix);
+    let new_end = after_len.saturating_sub(suffix);
+
+    let map = |x: usize, inside: usize| {
+        if x <= prefix {
+            x
+        } else if x >= old_end {
+            // `x >= before_len - suffix` and `after_len >= suffix`, so this
+            // never underflows before saturating.
+            (x + after_len).saturating_sub(before_len)
+        } else {
+            inside
+        }
+    };
+    let end = map(range.end, new_end).min(after_len);
+    let start = map(range.start, prefix).min(end);
+    start..end
 }
 
 #[cfg(test)]
@@ -122,5 +169,53 @@ mod tests {
         let caret = replace_range(&mut text, 3, 4, "e");
         assert_eq!(text, "cafe");
         assert_eq!(caret, 4);
+    }
+
+    #[test]
+    fn track_range_shifts_past_an_insert_before_it() {
+        assert_eq!(track_range(6..11, "hello world", "XXhello world"), 8..13);
+    }
+
+    #[test]
+    fn track_range_ignores_an_insert_after_it() {
+        assert_eq!(track_range(0..5, "hello world", "hello world!"), 0..5);
+    }
+
+    #[test]
+    fn track_range_moves_a_deleted_start_to_the_edit_start() {
+        // "bcd" (chars 1..4) is deleted; the range "cde" keeps only "e".
+        assert_eq!(track_range(2..5, "abcdef", "aef"), 1..2);
+    }
+
+    #[test]
+    fn track_range_extends_over_an_insert_inside_it() {
+        // "XY" is inserted at char 2, inside "bcd" (chars 1..4).
+        assert_eq!(track_range(1..4, "abcdef", "abXYcdef"), 1..6);
+    }
+
+    #[test]
+    fn track_range_collapses_onto_a_replacement_spanning_it() {
+        // "bcde" (chars 1..5) becomes "Z", swallowing the range "cd".
+        assert_eq!(track_range(2..4, "abcdef", "aZf"), 1..2);
+    }
+
+    #[test]
+    fn track_range_leaves_identical_text_alone_but_clamps() {
+        assert_eq!(track_range(1..2, "abc", "abc"), 1..2);
+        assert_eq!(track_range(1..10, "abc", "abc"), 1..3);
+    }
+
+    #[test]
+    fn track_range_counts_chars_not_bytes() {
+        // "本" (char 1) shifts by one char, not by the inserted byte count.
+        assert_eq!(track_range(1..2, "日本語", "x日本語"), 2..3);
+        assert_eq!(track_range(0..2, "日本語", "日本語éé"), 0..2);
+    }
+
+    #[test]
+    fn track_range_handles_empty_text() {
+        assert_eq!(track_range(0..0, "", "abc"), 0..0);
+        assert_eq!(track_range(1..2, "abc", ""), 0..0);
+        assert_eq!(track_range(0..0, "", ""), 0..0);
     }
 }
