@@ -7,6 +7,8 @@
 //!
 //! While the search bar is open, Alt+C / Alt+W / Alt+R / Alt+L toggle
 //! match case, whole word, regex and in-selection, whatever has focus.
+//! An upper-case letter with Alt+Shift toggles too, which is how a
+//! terminal reports them with Caps Lock on, or with Shift held.
 //! While a find-bar field has focus only the global keys are bound; the
 //! rest are left unbound so the front end can hand them to the field.
 
@@ -29,6 +31,17 @@ pub enum Focus {
     Find(FindField),
 }
 
+impl Focus {
+    /// The find-bar field with focus, or `None` when focus is elsewhere.
+    #[must_use]
+    pub const fn find_field(self) -> Option<FindField> {
+        match self {
+            Self::Find(field) => Some(field),
+            Self::Editor | Self::Sidebar => None,
+        }
+    }
+}
+
 /// What a key press asks the terminal front end to do.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
@@ -40,7 +53,8 @@ pub enum Action {
     Quit,
     /// Show or hide the sidebar.
     ToggleSidebar,
-    /// Move focus between the editor and the sidebar.
+    /// Move focus to the sidebar from the editor, back to the editor from
+    /// the sidebar, and to the editor from the find bar.
     ToggleFocus,
     /// Return focus to the editor.
     FocusEditor,
@@ -132,12 +146,19 @@ fn editing_key(code: KeyCode, mods: KeyModifiers) -> Option<EditAction> {
     }
 }
 
-/// The search option an exactly-Alt letter toggles, if `key` is one.
+/// The search option an Alt letter toggles, if `key` is one.
+///
+/// The modifiers must be exactly Alt, or exactly Alt+Shift with an
+/// ASCII upper-case letter: legacy encoding reports `ESC C` (Caps Lock
+/// on) that way, and kitty reports Alt+Shift+C so. The letter is matched
+/// case-insensitively.
 fn search_toggle(key: KeyEvent) -> Option<SearchOption> {
     let KeyCode::Char(c) = key.code else {
         return None;
     };
-    if key.modifiers != KeyModifiers::ALT {
+    let alt_shift_upper =
+        key.modifiers == KeyModifiers::ALT | KeyModifiers::SHIFT && c.is_ascii_uppercase();
+    if key.modifiers != KeyModifiers::ALT && !alt_shift_upper {
         return None;
     }
     match c.to_ascii_lowercase() {
@@ -766,16 +787,39 @@ mod tests {
     }
 
     #[test]
-    fn alt_toggle_needs_exactly_alt() {
-        for mods in [
-            KeyModifiers::ALT | KeyModifiers::SHIFT,
-            KeyModifiers::CONTROL | KeyModifiers::ALT,
-        ] {
-            assert_eq!(
-                action_for(key(KeyCode::Char('c'), mods), searching()),
-                None,
-                "{mods:?}"
-            );
+    fn alt_shift_toggles_only_an_upper_case_letter() {
+        let alt_shift = KeyModifiers::ALT | KeyModifiers::SHIFT;
+        assert_eq!(
+            action_for(key(KeyCode::Char('C'), alt_shift), searching()),
+            toggle(SearchOption::CaseSensitive)
+        );
+        assert_eq!(
+            action_for(key(KeyCode::Char('c'), alt_shift), searching()),
+            None
+        );
+        assert_eq!(
+            action_for(
+                key(
+                    KeyCode::Char('c'),
+                    KeyModifiers::CONTROL | KeyModifiers::ALT
+                ),
+                searching()
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn an_unbound_alt_letter_falls_through() {
+        assert_eq!(action_for(alt('x'), searching()), None);
+    }
+
+    #[test]
+    fn find_field_projects_the_find_focus() {
+        assert_eq!(Focus::Editor.find_field(), None);
+        assert_eq!(Focus::Sidebar.find_field(), None);
+        for field in [FindField::Pattern, FindField::Replacement] {
+            assert_eq!(Focus::Find(field).find_field(), Some(field));
         }
     }
 
@@ -789,9 +833,9 @@ mod tests {
             focus: Focus::Find(FindField::Replacement),
             ..searching()
         };
-        for c in [sidebar_searching, finding(), replacing] {
+        for ctx in [sidebar_searching, finding(), replacing] {
             for (letter, option) in TOGGLES {
-                assert_eq!(action_for(alt(letter), c), toggle(option), "Alt+{letter}");
+                assert_eq!(action_for(alt(letter), ctx), toggle(option), "Alt+{letter}");
             }
         }
     }

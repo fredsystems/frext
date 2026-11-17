@@ -262,14 +262,14 @@ impl TermApp {
                 self.settle_focus();
                 self.forget_layout();
             }
-            Action::ToggleFocus => {
-                if self.sidebar_shown() {
-                    self.set_focus(match self.focus {
-                        Focus::Editor | Focus::Find(_) => Focus::Sidebar,
-                        Focus::Sidebar => Focus::Editor,
-                    });
+            Action::ToggleFocus => match self.focus {
+                Focus::Editor => {
+                    if self.sidebar_shown() {
+                        self.set_focus(Focus::Sidebar);
+                    }
                 }
-            }
+                Focus::Sidebar | Focus::Find(_) => self.set_focus(Focus::Editor),
+            },
             Action::FocusEditor => self.set_focus(Focus::Editor),
             Action::Edit(action) => self.edit(action, now),
         }
@@ -566,10 +566,7 @@ impl TermApp {
             buf,
             &mut self.hits,
         );
-        let find_focus = match self.focus {
-            Focus::Find(field) => Some(field),
-            Focus::Editor | Focus::Sidebar => None,
-        };
+        let find_focus = self.focus.find_field();
         let find_cursor = self.find.render(
             &self.editor,
             find_focus,
@@ -2072,6 +2069,42 @@ mod tests {
         let cursor = frame_cursor(&mut app).unwrap();
         assert_eq!(cursor.y, 1);
         assert!((6..20).contains(&cursor.x), "{cursor:?}");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn ctrl_e_from_the_bar_focuses_the_editor_without_a_sidebar() {
+        let dir = temp_dir("find-ctrl-e");
+        let mut app = app_with_text(&dir, "hello world", KeyboardMode::Enhanced);
+        app.handle(ctrl('f'), Instant::now());
+        assert_eq!(app.focus, Focus::Find(FindField::Pattern));
+        app.handle(ctrl('e'), Instant::now());
+        assert_eq!(app.focus, Focus::Editor);
+        assert!(app.editor().search().is_open());
+        let buf = draw(&mut app);
+        assert!(row_text(&buf, 1).starts_with(" Find "));
+        // The caret at the start of the first line, past the gutter " 1 ".
+        assert_eq!(
+            frame_cursor(&mut app),
+            Some(ratatui::layout::Position { x: 3, y: 2 })
+        );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn ctrl_e_from_the_bar_focuses_the_editor_not_the_sidebar() {
+        let dir = temp_dir("find-ctrl-e-sidebar");
+        let ws = dir.join("ws");
+        fs::create_dir_all(&ws).unwrap();
+        let editor = open_editor(&dir, &[], Some(&ws));
+        let mut app = TermApp::new(editor, KeyboardMode::Enhanced, ws.clone(), None);
+        draw(&mut app);
+        assert!(app.sidebar_shown());
+        app.handle(ctrl('f'), Instant::now());
+        assert_eq!(app.focus, Focus::Find(FindField::Pattern));
+        app.handle(ctrl('e'), Instant::now());
+        assert_eq!(app.focus, Focus::Editor);
+        assert!(app.editor().search().is_open());
         fs::remove_dir_all(&dir).unwrap();
     }
 
