@@ -19,6 +19,7 @@ use frext_core::editor::{
     BufferChange, Command, Editor, EditorFocus, Effect, FolderState, SearchBar, StepDirection,
 };
 use frext_core::lines::line_count;
+use frext_core::proofread::Diagnostic;
 use frext_core::syntax::language_from_path;
 use frext_core::workspace::RowKind;
 use ratatui::Frame;
@@ -33,7 +34,7 @@ use crate::find_bar::{self, FindBar, FindField, FindReply};
 use crate::hit::{HitMap, Target};
 use crate::keymap::{self, Action, Focus, KeyContext};
 use crate::layout;
-use crate::menu::{ContextMenu, Enablement, MenuReply};
+use crate::menu::{ContextMenu, Enablement, MenuAnchor, MenuReply};
 use crate::prompt::{PromptReply, PromptUi};
 use crate::status::{MessageKind, StatusLine};
 use crate::tab_bar;
@@ -324,7 +325,31 @@ impl TermApp {
             },
             Action::FocusEditor => self.set_focus(Focus::Editor),
             Action::Edit(action) => self.edit(action, now),
+            Action::OpenEditorMenu => self.open_editor_menu_at_caret(),
         }
+    }
+
+    /// Opens the editor menu from the keyboard: with the diagnostic at
+    /// the caret, below the caret's cell, or at the editor's top-left
+    /// cell when the caret is not on screen.
+    fn open_editor_menu_at_caret(&mut self) {
+        let Some(tab) = self.editor.active_tab() else {
+            return;
+        };
+        let diagnostic = self.buffer.caret(tab.id).and_then(|caret| {
+            self.editor
+                .proofread()
+                .diagnostic_at(tab.id, &tab.text, caret)
+                .cloned()
+        });
+        let anchor = self.buffer.caret_cell(tab).map_or_else(
+            || {
+                let rect = self.buffer.rect();
+                MenuAnchor::At(Position::new(rect.x, rect.y))
+            },
+            MenuAnchor::Below,
+        );
+        self.open_editor_menu(diagnostic, anchor);
     }
 
     /// Routes a key the keymap left unbound to the file tree, over rows
@@ -522,7 +547,19 @@ impl TermApp {
                 }
                 let at = Position::new(mouse.column, mouse.row);
                 match target {
-                    Some(Target::Editor) => self.open_editor_menu(at),
+                    Some(Target::Editor) => {
+                        // The caret stays put: the cell only picks the
+                        // diagnostic the menu shows.
+                        let diagnostic = self.editor.active_tab().and_then(|tab| {
+                            let char_idx =
+                                self.buffer.char_at_cell(tab, mouse.column, mouse.row)?;
+                            self.editor
+                                .proofread()
+                                .diagnostic_at(tab.id, &tab.text, char_idx)
+                                .cloned()
+                        });
+                        self.open_editor_menu(diagnostic, MenuAnchor::At(at));
+                    }
                     Some(Target::TreeRow(index)) => {
                         if let Some(row) = self.tree.row(index).cloned() {
                             self.tree.select(index);
@@ -585,9 +622,10 @@ impl TermApp {
         }
     }
 
-    /// Opens the editor menu at `at`, its cut and copy enabled only over
-    /// a selection.
-    fn open_editor_menu(&mut self, at: Position) {
+    /// Opens the editor menu placed by `anchor`, leading with
+    /// `diagnostic`'s items when there is one, its cut and copy enabled
+    /// only over a selection.
+    fn open_editor_menu(&mut self, diagnostic: Option<Diagnostic>, anchor: MenuAnchor) {
         if let Some(tab) = self.editor.active_tab() {
             let selection = if self
                 .buffer
@@ -598,7 +636,11 @@ impl TermApp {
             } else {
                 Enablement::Disabled
             };
-            self.menu = Some(ContextMenu::new(editor_menu::entries(selection, None), at));
+            let entries = editor_menu::entries(selection, diagnostic.as_ref());
+            self.menu = Some(match anchor {
+                MenuAnchor::At(at) => ContextMenu::new(entries, at),
+                MenuAnchor::Below(cell) => ContextMenu::below(entries, cell),
+            });
             // The chosen command acts on the editor's selection.
             self.set_focus(Focus::Editor);
         }
@@ -880,6 +922,7 @@ mod tests {
     use ratatui::style::{Color, Modifier};
 
     use super::*;
+    use crate::menu::MenuEntry;
     use crate::theme;
     use crate::tree::{DEFAULT_WIDTH, MIN_EDITOR_WIDTH, MIN_WIDTH};
 
@@ -3929,6 +3972,256 @@ mod tests {
         let status = row_text(&buf, 23);
         assert!(status.starts_with(" Saved "), "{status:?}");
         assert!(!status.contains(&diagnostic.message), "{status:?}");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The screen column of char `char_idx` of a one-line ASCII file: the
+    /// gutter " 1 " is three columns wide.
+    fn column_of_char(char_idx: usize) -> u16 {
+        3 + u16::try_from(char_idx).unwrap()
+    }
+
+    /// `MISSPELT`, proofread and drawn.
+    fn proofread_app(dir: &Path) -> TermApp {
+        let mut app = app_with_text(dir, MISSPELT, KeyboardMode::Enhanced);
+        proofread(&mut app);
+        draw(&mut app);
+        app
+    }
+
+    /// The entries of the editor menu with no selection over `diagnostic`.
+    fn menu_entries(diagnostic: Option<&Diagnostic>) -> Vec<MenuEntry<Command>> {
+        editor_menu::entries(Enablement::Disabled, diagnostic)
+    }
+
+    /// Chooses the item labelled `label` from the open menu, whose entries
+    /// are `entries`, with Down until it is highlighted, then Enter.
+    fn choose(app: &mut TermApp, entries: &[MenuEntry<Command>], label: &str) {
+        let index = entries
+            .iter()
+            .position(|entry| matches!(entry, MenuEntry::Item { label: l, .. } if l == label))
+            .unwrap();
+        for _ in 0..entries.len() {
+            if app.menu.as_ref().unwrap().highlighted() == Some(index) {
+                break;
+            }
+            app.handle(key(KeyCode::Down, KeyModifiers::NONE), Instant::now());
+        }
+        assert_eq!(app.menu.as_ref().unwrap().highlighted(), Some(index));
+        app.handle(key(KeyCode::Enter, KeyModifiers::NONE), Instant::now());
+        assert!(app.menu.is_none());
+    }
+
+    /// Opens the editor menu over `tset` with a right-click on its second
+    /// char, returning the diagnostic and the menu's entries.
+    fn right_click_tset(app: &mut TermApp) -> (Diagnostic, Vec<MenuEntry<Command>>) {
+        let diagnostic = tset_diagnostic(app);
+        right_click(app, column_of_char(diagnostic.chars.start + 1), 1);
+        let entries = menu_entries(Some(&diagnostic));
+        (diagnostic, entries)
+    }
+
+    /// Asserts that no cell of `diagnostic` is underlined on a fresh draw.
+    fn assert_not_underlined(app: &mut TermApp, diagnostic: &Diagnostic) {
+        let buf = draw(app);
+        for char_idx in diagnostic.chars.clone() {
+            let x = column_of_char(char_idx);
+            assert_eq!(underline_of(&buf[(x, 1)]), None, "char {char_idx}");
+        }
+    }
+
+    #[test]
+    fn a_right_click_on_a_diagnostic_opens_its_menu_without_moving_the_caret() {
+        let dir = temp_dir("menu-diagnostic");
+        let mut app = proofread_app(&dir);
+        let id = active_id(&app);
+        let diagnostic = tset_diagnostic(&app);
+        let x = column_of_char(diagnostic.chars.start + 1);
+        right_click(&mut app, x, 1);
+        assert_eq!(
+            app.menu,
+            Some(ContextMenu::new(
+                menu_entries(Some(&diagnostic)),
+                Position::new(x, 1)
+            ))
+        );
+        assert_eq!(app.buffer.caret(id), Some(0));
+        assert_eq!(app.buffer.selection(id), Some(0..0));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_right_click_on_a_clean_word_opens_the_plain_menu() {
+        let dir = temp_dir("menu-clean-word");
+        let mut app = proofread_app(&dir);
+        let id = active_id(&app);
+        // The "h" of "This".
+        assert!(
+            app.editor()
+                .proofread()
+                .diagnostic_at(id, MISSPELT, 1)
+                .is_none()
+        );
+        let x = column_of_char(1);
+        right_click(&mut app, x, 1);
+        assert_eq!(
+            app.menu,
+            Some(ContextMenu::new(menu_entries(None), Position::new(x, 1)))
+        );
+        assert_eq!(app.buffer.caret(id), Some(0));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn choosing_a_suggestion_replaces_the_word_and_ctrl_z_restores() {
+        let dir = temp_dir("menu-suggestion");
+        let mut app = proofread_app(&dir);
+        let (diagnostic, entries) = right_click_tset(&mut app);
+        let suggestion = diagnostic.suggestions.first().unwrap().clone();
+        assert!(!suggestion.is_empty(), "{diagnostic:?}");
+        choose(&mut app, &entries, &suggestion);
+        assert_eq!(text_of(&app), MISSPELT.replacen("tset", &suggestion, 1));
+
+        app.handle(ctrl('z'), Instant::now());
+        assert_eq!(text_of(&app), MISSPELT);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn adding_to_the_dictionary_removes_the_squiggle() {
+        let dir = temp_dir("menu-add-word");
+        let mut app = proofread_app(&dir);
+        let (diagnostic, entries) = right_click_tset(&mut app);
+        choose(&mut app, &entries, "Add \u{201c}tset\u{201d} to dictionary");
+        assert!(app.editor().proofread().user_words().any(|w| w == "tset"));
+        // The store, and so the dictionary, lives under the temp dir.
+        let dictionary = fs::read_to_string(dir.join("state").join("dictionary.txt")).unwrap();
+        assert!(
+            dictionary.lines().any(|line| line == "tset"),
+            "{dictionary:?}"
+        );
+        assert_not_underlined(&mut app, &diagnostic);
+        assert_eq!(text_of(&app), MISSPELT);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn ignoring_removes_the_squiggle() {
+        let dir = temp_dir("menu-ignore");
+        let mut app = proofread_app(&dir);
+        let (diagnostic, entries) = right_click_tset(&mut app);
+        choose(&mut app, &entries, "Ignore");
+        assert_not_underlined(&mut app, &diagnostic);
+        assert_eq!(text_of(&app), MISSPELT);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The keys that open the editor menu at the caret.
+    const EDITOR_MENU_KEYS: [(KeyCode, KeyModifiers); 3] = [
+        (KeyCode::F(10), KeyModifiers::SHIFT),
+        (KeyCode::F(22), KeyModifiers::NONE),
+        (KeyCode::Menu, KeyModifiers::NONE),
+    ];
+
+    #[test]
+    fn menu_keys_open_the_diagnostic_menu_below_the_caret() {
+        let dir = temp_dir("menu-key-diagnostic");
+        let mut app = proofread_app(&dir);
+        let diagnostic = tset_diagnostic(&app);
+        let caret = diagnostic.chars.start + 1;
+        press(&mut app, KeyCode::Right, KeyModifiers::NONE, caret);
+        let id = active_id(&app);
+        let cell = app
+            .buffer
+            .caret_cell(app.editor().active_tab().unwrap())
+            .unwrap();
+        assert_eq!(cell, Position::new(column_of_char(caret), 1));
+        for (code, modifiers) in EDITOR_MENU_KEYS {
+            app.handle(key(code, modifiers), Instant::now());
+            assert_eq!(
+                app.menu,
+                Some(ContextMenu::below(menu_entries(Some(&diagnostic)), cell)),
+                "{code:?} {modifiers:?}"
+            );
+            assert_eq!(app.buffer.caret(id), Some(caret));
+            app.handle(key(KeyCode::Esc, KeyModifiers::NONE), Instant::now());
+            assert!(app.menu.is_none());
+        }
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn menu_keys_on_a_clean_word_open_the_plain_menu_below_the_caret() {
+        let dir = temp_dir("menu-key-clean");
+        let mut app = proofread_app(&dir);
+        let id = active_id(&app);
+        assert!(
+            app.editor()
+                .proofread()
+                .diagnostic_at(id, MISSPELT, 0)
+                .is_none()
+        );
+        let cell = app
+            .buffer
+            .caret_cell(app.editor().active_tab().unwrap())
+            .unwrap();
+        assert_eq!(cell, Position::new(column_of_char(0), 1));
+        for (code, modifiers) in EDITOR_MENU_KEYS {
+            app.handle(key(code, modifiers), Instant::now());
+            assert_eq!(
+                app.menu,
+                Some(ContextMenu::below(menu_entries(None), cell)),
+                "{code:?} {modifiers:?}"
+            );
+            app.handle(key(KeyCode::Esc, KeyModifiers::NONE), Instant::now());
+        }
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_menu_key_opens_at_the_editor_top_left_when_the_caret_is_off_screen() {
+        let dir = temp_dir("menu-key-off-screen");
+        let text: String = (1..=100).map(|n| format!("line {n}\n")).collect();
+        let mut app = app_with_text(&dir, &text, KeyboardMode::Enhanced);
+        let id = active_id(&app);
+        for _ in 0..10 {
+            app.handle(mouse(MouseEventKind::ScrollDown, 10, 5), Instant::now());
+        }
+        draw(&mut app);
+        assert_eq!(app.buffer.caret(id), Some(0));
+        assert_eq!(
+            app.buffer.caret_cell(app.editor().active_tab().unwrap()),
+            None
+        );
+        let rect = app.buffer.rect();
+        assert_eq!(rect.y, 1);
+        app.handle(key(KeyCode::F(10), KeyModifiers::SHIFT), Instant::now());
+        assert_eq!(
+            app.menu,
+            Some(ContextMenu::new(
+                menu_entries(None),
+                Position::new(rect.x, rect.y)
+            ))
+        );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn menu_keys_in_the_sidebar_still_open_the_tree_menu() {
+        let (dir, ws, mut app) = tree_app("tree-menu-key");
+        let cargo = ws.join("Cargo.toml");
+        app.handle(ctrl('e'), Instant::now());
+        press(&mut app, KeyCode::Down, KeyModifiers::NONE, 3);
+        let expected =
+            ContextMenu::new(tree_menu::file_entries(&cargo), Position::new(5, tree_y(2)));
+        for (code, modifiers) in EDITOR_MENU_KEYS {
+            app.handle(key(code, modifiers), Instant::now());
+            assert_eq!(app.menu.as_ref(), Some(&expected), "{code:?} {modifiers:?}");
+            assert_eq!(app.focus, Focus::Sidebar);
+            app.handle(key(KeyCode::Esc, KeyModifiers::NONE), Instant::now());
+            assert!(app.menu.is_none());
+            draw(&mut app);
+        }
         fs::remove_dir_all(&dir).unwrap();
     }
 }
