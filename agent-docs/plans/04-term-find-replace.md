@@ -23,8 +23,8 @@ highlighted in the buffer view, with the current match distinct.
   key bindings.
 - Enter / Shift+Enter in the find field and F3 / Shift+F3 anywhere send
   `StepMatch`. Esc sends `CloseSearch`.
-- Ctrl+F / Ctrl+H send `OpenSearch`. The core already seeds the
-  pattern from a single-line selection.
+- Ctrl+F / Ctrl+R / Ctrl+H send `OpenSearch`. The core already seeds
+  the pattern from a single-line selection.
 - Buffer view: `Editor::match_highlights()` gives the
   `MatchBackground::{Other, Current}` roles, which plan 03's rendering
   pass composes per cell.
@@ -154,19 +154,19 @@ says otherwise.
 - **Hit targets.** These are new `hit::Target` variants. Their hints are
   shown on the status line, since tooltips become status-line text.
 
-  | Target                                   | Hint                                           |
-  | ---------------------------------------- | ---------------------------------------------- |
-  | `FindInput`, `ReplaceInput`              | none                                           |
+  | Target                                    | Hint                                           |
+  | ----------------------------------------- | ---------------------------------------------- |
+  | `FindInput`, `ReplaceInput`               | none                                           |
   | `FindOption(SearchOption::CaseSensitive)` | `Match case (Alt+C)`                           |
-  | `FindOption(SearchOption::WholeWord)`    | `Whole word (Alt+W)`                           |
-  | `FindOption(SearchOption::Regex)`        | `Regular expression (Alt+R)`                   |
-  | `FindOption(SearchOption::InSelection)`  | `Search within the current selection (Alt+L)`  |
-  | `FindPrev`                               | `Previous match (Shift+F3)`                    |
-  | `FindNext`                               | `Next match (F3 / Enter)`                      |
-  | `FindReplaceRow`                         | `Toggle replace`                               |
-  | `FindClose`                              | `Close (Esc)`                                  |
-  | `ReplaceCurrent`                         | `Replace the current match (Enter in With)`    |
-  | `ReplaceAll`                             | `Replace all matches`                          |
+  | `FindOption(SearchOption::WholeWord)`     | `Whole word (Alt+W)`                           |
+  | `FindOption(SearchOption::Regex)`         | `Regular expression (Alt+R)`                   |
+  | `FindOption(SearchOption::InSelection)`   | `Search within the current selection (Alt+L)`  |
+  | `FindPrev`                                | `Previous match (Shift+F3)`                    |
+  | `FindNext`                                | `Next match (F3 / Enter)`                      |
+  | `FindReplaceRow`                          | `Toggle replace`                               |
+  | `FindClose`                               | `Close (Esc)`                                  |
+  | `ReplaceCurrent`                          | `Replace the current match (Enter in With)`    |
+  | `ReplaceAll`                              | `Replace all matches`                          |
 
 - **Mouse on the bar** (with no prompt or menu open):
   - A left click on a field focuses it and places its cursor
@@ -306,13 +306,25 @@ Deliverable: tests:
     the visible cells on `BASE`
   - a selected cell inside a match keeps the selection colour
 - `app.rs`: with the text `"hello world hello"`, select the first
-  `hello`, press Ctrl+F, and draw. The first `hello` has the
-  current-match bg, and the second has the other-match bg. After Esc
-  and a redraw, neither has a match bg.
+  `hello`, press Ctrl+F, collapse the selection, and draw. The
+  selection colour wins over a match, so the selection has to be
+  collapsed first: at first with Right, and from 04.8 on with a click
+  in the editor, because Right then goes to the find field. The first
+  `hello` has the current-match bg, and the second has the other-match
+  bg. After Esc and a redraw, neither has a match bg.
 
 Verification: the standard ritual, plus `cargo bench -p frext-term
 --bench buffer -- --baseline before04`. Report the table of the
 `before04` → after deltas and the new row.
+
+Results (criterion middle estimates). The new row has no `before04`
+baseline, so it was timed on its own:
+
+| Bench                               | `before04` | 04.2     | 04.8 re-run |
+| ----------------------------------- | ---------- | -------- | ----------- |
+| `type_and_render_rust_5k_lines`     | 7.384 ms   | 7.196 ms | 7.229 ms    |
+| `render_only_rust_5k_lines`         | 1.251 ms   | 1.297 ms | 1.279 ms    |
+| `render_with_matches_rust_5k_lines` | n/a        | 1.277 ms | 1.266 ms    |
 
 Prohibitions: do NOT change `render.rs`, `theme.rs` or core; do NOT
 add search logic; do NOT render the find bar; do NOT proceed to 04.3.
@@ -611,6 +623,9 @@ What:
     startup message.
   - `choosing_find_opens_the_search` asserts focus `Find(Pattern)` and
     the drawn bar.
+  - `open_search_paints_its_matches_in_the_editor` (04.2) collapses the
+    selection with a click in the editor instead of Right, which now goes
+    to the find field.
 
 Deliverable: app tests (`TestBackend`, real `Editor`):
 
@@ -631,9 +646,10 @@ Deliverable: app tests (`TestBackend`, real `Editor`):
   and the editor caret is the frame cursor
 - a seeded pattern (a selection plus Ctrl+F) puts the field cursor at
   the end of the pattern
-- in-selection: select the first line of `"a a\na a"`, press Ctrl+F,
-  type `a`, then Alt+L. The count is `1/2`, which proves the selection
-  reached core while focus was in the field.
+- in-selection: select the first line of `"a a\na a"`, press Ctrl+F
+  (which seeds `a a`), Backspace the seed away, type `a`, then Alt+L.
+  The count is `1/2`, which proves the selection reached core while
+  focus was in the field.
 - Legacy Ctrl+H in the field deletes a char from the pattern
 - a regex error (`(` with Alt+R) draws the error rows, and the editor
   moves down by them
@@ -705,3 +721,196 @@ Run in a real terminal (kitty or freminal, then a legacy terminal):
 8. Legacy terminal: Backspace in the field deletes.
 9. An 80-column terminal shows the whole find row, and a narrow one
    clips it cleanly.
+
+### 04.10 -- Review fixes (adversarial branch review)
+
+Surfaced by two adversarial reviews of the branch diff against `main`
+(after `68adba2`): one for correctness and one for quality. Every
+finding, nitpicks included, is fixed here. Each group lands as its own
+commit with regression tests, followed by the standard ritual. Where a
+fix changes a decision above, the decision here supersedes it.
+
+Decided with the user:
+
+- **In-selection scope is captured in core** (supersedes "the scope is
+  the live selection"). The live selection was re-read on every
+  recompute and Replace all, so a `StepMatch` (which selects the match)
+  collapsed the scope to that match, and typing in the editor left it
+  pointing at stale positions. GUI and TUI both change.
+- **The find bar uses ASCII glyphs**: `[x]` for close, and `...` in the
+  three hints. `×` and `…` are East Asian Ambiguous, so a terminal set
+  to draw them wide shifts the bar's hit regions. The tab bar is not
+  changed.
+- **`ReplaceCurrent` selects and reveals the next match**
+  (`SetSelection { focus: Keep }` plus `RevealSelection`), as VS Code
+  does. GUI and TUI both change.
+
+The fixes, in commit order:
+
+- **A -- Capture the in-selection scope in core.**
+  (`frext-core/src/edit_ops.rs`, `frext-core/src/editor/search.rs`,
+  `frext-core/src/editor/mod.rs`, and any core or GUI test that
+  encodes the old live-selection behaviour; `frext-term/src/app.rs`,
+  one regression test only.)
+  - `SearchState` gains a private scope:
+    `Option<SearchScope { tab_id: u64, chars: Range<usize>, base: String }>`,
+    where `base` is the text the range was last mapped against.
+  - It is captured from the active non-empty selection when
+    `ToggleSearchOption(InSelection)` turns the option on, and by
+    `OpenSearch` while the option is on and a non-empty selection
+    exists. Turning the option off clears it, and so does
+    `CloseSearch`.
+  - Before every recompute and Replace all, if the scope's tab is
+    active and its text differs from `base`, the range is mapped
+    through the edit with a new pure
+    `edit_ops::track_range(range, before, after) -> Range<usize>`, and
+    `base` is updated. `track_range` uses the common prefix and suffix,
+    in chars:
+    - a position before the edit is unchanged
+    - a position after it shifts by the length delta
+    - a start inside the edit moves to the edit start
+    - an end inside it moves to the end of the inserted text
+  - The scope applies only to its own tab. On another tab, with no
+    scope, or with an empty scope, the whole buffer is searched, as
+    before.
+  - Tests: `track_range` cases; step-then-Replace-all replaces every
+    match in the captured scope; an edit before the scope shifts it;
+    the scope is ignored on another tab. In `frext-term`, the
+    correctness review's repro (typing before an in-selection scope
+    keeps the matches inside it).
+- **B -- `ReplaceCurrent` selects and reveals the next match.**
+  (`frext-core/src/editor/search.rs`, `frext-core/src/editor/mod.rs`;
+  `frext-term/src/app.rs`, one test.) `replace_current` returns an
+  `Outcome`. When a current match remains, it carries
+  `SetSelection { tab_id, chars, focus: Keep }` plus `RevealSelection`.
+  Tests: in core, the effects after a replace; in the TUI, Enter in
+  With selects the next match, and redo after undo restores that
+  selection.
+- **C -- Borrowed, windowed match highlights.**
+  (`frext-core/src/highlight/mod.rs`, `frext-core/src/editor/search.rs`,
+  `frext-term/src/buffer/mod.rs`, `frext-term/src/app.rs`,
+  `frext-term/benches/buffer.rs`.)
+  - `match_highlights()` cloned every match on every frame. Core gains
+    `pub struct MatchHighlightsRef<'a> { pub ranges: &'a [Range<usize>],
+    pub current: Option<usize> }`, with `within(self, bytes) ->
+    MatchHighlights` (the same algorithm as 04.1). `MatchHighlights`
+    gains `as_ref()`, and its `within` delegates to it.
+  - `Editor::match_highlights_ref() -> MatchHighlightsRef<'_>` is empty
+    while the bar is closed. `BufferView::render` takes a
+    `MatchHighlightsRef<'_>`.
+  - `overlay_matches` scanned every match for every byte. It now finds
+    the match for a byte with a binary search over the sorted ranges,
+    with the precondition documented. This also bounds the cost of a
+    single very long visible line.
+  - The reversed-window test in `highlight/mod.rs` gets a comment
+    explaining why it builds its range from variables.
+  - Test: a multi-line match that starts above the viewport paints its
+    visible part.
+  - The bench re-runs, and the results are added to the plan.
+- **D -- `TextInput` rejects chars with Super / Hyper / Meta**, as
+  `editing_key` does for the editor, so a kitty-reported Cmd+V does not
+  type `v` into a field or prompt. (`frext-term/src/text_input.rs`.)
+- **E -- Keymap.** (`frext-term/src/keymap.rs`, `frext-term/src/app.rs`.)
+  - The Alt toggles also accept `ALT | SHIFT` with an upper-case letter.
+    Legacy crossterm reports `ESC C` (Caps Lock on) that way, so they
+    failed with Caps Lock on. This supersedes the "exactly Alt" rule,
+    so Alt+Shift+C toggles too.
+  - A test covers an unbound Alt letter (Alt+X) falling through, and the
+    `KeyContext` loop variable is renamed `ctx`.
+  - **Ctrl+E from `Find(_)` goes to the editor** (supersedes "treats
+    `Find(_)` like `Editor`"). This gives keyboard users a way back to
+    the editor with the bar left open. The `ToggleFocus` doc is
+    updated.
+  - `Focus::find_field() -> Option<FindField>` replaces the inline
+    projection in `app.rs`, with a test.
+- **F -- Find bar quality.** (`frext-term/src/find_bar.rs`,
+  `frext-term/src/paint.rs` (new), `frext-term/src/lib.rs`,
+  `frext-term/src/app.rs`, `frext-term/src/buffer/mod.rs`,
+  `frext-term/src/buffer/render.rs`, `frext-term/src/hit.rs`,
+  `frext-term/src/theme.rs`, `frext-core/src/editor/search.rs`.)
+  - **Naming and types:**
+    - A `Toggle { On, Off }` enum replaces the `on: bool` / `hovered:
+      bool` parameters. Hover is compared against the target inside the
+      button.
+    - Core gains `SearchState::option(SearchOption) -> bool`, and the
+      bar's own copy of that mapping goes.
+    - `FindBar::paste` / `click` become `handle_paste` / `handle_click`,
+      as in `PromptUi`.
+    - `Row::count` becomes `match_count`, and the `COUNT_WIDTH` doc
+      notes that longer labels are cut.
+    - The targets are renamed with a common prefix: `FindPattern`,
+      `FindReplacement`, `FindOption`, `FindPrev`, `FindNext`,
+      `FindReplaceRow`, `FindClose`, `FindReplaceCurrent` and
+      `FindReplaceAll`. New docs say "find bar".
+  - **Visibility and structure:**
+    - One `paint::fill(buf, area, style)`, which intersects the area
+      with the buffer and uses `cell_mut`, replaces the four copies.
+    - The constants, `field_width` and `error_lines` become private, or
+      `pub(crate)` where an app test uses them.
+    - `FindField` gains `text` / `text_mut`, and `FindBar` a `rect`
+      helper.
+    - A test derives `FIXED_WIDTH` from the labels.
+  - **Arithmetic:** `slot` uses `checked_add`, the error-line x uses
+    `saturating_add`, and `Row::new` / `slot` become `const fn`.
+  - **Docs:** the `handle_key` doc covers Tab with no replace row,
+    Shift+Enter in With, and releases. The `render` hover doc is made
+    accurate. The arm the app cannot reach (`Cancel`) gets a comment.
+  - **Behaviour:**
+    - The ASCII glyphs.
+    - `toggle_on()` gets a background distinct from `hover_bg()`:
+      `selection().over(SURFACE0)`, with a test that the two differ.
+    - `BackTab` switches fields only with no modifiers or Shift.
+    - Enter with Ctrl or Alt in either field is `Handled` (reserved).
+    - When the bar has fewer rows than it asks for, error lines are cut
+      before the replace row, so the With field stays drawn.
+  - **Tests:**
+    - The find-row column table is defined once, in row order, with
+      widths derived from the labels.
+    - `lines[0]` is no longer indexed.
+    - The clipped-field widths assert the rect and the cursor.
+    - New: a short area with an error and the replace row; a
+      five-line `cap_lines` case written in terms of `MAX_ERROR_ROWS`.
+    - `open_editor` is inlined into `fixture`.
+- **G -- App.** (`frext-term/src/app.rs`, `frext-term/src/layout.rs`
+  (doc only).)
+  - **Field that is not drawn:** after the bar renders, a focused field
+    that was not drawn settles: `Replacement` falls back to `Pattern`,
+    and `Pattern` to `Editor`. This stops keys going to a field with
+    no cursor.
+  - **No re-seeding from the bar:** Ctrl+F / Ctrl+R / Ctrl+H while focus
+    is `Find(_)` no longer send `OpenSearch`, which re-seeded the
+    pattern from the match the step had just selected. They toggle the
+    replace row as needed (`ToggleReplaceRow`) and focus
+    `Find(Pattern)`, moving the cursor to the end.
+  - **Hover and hints:**
+    - `forget_layout` also clears the status hint.
+    - While a prompt is open, hover records only prompt targets.
+  - **Cursor:** focus moved by Tab (`FindReply::Focus`) also moves that
+    field's cursor to the end. The redundant `find_focus.is_some()`
+    check goes.
+  - **Docs:** the `send` doc and the `Areas::find_bar` doc are updated.
+  - **Tests:**
+    - New:
+      - clicking the With field
+      - the replace row's `[Replace]` button
+      - undoing Replace all
+      - Ctrl+E from the bar
+      - Ctrl+F from the sidebar
+      - the find cursor hidden under a prompt and under the menu
+      - the field that was not drawn
+      - no re-seeding
+    - App tests find bar columns from the drawn row instead of fixed
+      numbers.
+    - The `ToggleReplaceRow` test clicks `[Replace]` and drops the
+      `Wake`.
+    - The post-Esc check asserts `BASE`.
+    - The test-local imports move to module level.
+
+Recorded, not changed:
+
+- Under legacy encoding, Esc followed quickly by `c` / `w` / `r` / `l`
+  arrives as one Alt+letter, so it toggles an option instead of closing
+  the bar and typing. That is inherent to the encoding.
+- Alt+letter does not reach the app in freminal, which sends a plain
+  letter. That is a freminal bug, fixed in freminal; wezterm and kitty
+  work.
