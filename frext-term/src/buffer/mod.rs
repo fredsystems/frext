@@ -30,7 +30,7 @@ use std::ops::Range;
 use std::time::{Duration, Instant};
 
 use frext_core::highlight::incremental::IncrementalHighlighter;
-use frext_core::highlight::{MatchHighlights, overlay_matches};
+use frext_core::highlight::{MatchHighlightsRef, overlay_matches};
 use frext_core::syntax::language_from_path;
 use frext_core::tab::Tab;
 use ratatui::buffer::Buffer;
@@ -535,14 +535,15 @@ impl BufferView {
     /// screen position when it is visible. With no tab, both rects are
     /// blank.
     ///
-    /// `matches` are the search matches to paint, as byte ranges of the
-    /// whole text; only those overlapping the visible lines are used.
+    /// `matches` are the search matches to paint, borrowed, as byte ranges
+    /// of the whole text; only those overlapping the visible lines are
+    /// copied and used.
     pub fn render(
         &mut self,
         tab: Option<&Tab>,
         gutter: Rect,
         editor: Rect,
-        matches: &MatchHighlights,
+        matches: MatchHighlightsRef<'_>,
         buf: &mut Buffer,
         hits: &mut HitMap,
     ) -> Option<Position> {
@@ -601,7 +602,7 @@ mod tests {
 
     use super::*;
     use crate::buffer::cursor::Motion;
-    use frext_core::highlight::MatchBackground;
+    use frext_core::highlight::{MatchBackground, MatchHighlights};
     use frext_core::palette::BASE;
 
     const GUTTER: u16 = 4;
@@ -636,7 +637,7 @@ mod tests {
         width: u16,
         height: u16,
     ) -> (Buffer, Option<Position>, HitMap) {
-        draw_with(view, tab, width, height, &MatchHighlights::default())
+        draw_with(view, tab, width, height, MatchHighlightsRef::default())
     }
 
     /// [`draw`] with search `matches` painted.
@@ -645,7 +646,7 @@ mod tests {
         tab: Option<&Tab>,
         width: u16,
         height: u16,
-        matches: &MatchHighlights,
+        matches: MatchHighlightsRef<'_>,
     ) -> (Buffer, Option<Position>, HitMap) {
         let mut buf = Buffer::empty(Rect::new(0, 0, width, height));
         let mut hits = HitMap::default();
@@ -1070,7 +1071,7 @@ mod tests {
             Some(&tab),
             Rect::new(0, 1, GUTTER, 5),
             Rect::new(GUTTER, 1, 8, 5),
-            &MatchHighlights::default(),
+            MatchHighlightsRef::default(),
             &mut buf,
             &mut hits,
         );
@@ -1132,7 +1133,7 @@ mod tests {
             None,
             Rect::new(0, 0, GUTTER, 2),
             Rect::new(GUTTER, 0, 4, 2),
-            &MatchHighlights::default(),
+            MatchHighlightsRef::default(),
             &mut buf,
             &mut hits,
         );
@@ -1156,7 +1157,7 @@ mod tests {
             ranges: vec![3..6, 10..13],
             current: Some(1),
         };
-        let (buf, _, _) = draw_with(&mut view, Some(&tab), 20, 2, &matches);
+        let (buf, _, _) = draw_with(&mut view, Some(&tab), 20, 2, matches.as_ref());
         let base = Some(theme::color(BASE));
         let other = Some(theme::match_bg(MatchBackground::Other));
         let current = Some(theme::match_bg(MatchBackground::Current));
@@ -1182,11 +1183,37 @@ mod tests {
             ranges: vec![0..1, text.len() - 3..text.len()],
             current: Some(0),
         };
-        let (buf, _, _) = draw_with(&mut view, Some(&tab), 12, 5, &matches);
+        let (buf, _, _) = draw_with(&mut view, Some(&tab), 12, 5, matches.as_ref());
         assert_eq!(&row_text(&buf, 0)[..6], " 51 51");
         for y in 0..5 {
             for x in GUTTER..12 {
                 assert_eq!(bg(&buf, x, y), Some(theme::color(BASE)), "({x}, {y})");
+            }
+        }
+    }
+
+    #[test]
+    fn a_match_starting_above_the_viewport_paints_its_visible_part() {
+        let text = numbered(100);
+        let tab = tab(1, &text);
+        let mut view = BufferView::default();
+        draw(&mut view, Some(&tab), 12, 5);
+        view.wheel(&tab, 50);
+        // Line 50 is "50" and line 51 is "51"; all ASCII, so chars are bytes.
+        let line_50 = line_start(&text, 49);
+        let line_51 = line_start(&text, 50);
+        let matches = MatchHighlights {
+            ranges: std::iter::once(line_50 + 1..line_51 + 1).collect(),
+            current: None,
+        };
+        let (buf, _, _) = draw_with(&mut view, Some(&tab), 12, 5, matches.as_ref());
+        assert_eq!(&row_text(&buf, 0)[..6], " 51 51");
+        let base = Some(theme::color(BASE));
+        let other = Some(theme::match_bg(MatchBackground::Other));
+        for y in 0..5 {
+            for x in GUTTER..12 {
+                let want = if y == 0 && x == GUTTER { other } else { base };
+                assert_eq!(bg(&buf, x, y), want, "({x}, {y})");
             }
         }
     }
@@ -1201,7 +1228,7 @@ mod tests {
             ranges: vec![3..6, 10..13],
             current: None,
         };
-        let (buf, _, _) = draw_with(&mut view, Some(&tab), 20, 2, &matches);
+        let (buf, _, _) = draw_with(&mut view, Some(&tab), 20, 2, matches.as_ref());
         let other = Some(theme::match_bg(MatchBackground::Other));
         assert_eq!(bg(&buf, GUTTER + 3, 0), other);
         assert_eq!(bg(&buf, GUTTER + 4, 0), Some(theme::selection_bg()));

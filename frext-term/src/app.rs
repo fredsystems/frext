@@ -583,7 +583,7 @@ impl TermApp {
             tab,
             areas.gutter,
             areas.editor,
-            &self.editor.match_highlights(),
+            self.editor.match_highlights_ref(),
             buf,
             &mut self.hits,
         );

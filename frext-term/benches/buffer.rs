@@ -9,7 +9,7 @@ use std::hint::black_box;
 use std::time::Instant;
 
 use criterion::{Criterion, criterion_group, criterion_main};
-use frext_core::highlight::MatchHighlights;
+use frext_core::highlight::{MatchHighlights, MatchHighlightsRef};
 use frext_core::tab::Tab;
 use frext_term::buffer::BufferView;
 use frext_term::buffer::edit::EditAction;
@@ -85,13 +85,13 @@ const GUTTER: Rect = Rect::new(0, 0, 5, 24);
 const EDITOR: Rect = Rect::new(5, 0, 75, 24);
 
 fn render(view: &mut BufferView, tab: &Tab, buf: &mut Buffer, hits: &mut HitMap) {
-    render_with(view, tab, &MatchHighlights::default(), buf, hits);
+    render_with(view, tab, MatchHighlightsRef::default(), buf, hits);
 }
 
 fn render_with(
     view: &mut BufferView,
     tab: &Tab,
-    matches: &MatchHighlights,
+    matches: MatchHighlightsRef<'_>,
     buf: &mut Buffer,
     hits: &mut HitMap,
 ) {
@@ -138,7 +138,7 @@ fn bench_buffer(c: &mut Criterion) {
         b.iter(|| render(&mut view, &tab, &mut buf, &mut hits));
     });
     group.bench_function("render_with_matches_rust_5k_lines", |b| {
-        b.iter(|| render_with(&mut view, &tab, &matches, &mut buf, &mut hits));
+        b.iter(|| render_with(&mut view, &tab, matches.as_ref(), &mut buf, &mut hits));
     });
     group.finish();
 }

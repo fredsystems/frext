@@ -62,6 +62,37 @@ pub struct MatchHighlights {
 }
 
 impl MatchHighlights {
+    /// A borrowed view of these matches.
+    #[must_use]
+    pub fn as_ref(&self) -> MatchHighlightsRef<'_> {
+        MatchHighlightsRef {
+            ranges: &self.ranges,
+            current: self.current,
+        }
+    }
+
+    /// The matches that overlap the byte window `bytes`; see
+    /// [`MatchHighlightsRef::within`].
+    #[must_use]
+    pub fn within(&self, bytes: Range<usize>) -> Self {
+        self.as_ref().within(bytes)
+    }
+}
+
+/// A borrowed view of search matches: the same data as [`MatchHighlights`]
+/// without owning (or cloning) the ranges.
+///
+/// Precondition: `ranges` are sorted by start and do not overlap, as
+/// `SearchState` produces them.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MatchHighlightsRef<'a> {
+    /// Byte ranges of all matches in the buffer.
+    pub ranges: &'a [Range<usize>],
+    /// Index into `ranges` of the currently-focused match, if any.
+    pub current: Option<usize>,
+}
+
+impl MatchHighlightsRef<'_> {
     /// The matches that overlap the byte window `bytes`.
     ///
     /// Precondition: `ranges` are sorted by start and do not overlap, as
@@ -72,9 +103,9 @@ impl MatchHighlights {
     /// remapped to index the returned ranges, or `None` when the current
     /// match is outside the window. An empty window gives no matches.
     #[must_use]
-    pub fn within(&self, bytes: Range<usize>) -> Self {
+    pub fn within(self, bytes: Range<usize>) -> MatchHighlights {
         if bytes.start >= bytes.end {
-            return Self::default();
+            return MatchHighlights::default();
         }
         let lo = self.ranges.partition_point(|r| r.end <= bytes.start);
         let hi = self.ranges.partition_point(|r| r.start < bytes.end).max(lo);
@@ -87,7 +118,7 @@ impl MatchHighlights {
             .current
             .filter(|c| (lo..hi).contains(c))
             .map(|c| c - lo);
-        Self { ranges, current }
+        MatchHighlights { ranges, current }
     }
 }
 
@@ -162,6 +193,10 @@ fn as_byte_range(whole: &str, range: &str) -> Range<usize> {
 /// [`MatchBackground`] role; the current match uses
 /// [`MatchBackground::Current`]. Spans stay sorted and non-overlapping. With
 /// no matches the spans are returned unchanged.
+///
+/// Precondition: `matches.ranges` are sorted by start and do not overlap,
+/// as `SearchState` produces them; each byte's match is found by binary
+/// search.
 #[must_use]
 pub fn overlay_matches(spans: Vec<StyledSpan>, matches: &MatchHighlights) -> Vec<StyledSpan> {
     if matches.ranges.is_empty() {
@@ -177,7 +212,8 @@ pub fn overlay_matches(spans: Vec<StyledSpan>, matches: &MatchHighlights) -> Vec
         {
             return Some(MatchBackground::Current);
         }
-        if matches.ranges.iter().any(|r| r.contains(&b)) {
+        let i = matches.ranges.partition_point(|r| r.end <= b);
+        if matches.ranges.get(i).is_some_and(|r| r.start <= b) {
             Some(MatchBackground::Other)
         } else {
             None
@@ -404,6 +440,8 @@ mod tests {
     fn within_an_empty_window_is_empty() {
         let m = spread_matches(Some(2));
         assert_eq!(m.within(21..21), MatchHighlights::default());
+        // A reversed window, built from variables so clippy's
+        // `reversed_empty_ranges` lint accepts it.
         let (start, end) = (30, 10);
         assert_eq!(m.within(start..end), MatchHighlights::default());
     }
@@ -442,5 +480,54 @@ mod tests {
             overlay_matches(spans.clone(), &m.within(window)),
             overlay_matches(spans, &m)
         );
+    }
+
+    #[test]
+    fn borrowed_within_equals_owned_within() {
+        for current in [None, Some(0), Some(2), Some(3), Some(4)] {
+            let m = spread_matches(current);
+            for window in [10..32, 12..20, 0..100, 50..60, 21..21] {
+                assert_eq!(m.as_ref().within(window.clone()), m.within(window));
+            }
+        }
+    }
+
+    #[test]
+    fn overlay_with_many_matches_equals_a_linear_scan() {
+        let text = "x".repeat(64);
+        // A one-byte match on every other byte.
+        let ranges: Vec<Range<usize>> = (0..text.len()).step_by(2).map(|b| b..b + 1).collect();
+        let m = MatchHighlights {
+            ranges,
+            current: Some(5),
+        };
+        // Several spans so split points fall inside and on span edges.
+        let spans: Vec<StyledSpan> = [0..7, 7..8, 8..33, 33..64]
+            .into_iter()
+            .map(plain_span)
+            .collect();
+        let out = overlay_matches(spans, &m);
+
+        let current = m.current.and_then(|i| m.ranges.get(i)).cloned();
+        let expected = |b: usize| {
+            if current.as_ref().is_some_and(|c| c.contains(&b)) {
+                Some(MatchBackground::Current)
+            } else if m.ranges.iter().any(|r| r.contains(&b)) {
+                Some(MatchBackground::Other)
+            } else {
+                None
+            }
+        };
+        let mut next = 0;
+        for span in &out {
+            assert_eq!(span.bytes.start, next, "gap or overlap at {span:?}");
+            next = span.bytes.end;
+            for b in span.bytes.clone() {
+                assert_eq!(span.background, expected(b), "byte {b}");
+            }
+        }
+        assert_eq!(next, text.len());
+        // Each byte alternates, so every byte is its own run.
+        assert_eq!(out.len(), text.len());
     }
 }

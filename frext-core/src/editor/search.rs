@@ -6,7 +6,12 @@ use std::ops::Range;
 use super::{
     BufferChange, Editor, EditorFocus, Effect, Outcome, SearchBar, SearchOption, StepDirection,
 };
-use crate::{edit_ops, highlight::MatchHighlights, offsets, search::SearchQuery};
+use crate::{
+    edit_ops,
+    highlight::{MatchHighlights, MatchHighlightsRef},
+    offsets,
+    search::SearchQuery,
+};
 
 /// Live state for the find/replace bar. Only the query itself survives
 /// across sessions.
@@ -429,6 +434,20 @@ impl Editor {
         }
     }
 
+    /// The match highlights to paint over the active buffer, borrowed rather
+    /// than cloned: empty while the find bar is closed.
+    #[must_use]
+    pub fn match_highlights_ref(&self) -> MatchHighlightsRef<'_> {
+        if self.search.open {
+            MatchHighlightsRef {
+                ranges: &self.search.matches,
+                current: self.search.current,
+            }
+        } else {
+            MatchHighlightsRef::default()
+        }
+    }
+
     /// The live search state.
     #[must_use]
     pub fn search(&self) -> &SearchState {
@@ -820,6 +839,23 @@ mod tests {
         let open = editor.match_highlights();
         assert_eq!(open.ranges, vec![0..3, 4..7]);
         assert_eq!(open.current, Some(0));
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn borrowed_match_highlights_are_empty_while_closed() {
+        let dir = temp_dir("search-highlights-ref");
+        let mut editor = editor_with_two_tabs(&dir, "foo foo", "");
+        find(&mut editor, "foo");
+
+        assert_eq!(editor.match_highlights_ref(), MatchHighlightsRef::default());
+
+        editor.apply(Command::OpenSearch(SearchBar::Find));
+        let open = editor.match_highlights_ref();
+        assert_eq!(open.ranges, &[0..3, 4..7]);
+        assert_eq!(open.current, Some(0));
+        assert_eq!(open, editor.match_highlights().as_ref());
 
         fs::remove_dir_all(&dir).unwrap();
     }
