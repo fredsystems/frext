@@ -5,7 +5,7 @@
 //! has focus, the editing keys: typing, deleting, caret motion (Shift
 //! extends the selection), clipboard, and undo/redo.
 //!
-//! While the search bar is open, Alt+C / Alt+W / Alt+R / Alt+L toggle
+//! While the find bar is open, Alt+C / Alt+W / Alt+R / Alt+L toggle
 //! match case, whole word, regex and in-selection, whatever has focus.
 //! An upper-case letter with Alt+Shift toggles too, which is how a
 //! terminal reports them with Caps Lock on, or with Shift held.
@@ -67,7 +67,7 @@ pub enum Action {
 pub struct KeyContext {
     /// How the terminal reports keys.
     pub keyboard: KeyboardMode,
-    /// Whether the search bar is open.
+    /// Whether the find bar is open.
     pub search_open: bool,
     /// Which pane has focus.
     pub focus: Focus,
