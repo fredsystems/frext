@@ -430,8 +430,13 @@ impl TermApp {
                 }
                 if mouse.kind == MouseEventKind::Drag(MouseButton::Left) && self.tree.is_resizing()
                 {
-                    self.tree.drag_to(mouse.column);
-                    self.forget_layout();
+                    if self.prompt.is_open(&self.editor) {
+                        // A prompt opened mid-drag: the border stays put.
+                        self.tree.end_resize();
+                    } else {
+                        self.tree.drag_to(mouse.column);
+                        self.forget_layout();
+                    }
                 }
             }
             MouseEventKind::Up(MouseButton::Left) => {
@@ -500,7 +505,8 @@ impl TermApp {
                     Some(Target::TreeEmpty) => self.set_focus(Focus::Sidebar),
                     Some(Target::TreeBorder) => self.tree.begin_resize(),
                     Some(
-                        Target::PromptPopup
+                        Target::TreeScrolled
+                        | Target::PromptPopup
                         | Target::PromptInput
                         | Target::PromptButton(_)
                         | Target::PromptCandidate(_)
@@ -554,9 +560,23 @@ impl TermApp {
                             self.buffer.wheel(tab, rows);
                         }
                     }
-                    Some(Target::TreeRow(_) | Target::TreeEmpty | Target::TreeBorder) => {
+                    Some(
+                        Target::TreeRow(_)
+                        | Target::TreeEmpty
+                        | Target::TreeBorder
+                        | Target::TreeScrolled,
+                    ) => {
                         self.tree.wheel(rows);
-                        self.forget_layout();
+                        // The rows moved under their regions: later wheel
+                        // events in the batch still scroll, clicks do not.
+                        self.hits.retarget(|target| match target {
+                            Target::TreeRow(_) | Target::TreeEmpty => Target::TreeScrolled,
+                            other => other,
+                        });
+                        if matches!(self.hovered, Some(Target::TreeRow(_))) {
+                            self.hovered = None;
+                            self.status.set_hint(None);
+                        }
                     }
                     _ => {}
                 }
@@ -722,9 +742,8 @@ impl TermApp {
             .editor
             .active_tab()
             .map_or(0, |tab| layout::gutter_width(line_count(&tab.text)));
-        let sidebar_width = self
-            .sidebar_shown()
-            .then(|| self.tree.effective_width(area.width));
+        self.tree.set_space(area.width.saturating_sub(gutter_width));
+        let sidebar_width = self.sidebar_shown().then(|| self.tree.width());
         let areas = layout::areas(
             area,
             find_bar::height(self.editor.search()),
@@ -759,7 +778,7 @@ impl TermApp {
             } else {
                 TreeFocus::Unfocused
             };
-            self.tree.render(
+            let refresh = self.tree.render(
                 &self.editor,
                 focus,
                 self.hovered,
@@ -767,6 +786,11 @@ impl TermApp {
                 buf,
                 &mut self.hits,
             );
+            // A hovered row index refers to the rows before the change.
+            if refresh == Refresh::Changed && matches!(self.hovered, Some(Target::TreeRow(_))) {
+                self.hovered = None;
+                self.status.set_hint(None);
+            }
         }
         let caret = self.buffer.render(
             tab,
@@ -3080,7 +3104,7 @@ mod tests {
 
     /// The sidebar's text at screen row `y` (the border excluded).
     fn sidebar_text(app: &TermApp, buf: &Buffer, y: u16) -> String {
-        let width = app.tree.effective_width(buf.area.width) - 1;
+        let width = app.tree.width() - 1;
         row_text(buf, y).chars().take(usize::from(width)).collect()
     }
 
@@ -3244,7 +3268,7 @@ mod tests {
         assert_gutter_at(&draw(&mut app), start - 1);
 
         press(&mut app, KeyCode::Char('<'), KeyModifiers::NONE, 40);
-        assert_eq!(app.tree.effective_width(80), MIN_WIDTH);
+        assert_eq!(app.tree.width(), MIN_WIDTH);
         assert_gutter_at(&draw(&mut app), MIN_WIDTH);
         fs::remove_dir_all(&dir).unwrap();
     }
@@ -3406,7 +3430,7 @@ mod tests {
         assert!(app.tree.is_resizing());
         // The border follows the mouse: at column 39 the sidebar is 40 wide.
         app.handle(mouse(left(MouseEventKind::Drag), 39, 10), now);
-        assert_eq!(app.tree.effective_width(80), 40);
+        assert_eq!(app.tree.width(), 40);
         app.handle(mouse(left(MouseEventKind::Up), 39, 10), now);
         assert!(!app.tree.is_resizing());
         let buf = draw(&mut app);
@@ -3416,15 +3440,24 @@ mod tests {
 
         // After the release a drag does nothing.
         app.handle(mouse(left(MouseEventKind::Drag), 50, 10), now);
-        assert_eq!(app.tree.effective_width(80), 40);
+        assert_eq!(app.tree.width(), 40);
 
         app.handle(mouse(left(MouseEventKind::Down), 39, 10), now);
         app.handle(mouse(left(MouseEventKind::Drag), 2, 10), now);
-        assert_eq!(app.tree.effective_width(80), MIN_WIDTH);
+        assert_eq!(app.tree.width(), MIN_WIDTH);
+        // The widest leaves the editor text 20 columns past the gutter " 1 ".
         app.handle(mouse(left(MouseEventKind::Drag), 79, 10), now);
-        assert_eq!(app.tree.effective_width(80), 80 - MIN_EDITOR_WIDTH);
+        assert_eq!(app.tree.width(), 80 - 3 - MIN_EDITOR_WIDTH);
         app.handle(mouse(left(MouseEventKind::Up), 79, 10), now);
         assert!(!app.tree.is_resizing());
+        let buf = draw(&mut app);
+        assert_eq!(buf[(56, 10)].bg, theme::tree_border().bg.unwrap());
+        assert_ne!(buf[(57, 10)].bg, theme::tree_border().bg.unwrap());
+        // The gutter is columns 57 to 59; the text is the last 20.
+        assert_eq!(buf[(58, 1)].symbol(), "1");
+        assert_eq!(app.hits.hit(59, 10), None);
+        assert_eq!(app.hits.hit(60, 10), Some(Target::Editor));
+        assert_eq!(app.hits.hit(79, 10), Some(Target::Editor));
         fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -3451,12 +3484,12 @@ mod tests {
         // A drag does not end it.
         app.handle(mouse(left(MouseEventKind::Drag), 34, 10), now);
         assert!(app.tree.is_resizing());
-        assert_eq!(app.tree.effective_width(80), 35);
+        assert_eq!(app.tree.width(), 35);
         draw(&mut app);
         app.handle(mouse(MouseEventKind::Moved, 34, 10), now);
         assert!(!app.tree.is_resizing());
         app.handle(mouse(left(MouseEventKind::Drag), 50, 10), now);
-        assert_eq!(app.tree.effective_width(80), 35);
+        assert_eq!(app.tree.width(), 35);
         fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -3471,7 +3504,7 @@ mod tests {
         app.handle(mouse(left(MouseEventKind::Down), 50, 10), now);
         assert!(!app.tree.is_resizing());
         app.handle(mouse(left(MouseEventKind::Drag), 60, 10), now);
-        assert_eq!(app.tree.effective_width(80), DEFAULT_WIDTH);
+        assert_eq!(app.tree.width(), DEFAULT_WIDTH);
         fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -3498,16 +3531,19 @@ mod tests {
         app.handle(mouse(left(MouseEventKind::Down), border, 10), now);
         app.handle(mouse(left(MouseEventKind::Drag), 59, 10), now);
         app.handle(mouse(left(MouseEventKind::Up), 59, 10), now);
-        assert_eq!(app.tree.effective_width(80), 60);
+        // 80 columns less the gutter " 1 " and the editor's 20.
+        assert_eq!(app.tree.width(), 57);
 
-        // In 40 columns the sidebar is clamped to 20, its border at 19.
+        // In 40 columns the sidebar is clamped to 40 - 3 - 20 = 17, its
+        // border at 16.
         let buf = draw_sized(&mut app, 40, 24);
-        assert_eq!(buf[(19, 10)].bg, theme::tree_border().bg.unwrap());
+        assert_eq!(app.tree.width(), 17);
+        assert_eq!(buf[(16, 10)].bg, theme::tree_border().bg.unwrap());
         app.handle(ctrl('e'), now);
         app.handle(key(KeyCode::Char('<'), KeyModifiers::NONE), now);
         let buf = draw_sized(&mut app, 40, 24);
-        assert_eq!(buf[(18, 10)].bg, theme::tree_border().bg.unwrap());
-        assert_ne!(buf[(19, 10)].bg, theme::tree_border().bg.unwrap());
+        assert_eq!(buf[(15, 10)].bg, theme::tree_border().bg.unwrap());
+        assert_ne!(buf[(16, 10)].bg, theme::tree_border().bg.unwrap());
         fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -3628,8 +3664,114 @@ mod tests {
             assert_eq!(app.editor().tabs().len(), tabs);
             assert_eq!(app.tree.selected(), None);
             assert!(!app.tree.is_resizing());
-            assert_eq!(app.tree.effective_width(80), DEFAULT_WIDTH);
+            assert_eq!(app.tree.width(), DEFAULT_WIDTH);
             assert_eq!(app.focus, Focus::Editor);
+        }
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// An app over a workspace of 40 files, `f00.txt` to `f39.txt`,
+    /// drawn once.
+    fn long_tree_app(tag: &str) -> (PathBuf, PathBuf, TermApp) {
+        let dir = temp_dir(tag);
+        let ws = dir.join("ws");
+        fs::create_dir_all(&ws).unwrap();
+        for n in 0..40 {
+            fs::write(ws.join(format!("f{n:02}.txt")), "").unwrap();
+        }
+        let editor = open_editor(&dir, &[], Some(&ws));
+        let mut app = TermApp::new(editor, KeyboardMode::Enhanced, ws.clone(), None);
+        draw(&mut app);
+        (dir, ws, app)
+    }
+
+    #[test]
+    fn a_batch_of_wheel_events_scrolls_by_all_of_them() {
+        let (dir, _ws, mut app) = long_tree_app("tree-wheel-batch");
+        // No render between the three events.
+        for _ in 0..3 {
+            app.handle(mouse(MouseEventKind::ScrollDown, 5, 10), Instant::now());
+        }
+        assert_eq!(app.hits.hit(5, 10), Some(Target::TreeScrolled));
+        let buf = draw(&mut app);
+        assert_eq!(sidebar_text(&app, &buf, tree_y(0)).trim(), "f09.txt");
+        assert_eq!(app.hits.hit(5, 10), Some(Target::TreeRow(17)));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn clicks_after_a_wheel_event_in_the_same_batch_do_nothing() {
+        let (dir, ws, mut app) = long_tree_app("tree-wheel-click");
+        let tabs = app.editor().tabs().len();
+        app.handle(mouse(MouseEventKind::Moved, 5, tree_y(1)), Instant::now());
+        assert_eq!(app.hovered, Some(Target::TreeRow(1)));
+        app.handle(mouse(MouseEventKind::ScrollDown, 5, 10), Instant::now());
+        assert_eq!(app.hovered, None);
+        assert_eq!(app.status.hint(), None);
+        // The border keeps its target.
+        assert_eq!(
+            app.hits.hit(DEFAULT_WIDTH - 1, 10),
+            Some(Target::TreeBorder)
+        );
+
+        left_click(&mut app, 5, tree_y(1));
+        right_click(&mut app, 5, tree_y(1));
+        right_click(&mut app, 5, tree_y(30));
+        assert_eq!(app.editor().tabs().len(), tabs);
+        assert_eq!(app.tree.selected(), None);
+        assert!(app.menu.is_none());
+        assert_eq!(app.focus, Focus::Editor);
+
+        // After a render the click lands on the row now drawn there.
+        draw(&mut app);
+        left_click(&mut app, 5, tree_y(1));
+        let f04 = ws.join("f04.txt");
+        assert_eq!(
+            app.editor().active_tab().unwrap().path.as_deref(),
+            Some(f04.as_path())
+        );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_prompt_opened_mid_drag_ends_the_drag() {
+        let (dir, _ws, mut app) = tree_app("tree-drag-prompt");
+        let border = DEFAULT_WIDTH - 1;
+        let now = Instant::now();
+        app.handle(mouse(left(MouseEventKind::Down), border, 10), now);
+        app.handle(mouse(left(MouseEventKind::Drag), 34, 10), now);
+        assert_eq!(app.tree.width(), 35);
+        app.handle(ctrl('o'), now);
+        assert!(app.prompt.is_open(&app.editor));
+        assert!(app.tree.is_resizing());
+
+        app.handle(mouse(left(MouseEventKind::Drag), 50, 10), now);
+        assert_eq!(app.tree.width(), 35);
+        assert!(!app.tree.is_resizing());
+
+        app.handle(key(KeyCode::Esc, KeyModifiers::NONE), now);
+        app.handle(mouse(left(MouseEventKind::Drag), 60, 10), now);
+        assert_eq!(app.tree.width(), 35);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_stale_hovered_row_is_dropped_for_good_after_a_refresh() {
+        let (dir, ws, mut app) = tree_app("tree-stale-hover");
+        let y = tree_y(1);
+        app.handle(mouse(MouseEventKind::Moved, 5, y), Instant::now());
+        assert_eq!(app.hovered, Some(Target::TreeRow(1)));
+        let buf = draw(&mut app);
+        assert_eq!(buf[(0, y)].bg, theme::hover_bg());
+
+        // Removing `docs` moves `Cargo.toml` into row 1.
+        fs::remove_dir_all(ws.join("docs")).unwrap();
+        for _ in 0..2 {
+            let buf = draw(&mut app);
+            assert!(sidebar_text(&app, &buf, y).starts_with("     Cargo.toml "));
+            assert_ne!(buf[(0, y)].bg, theme::hover_bg());
+            assert_eq!(app.hovered, None);
+            assert_eq!(app.status.hint(), None);
         }
         fs::remove_dir_all(&dir).unwrap();
     }

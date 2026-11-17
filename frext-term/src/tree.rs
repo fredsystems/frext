@@ -134,7 +134,8 @@ pub struct FileTree {
     top: usize,
     /// The requested width, border included.
     width: u16,
-    /// The terminal width at the last render.
+    /// The columns the sidebar and the editor text share, from the last
+    /// [`FileTree::set_space`].
     total: u16,
     /// The sidebar at the last render.
     area: Rect,
@@ -169,11 +170,21 @@ impl FileTree {
         }
     }
 
-    /// The stored width, border included, as clamped for the terminal
-    /// at the last render or resize.
+    /// The stored width, border included, as clamped at the last
+    /// [`FileTree::set_space`] or resize.
     #[must_use]
     pub const fn width(&self) -> u16 {
         self.width
+    }
+
+    /// Sets the `columns` the sidebar and the editor text share (the
+    /// terminal width minus the line-number gutter), so the editor text
+    /// keeps [`MIN_EDITOR_WIDTH`] of them, and clamps the stored width
+    /// against them. Keyboard and drag resizing clamp against the same
+    /// columns.
+    pub fn set_space(&mut self, columns: u16) {
+        self.total = columns;
+        self.width = clamp_width(self.width, self.total);
     }
 
     /// The width clamped for a terminal `total` columns wide.
@@ -495,6 +506,9 @@ impl FileTree {
     /// Draws the sidebar into `area` and records its hit regions.
     ///
     /// Without a workspace, or with an empty `area`, nothing is drawn.
+    /// Returns whether the refresh before drawing changed the rows, in
+    /// which case a hovered row index refers to the old rows.
+    #[must_use]
     pub fn render(
         &mut self,
         editor: &Editor,
@@ -503,21 +517,20 @@ impl FileTree {
         area: Rect,
         buf: &mut Buffer,
         hits: &mut HitMap,
-    ) {
+    ) -> Refresh {
         self.area = area;
-        self.total = buf.area.width;
-        self.width = clamp_width(self.width, self.total);
+        let refresh = self.refresh(editor.workspace());
         // A hovered row index refers to the rows before a change.
-        let hovered = match (self.refresh(editor.workspace()), hovered) {
+        let hovered = match (refresh, hovered) {
             (Refresh::Changed, Some(Target::TreeRow(_))) => None,
             (_, hovered) => hovered,
         };
         let Some(workspace) = editor.workspace() else {
-            return;
+            return refresh;
         };
         let area = area.intersection(buf.area);
         if area.is_empty() {
-            return;
+            return refresh;
         }
         paint::fill(buf, area, theme::chrome());
 
@@ -600,6 +613,7 @@ impl FileTree {
                 Target::TreeEmpty,
             );
         }
+        refresh
     }
 }
 
@@ -653,7 +667,22 @@ mod tests {
 
     use super::*;
 
-    fn temp_dir(tag: &str) -> PathBuf {
+    /// A temp directory, removed (ignoring errors) when the guard drops.
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn temp_dir(tag: &str) -> TempDir {
         let dir = std::env::temp_dir().join(format!(
             "frext-term-tree-test-{tag}-{}",
             std::time::SystemTime::now()
@@ -662,7 +691,7 @@ mod tests {
                 .as_nanos()
         ));
         fs::create_dir_all(&dir).unwrap();
-        dir
+        TempDir(dir)
     }
 
     fn open_editor(dir: &Path, files: &[PathBuf], workspace: Option<&Path>) -> Editor {
@@ -676,9 +705,9 @@ mod tests {
 
     /// A project with `src/main.rs`, `docs/`, `Cargo.toml` and
     /// `README.md`, in its own temp directory. Returns `(dir, project)`.
-    fn project(tag: &str) -> (PathBuf, PathBuf) {
+    fn project(tag: &str) -> (TempDir, PathBuf) {
         let dir = temp_dir(tag);
-        let project = dir.join("project");
+        let project = dir.path().join("project");
         fs::create_dir_all(project.join("src")).unwrap();
         fs::create_dir_all(project.join("docs")).unwrap();
         fs::write(project.join("src").join("main.rs"), "fn main() {}").unwrap();
@@ -688,11 +717,12 @@ mod tests {
     }
 
     /// An editor over the project fixture, with the project as workspace.
-    fn fixture(tag: &str, files: &[&str]) -> (PathBuf, Editor) {
+    /// Returns `(dir, project, editor)`; the test holds `dir` throughout.
+    fn fixture(tag: &str, files: &[&str]) -> (TempDir, PathBuf, Editor) {
         let (dir, project) = project(tag);
         let files: Vec<PathBuf> = files.iter().map(|name| project.join(name)).collect();
-        let editor = open_editor(&dir, &files, Some(&project));
-        (project, editor)
+        let editor = open_editor(dir.path(), &files, Some(&project));
+        (dir, project, editor)
     }
 
     const SIDEBAR: Rect = Rect::new(0, 0, 30, 8);
@@ -707,7 +737,7 @@ mod tests {
     ) -> (Buffer, HitMap) {
         let mut buf = Buffer::empty(SCREEN);
         let mut hits = HitMap::default();
-        tree.render(editor, focus, hovered, area, &mut buf, &mut hits);
+        let _refresh = tree.render(editor, focus, hovered, area, &mut buf, &mut hits);
         (buf, hits)
     }
 
@@ -760,12 +790,14 @@ mod tests {
     }
 
     #[test]
-    fn render_stores_area_and_total() {
-        let (_, editor) = fixture("stores", &[]);
+    fn render_stores_the_area_but_not_the_space() {
+        let (_dir, _, editor) = fixture("stores", &[]);
         let mut tree = FileTree::new();
         render(&mut tree, &editor, TreeFocus::Unfocused, None, SIDEBAR);
         assert_eq!(tree.area, SIDEBAR);
-        assert_eq!(tree.total, SCREEN.width);
+        // Only `set_space` sets the space and clamps the width.
+        assert_eq!(tree.total, 0);
+        assert_eq!(tree.width(), DEFAULT_WIDTH);
         assert_eq!(tree.root(), editor.workspace().map(|ws| ws.root.as_path()));
         assert_eq!(tree.rows().len(), 4);
         assert_eq!(
@@ -777,7 +809,7 @@ mod tests {
 
     #[test]
     fn header_shows_close_and_root() {
-        let (_, editor) = fixture("header", &[]);
+        let (_dir, _, editor) = fixture("header", &[]);
         let mut tree = FileTree::new();
         let (buf, hits) = render(&mut tree, &editor, TreeFocus::Unfocused, None, SIDEBAR);
         let root = editor.workspace().unwrap().display_root();
@@ -804,7 +836,7 @@ mod tests {
 
     #[test]
     fn narrow_header_is_blank() {
-        let (_, editor) = fixture("narrow-header", &[]);
+        let (_dir, _, editor) = fixture("narrow-header", &[]);
         let mut tree = FileTree::new();
         let (buf, hits) = render(
             &mut tree,
@@ -820,7 +852,7 @@ mod tests {
 
     #[test]
     fn collapsed_and_expanded_rows() {
-        let (project, mut editor) = fixture("rows", &[]);
+        let (_dir, project, mut editor) = fixture("rows", &[]);
         let mut tree = FileTree::new();
         let (buf, _) = render(&mut tree, &editor, TreeFocus::Unfocused, None, SIDEBAR);
         let rows: Vec<String> = (1..5).map(|y| row_text(&buf, y)).collect();
@@ -842,7 +874,7 @@ mod tests {
 
     #[test]
     fn border_column() {
-        let (_, editor) = fixture("border", &[]);
+        let (_dir, _, editor) = fixture("border", &[]);
         let mut tree = FileTree::new();
         let (buf, hits) = render(&mut tree, &editor, TreeFocus::Unfocused, None, SIDEBAR);
         for y in 0..SIDEBAR.height {
@@ -870,7 +902,7 @@ mod tests {
 
     #[test]
     fn row_and_empty_regions() {
-        let (_, editor) = fixture("regions", &[]);
+        let (_dir, _, editor) = fixture("regions", &[]);
         let mut tree = FileTree::new();
         let (_, hits) = render(&mut tree, &editor, TreeFocus::Unfocused, None, SIDEBAR);
         for index in 0..4u16 {
@@ -887,7 +919,7 @@ mod tests {
 
     #[test]
     fn full_sidebar_has_no_empty_region() {
-        let (_, editor) = fixture("full", &[]);
+        let (_dir, _, editor) = fixture("full", &[]);
         let mut tree = FileTree::new();
         let area = Rect::new(0, 0, 30, 5);
         let (_, hits) = render(&mut tree, &editor, TreeFocus::Unfocused, None, area);
@@ -897,7 +929,7 @@ mod tests {
 
     #[test]
     fn active_selected_and_hovered_styles() {
-        let (_, editor) = fixture("styles", &["Cargo.toml"]);
+        let (_dir, _, editor) = fixture("styles", &["Cargo.toml"]);
         let mut tree = FileTree::new();
         let (buf, _) = render(&mut tree, &editor, TreeFocus::Unfocused, None, SIDEBAR);
         // Cargo.toml is row 2, drawn at y = 3; its name starts at x = 5.
@@ -931,7 +963,7 @@ mod tests {
 
     #[test]
     fn long_name_is_cut_at_the_border() {
-        let (project, editor) = fixture("long", &[]);
+        let (_dir, project, editor) = fixture("long", &[]);
         let name = "a-really-long-file-name-that-overflows.txt";
         fs::write(project.join(name), "x").unwrap();
         let mut tree = FileTree::new();
@@ -954,7 +986,7 @@ mod tests {
 
     #[test]
     fn wide_name_is_never_split() {
-        let (project, editor) = fixture("wide", &[]);
+        let (_dir, project, editor) = fixture("wide", &[]);
         // "     " + 8 wide chars in 20 cells: the 8th would straddle
         // columns 19 and 20, the border, so it is dropped whole.
         let name = "\u{65e5}".repeat(8);
@@ -977,7 +1009,7 @@ mod tests {
 
     #[test]
     fn short_sidebar_scrolls_from_top() {
-        let (_, editor) = fixture("scroll", &[]);
+        let (_dir, _, editor) = fixture("scroll", &[]);
         let mut tree = FileTree::new();
         let area = Rect::new(0, 0, 30, 3);
         render(&mut tree, &editor, TreeFocus::Unfocused, None, area);
@@ -998,7 +1030,7 @@ mod tests {
 
     #[test]
     fn refresh_unchanged_then_changed_on_new_file() {
-        let (project, editor) = fixture("refresh", &[]);
+        let (_dir, project, editor) = fixture("refresh", &[]);
         let mut tree = FileTree::new();
         assert_eq!(tree.refresh(editor.workspace()), Refresh::Changed);
         assert_eq!(tree.refresh(editor.workspace()), Refresh::Unchanged);
@@ -1009,7 +1041,7 @@ mod tests {
 
     #[test]
     fn select_ignores_missing_rows() {
-        let (project, editor) = fixture("select", &[]);
+        let (_dir, project, editor) = fixture("select", &[]);
         let mut tree = FileTree::new();
         tree.refresh(editor.workspace());
         tree.select(9);
@@ -1023,7 +1055,7 @@ mod tests {
 
     #[test]
     fn selection_follows_its_path_when_a_folder_above_expands() {
-        let (project, mut editor) = fixture("follow", &[]);
+        let (_dir, project, mut editor) = fixture("follow", &[]);
         let mut tree = FileTree::new();
         tree.refresh(editor.workspace());
         tree.select(3);
@@ -1039,7 +1071,7 @@ mod tests {
 
     #[test]
     fn selection_moves_to_the_collapsed_parent() {
-        let (project, mut editor) = fixture("parent", &[]);
+        let (_dir, project, mut editor) = fixture("parent", &[]);
         let src = project.join("src");
         editor.apply(Command::SetExpanded {
             dir: src.clone(),
@@ -1060,7 +1092,7 @@ mod tests {
 
     #[test]
     fn selection_falls_back_to_the_clamped_index() {
-        let (project, editor) = fixture("deleted", &[]);
+        let (_dir, project, editor) = fixture("deleted", &[]);
         let mut tree = FileTree::new();
         tree.refresh(editor.workspace());
         tree.select(3);
@@ -1073,7 +1105,7 @@ mod tests {
 
     #[test]
     fn selection_is_none_without_a_workspace() {
-        let (_, editor) = fixture("none", &[]);
+        let (_dir, _, editor) = fixture("none", &[]);
         let mut tree = FileTree::new();
         tree.refresh(editor.workspace());
         tree.select(1);
@@ -1087,7 +1119,7 @@ mod tests {
 
     #[test]
     fn nothing_selected_stays_none() {
-        let (project, editor) = fixture("unselected", &[]);
+        let (_dir, project, editor) = fixture("unselected", &[]);
         let mut tree = FileTree::new();
         tree.refresh(editor.workspace());
         fs::write(project.join("new.txt"), "").unwrap();
@@ -1098,7 +1130,7 @@ mod tests {
     #[test]
     fn no_workspace_draws_nothing() {
         let dir = temp_dir("no-workspace");
-        let editor = open_editor(&dir, &[], None);
+        let editor = open_editor(dir.path(), &[], None);
         let mut tree = FileTree::new();
         let (buf, hits) = render(&mut tree, &editor, TreeFocus::Focused, None, SIDEBAR);
         assert_eq!(buf, Buffer::empty(SCREEN));
@@ -1115,19 +1147,23 @@ mod tests {
         KeyEvent::new(code, modifiers)
     }
 
-    /// Renders `tree` once into a `screen`-sized buffer at `area`.
-    fn render_in(tree: &mut FileTree, editor: &Editor, area: Rect, screen: Rect) {
+    /// Gives `tree` the whole `screen` width as its space, as the app
+    /// does with no gutter, then renders it once into a `screen`-sized
+    /// buffer at `area`.
+    fn render_in(tree: &mut FileTree, editor: &Editor, area: Rect, screen: Rect) -> Refresh {
+        tree.set_space(screen.width);
         let mut buf = Buffer::empty(screen);
         let mut hits = HitMap::default();
-        tree.render(editor, TreeFocus::Focused, None, area, &mut buf, &mut hits);
+        tree.render(editor, TreeFocus::Focused, None, area, &mut buf, &mut hits)
     }
 
-    /// A tree rendered once over the fixture in `area`.
-    fn keyed(tag: &str, area: Rect) -> (PathBuf, Editor, FileTree) {
-        let (project, editor) = fixture(tag, &[]);
+    /// A tree rendered once over the fixture in `area`, with `SCREEN`'s
+    /// width as its space. Returns `(dir, project, editor, tree)`.
+    fn keyed(tag: &str, area: Rect) -> (TempDir, PathBuf, Editor, FileTree) {
+        let (dir, project, editor) = fixture(tag, &[]);
         let mut tree = FileTree::new();
         render_in(&mut tree, &editor, area, SCREEN);
-        (project, editor, tree)
+        (dir, project, editor, tree)
     }
 
     fn selected_index(tree: &FileTree) -> Option<usize> {
@@ -1136,21 +1172,21 @@ mod tests {
 
     #[test]
     fn down_from_nothing_selects_the_first_row() {
-        let (_, _, mut tree) = keyed("down-first", SIDEBAR);
+        let (_dir, _, _, mut tree) = keyed("down-first", SIDEBAR);
         assert_eq!(tree.handle_key(key(KeyCode::Down)), TreeReply::Handled);
         assert_eq!(selected_index(&tree), Some(0));
     }
 
     #[test]
     fn end_from_nothing_selects_the_last_row() {
-        let (_, _, mut tree) = keyed("end-first", SIDEBAR);
+        let (_dir, _, _, mut tree) = keyed("end-first", SIDEBAR);
         assert_eq!(tree.handle_key(key(KeyCode::End)), TreeReply::Handled);
         assert_eq!(selected_index(&tree), Some(3));
     }
 
     #[test]
     fn up_and_down_step_and_stop_at_the_ends() {
-        let (_, _, mut tree) = keyed("step", SIDEBAR);
+        let (_dir, _, _, mut tree) = keyed("step", SIDEBAR);
         tree.handle_key(key(KeyCode::Down));
         for want in [1, 2, 3, 3] {
             assert_eq!(tree.handle_key(key(KeyCode::Down)), TreeReply::Handled);
@@ -1164,7 +1200,7 @@ mod tests {
 
     #[test]
     fn home_and_end() {
-        let (_, _, mut tree) = keyed("home-end", SIDEBAR);
+        let (_dir, _, _, mut tree) = keyed("home-end", SIDEBAR);
         tree.select(1);
         assert_eq!(tree.handle_key(key(KeyCode::End)), TreeReply::Handled);
         assert_eq!(selected_index(&tree), Some(3));
@@ -1190,7 +1226,7 @@ mod tests {
 
     #[test]
     fn page_keys_move_by_rows_height_minus_one() {
-        let (project, editor) = fixture("page", &[]);
+        let (_dir, project, editor) = fixture("page", &[]);
         for name in ["w1.txt", "w2.txt", "w3.txt", "w4.txt"] {
             fs::write(project.join(name), "").unwrap();
         }
@@ -1211,7 +1247,7 @@ mod tests {
 
     #[test]
     fn page_keys_move_by_one_in_a_one_row_sidebar() {
-        let (_, _, mut tree) = keyed("page-one", Rect::new(0, 0, 30, 2));
+        let (_dir, _, _, mut tree) = keyed("page-one", Rect::new(0, 0, 30, 2));
         tree.select(0);
         tree.handle_key(key(KeyCode::PageDown));
         assert_eq!(selected_index(&tree), Some(1));
@@ -1222,7 +1258,7 @@ mod tests {
     #[test]
     fn selection_scrolls_into_view_in_a_short_sidebar() {
         let area = Rect::new(0, 0, 30, 3);
-        let (project, editor, mut tree) = keyed("into-view", area);
+        let (_dir, project, editor, mut tree) = keyed("into-view", area);
         for _ in 0..3 {
             tree.handle_key(key(KeyCode::Down));
         }
@@ -1232,7 +1268,8 @@ mod tests {
         assert_eq!(tree.top, 2);
         let mut buf = Buffer::empty(SCREEN);
         let mut hits = HitMap::default();
-        tree.render(&editor, TreeFocus::Focused, None, area, &mut buf, &mut hits);
+        let refresh = tree.render(&editor, TreeFocus::Focused, None, area, &mut buf, &mut hits);
+        assert_eq!(refresh, Refresh::Unchanged);
         assert_eq!(row_text(&buf, 2), "     README.md");
         assert_eq!(buf[(0, 2)].bg, theme::tree_cursor_bg());
         assert_eq!(tree.selected(), Some(project.join("README.md").as_path()));
@@ -1243,7 +1280,7 @@ mod tests {
 
     #[test]
     fn right_expands_then_steps_into_a_folder() {
-        let (project, mut editor, mut tree) = keyed("right", SIDEBAR);
+        let (_dir, project, mut editor, mut tree) = keyed("right", SIDEBAR);
         let src = project.join("src");
         tree.select(1);
         let reply = tree.handle_key(key(KeyCode::Right));
@@ -1262,7 +1299,7 @@ mod tests {
 
     #[test]
     fn right_on_a_file_or_an_empty_expanded_folder_does_nothing() {
-        let (project, mut editor, mut tree) = keyed("right-file", SIDEBAR);
+        let (_dir, project, mut editor, mut tree) = keyed("right-file", SIDEBAR);
         let cargo = project.join("Cargo.toml");
         tree.select(2);
         assert_eq!(tree.handle_key(key(KeyCode::Right)), TreeReply::Handled);
@@ -1281,7 +1318,7 @@ mod tests {
 
     #[test]
     fn left_collapses_then_steps_out() {
-        let (project, mut editor, mut tree) = keyed("left", SIDEBAR);
+        let (_dir, project, mut editor, mut tree) = keyed("left", SIDEBAR);
         let src = project.join("src");
         editor.apply(Command::SetExpanded {
             dir: src.clone(),
@@ -1305,7 +1342,7 @@ mod tests {
 
     #[test]
     fn left_at_depth_zero_changes_nothing() {
-        let (project, _, mut tree) = keyed("left-top", SIDEBAR);
+        let (_dir, project, _, mut tree) = keyed("left-top", SIDEBAR);
         for (index, name) in [(0, "docs"), (3, "README.md")] {
             tree.select(index);
             let width = tree.width();
@@ -1318,7 +1355,7 @@ mod tests {
 
     #[test]
     fn enter_toggles_a_folder_and_opens_a_file() {
-        let (project, mut editor, mut tree) = keyed("enter", SIDEBAR);
+        let (_dir, project, mut editor, mut tree) = keyed("enter", SIDEBAR);
         let src = project.join("src");
         tree.select(1);
         let expand = Command::SetExpanded {
@@ -1348,7 +1385,7 @@ mod tests {
 
     #[test]
     fn right_left_enter_with_nothing_selected_are_handled() {
-        let (_, _, mut tree) = keyed("unselected-keys", SIDEBAR);
+        let (_dir, _, _, mut tree) = keyed("unselected-keys", SIDEBAR);
         for code in [KeyCode::Right, KeyCode::Left, KeyCode::Enter] {
             assert_eq!(tree.handle_key(key(code)), TreeReply::Handled, "{code:?}");
         }
@@ -1357,7 +1394,7 @@ mod tests {
 
     #[test]
     fn menu_keys_open_the_selected_rows_menu() {
-        let (project, _, mut tree) = keyed("menu", SIDEBAR);
+        let (_dir, project, _, mut tree) = keyed("menu", SIDEBAR);
         let menu_keys = [
             key_with(KeyCode::F(10), KeyModifiers::SHIFT),
             key(KeyCode::F(22)),
@@ -1393,7 +1430,7 @@ mod tests {
 
     #[test]
     fn menu_keys_with_nothing_selected_open_the_root_menu() {
-        let (_, editor, mut tree) = keyed("menu-root", SIDEBAR);
+        let (_dir, _, editor, mut tree) = keyed("menu-root", SIDEBAR);
         let root = editor.workspace().unwrap().root.clone();
         assert_eq!(
             tree.handle_key(key_with(KeyCode::F(10), KeyModifiers::SHIFT)),
@@ -1414,7 +1451,7 @@ mod tests {
 
     #[test]
     fn menu_anchor_follows_depth_area_and_scroll() {
-        let (project, mut editor) = fixture("anchor", &[]);
+        let (_dir, project, mut editor) = fixture("anchor", &[]);
         editor.apply(Command::SetExpanded {
             dir: project.join("src"),
             state: FolderState::Expanded,
@@ -1440,7 +1477,7 @@ mod tests {
 
     #[test]
     fn angle_brackets_resize_and_clamp() {
-        let (_, _, mut tree) = keyed("resize-keys", SIDEBAR);
+        let (_dir, _, _, mut tree) = keyed("resize-keys", SIDEBAR);
         // SCREEN is 50 wide, so the widest is 30, the default.
         assert_eq!(tree.handle_key(key(KeyCode::Char('>'))), TreeReply::Resized);
         assert_eq!(tree.width(), 30);
@@ -1468,7 +1505,7 @@ mod tests {
 
     #[test]
     fn modified_and_unbound_keys_are_ignored() {
-        let (_, _, mut tree) = keyed("ignored", SIDEBAR);
+        let (_dir, _, _, mut tree) = keyed("ignored", SIDEBAR);
         tree.select(1);
         let width = tree.width();
         let release =
@@ -1490,7 +1527,7 @@ mod tests {
 
     #[test]
     fn wheel_clamps_and_leaves_the_selection() {
-        let (_, _, mut tree) = keyed("wheel", Rect::new(0, 0, 30, 3));
+        let (_dir, _, _, mut tree) = keyed("wheel", Rect::new(0, 0, 30, 3));
         tree.select(1);
         tree.wheel(1);
         assert_eq!(tree.top, 1);
@@ -1507,7 +1544,7 @@ mod tests {
 
     #[test]
     fn drag_to_only_while_resizing() {
-        let (_, editor) = fixture("drag", &[]);
+        let (_dir, _, editor) = fixture("drag", &[]);
         let mut tree = FileTree::new();
         render_in(
             &mut tree,
@@ -1536,7 +1573,7 @@ mod tests {
 
     #[test]
     fn a_stale_hovered_row_after_a_refresh_is_not_painted() {
-        let (project, editor) = fixture("stale-hover", &[]);
+        let (_dir, project, editor) = fixture("stale-hover", &[]);
         let mut tree = FileTree::new();
         render(&mut tree, &editor, TreeFocus::Unfocused, None, SIDEBAR);
         // Row 1 is `src`; removing `docs` moves `Cargo.toml` into row 1.
@@ -1553,7 +1590,7 @@ mod tests {
 
     #[test]
     fn refresh_clamps_top_to_the_last_full_page() {
-        let (project, mut editor) = fixture("refresh-top", &[]);
+        let (_dir, project, mut editor) = fixture("refresh-top", &[]);
         let src = project.join("src");
         editor.apply(Command::SetExpanded {
             dir: src.clone(),
@@ -1573,7 +1610,7 @@ mod tests {
 
     #[test]
     fn zero_area_draws_nothing() {
-        let (_, editor) = fixture("zero", &[]);
+        let (_dir, _, editor) = fixture("zero", &[]);
         let mut tree = FileTree::new();
         let (buf, hits) = render(
             &mut tree,
@@ -1593,5 +1630,51 @@ mod tests {
         );
         assert_eq!(buf, Buffer::empty(SCREEN));
         assert_eq!(hits.hit(0, 0), None);
+    }
+
+    #[test]
+    fn set_space_clamps_the_stored_width() {
+        let mut tree = FileTree::new();
+        tree.set_space(200);
+        assert_eq!((tree.total, tree.width()), (200, DEFAULT_WIDTH));
+        // 40 columns leave the editor text 20, so the sidebar gets 20.
+        tree.set_space(40);
+        assert_eq!((tree.total, tree.width()), (40, 40 - MIN_EDITOR_WIDTH));
+        // The stored width stays clamped when the space grows again.
+        tree.set_space(200);
+        assert_eq!(tree.width(), 40 - MIN_EDITOR_WIDTH);
+        tree.set_space(10);
+        assert_eq!((tree.total, tree.width()), (10, MIN_WIDTH));
+        // Keyboard resizing clamps against the same space.
+        tree.set_space(57);
+        for _ in 0..60 {
+            tree.handle_key(key(KeyCode::Char('>')));
+        }
+        assert_eq!(tree.width(), 57 - MIN_EDITOR_WIDTH);
+    }
+
+    #[test]
+    fn render_returns_whether_the_rows_changed() {
+        let (_dir, project, editor) = fixture("render-refresh", &[]);
+        let mut tree = FileTree::new();
+        assert_eq!(
+            render_in(&mut tree, &editor, SIDEBAR, SCREEN),
+            Refresh::Changed
+        );
+        assert_eq!(
+            render_in(&mut tree, &editor, SIDEBAR, SCREEN),
+            Refresh::Unchanged
+        );
+        fs::write(project.join("new.txt"), "").unwrap();
+        assert_eq!(
+            render_in(&mut tree, &editor, SIDEBAR, SCREEN),
+            Refresh::Changed
+        );
+        // An empty area draws nothing but still reports the refresh.
+        fs::write(project.join("newer.txt"), "").unwrap();
+        assert_eq!(
+            render_in(&mut tree, &editor, Rect::new(0, 0, 0, 0), SCREEN),
+            Refresh::Changed
+        );
     }
 }
