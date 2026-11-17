@@ -319,7 +319,9 @@ impl BufferView {
     /// Records a change made to `tab` outside the view (a core command),
     /// where `before` is the text before it, as one undo group. The
     /// cursor is left alone; the app's effects place it. A tab the view
-    /// has never seen has nothing to record. A recorded group is never
+    /// has never seen (a new tab edited before its first render) gets
+    /// fresh view state for `before` first, so its edit is undoable too;
+    /// its layout is built on the next render. A recorded group is never
     /// coalesced, so `_now` does not affect grouping.
     ///
     /// `after` is the selection a redo restores, clamped to the new text:
@@ -333,13 +335,10 @@ impl BufferView {
         after: Option<Range<usize>>,
         _now: Instant,
     ) {
-        if !self.tabs.contains_key(&tab.id) {
-            prepare(&mut self.tabs, self.rect, tab);
-            return;
-        }
-        let Some(view) = self.tabs.get_mut(&tab.id) else {
-            return;
-        };
+        let view = self
+            .tabs
+            .entry(tab.id)
+            .or_insert_with(|| TabView::new(text_hash(before)));
         if before == tab.text {
             return;
         }
@@ -818,19 +817,28 @@ mod tests {
         let mut tab = tab(1, "aaa");
         let mut view = BufferView::default();
         let base = Instant::now();
-        // An unknown tab just starts being tracked.
+        // An unknown tab gets view state for `before`, and its edit is
+        // undoable.
         view.record_outside_edit(&tab, "zz", None, base);
         assert_eq!(view.caret(1), Some(0));
+        view.handle(&mut tab, EditAction::Undo, ms(base, 5));
+        assert_eq!(tab.text, "zz");
+        view.handle(&mut tab, EditAction::Redo, ms(base, 6));
+        assert_eq!(tab.text, "aaa");
         let before = tab.text.clone();
         tab.text = "aaaa".to_owned();
         view.record_outside_edit(&tab, &before, None, base);
         view.handle(&mut tab, EditAction::Undo, ms(base, 10));
         assert_eq!(tab.text, "aaa");
-        // No change records nothing.
+        // No change records nothing: the redo is still there, and the
+        // next undo reaches the unknown tab's edit.
         let before = tab.text.clone();
         view.record_outside_edit(&tab, &before, None, base);
-        view.handle(&mut tab, EditAction::Undo, ms(base, 20));
-        assert_eq!(tab.text, "aaa");
+        view.handle(&mut tab, EditAction::Redo, ms(base, 20));
+        assert_eq!(tab.text, "aaaa");
+        view.handle(&mut tab, EditAction::Undo, ms(base, 30));
+        view.handle(&mut tab, EditAction::Undo, ms(base, 40));
+        assert_eq!(tab.text, "zz");
     }
 
     /// Records "aaa" -> "aaaa" with `after`, then undoes and redoes it,

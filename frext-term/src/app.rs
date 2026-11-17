@@ -1258,6 +1258,24 @@ mod tests {
     }
 
     #[test]
+    fn a_paste_into_a_never_rendered_new_tab_is_undoable() {
+        let dir = temp_dir("paste-new-tab");
+        let mut app = app_with_text(&dir, "hello", KeyboardMode::Enhanced);
+        press(&mut app, KeyCode::Right, KeyModifiers::SHIFT, 5);
+        app.handle(ctrl('c'), Instant::now());
+
+        // One batch: no render between the new tab, the paste and the undo.
+        let tabs = app.editor().tabs().len();
+        app.handle(ctrl('n'), Instant::now());
+        app.handle(ctrl('v'), Instant::now());
+        assert_eq!(app.editor().active_index(), tabs);
+        assert_eq!(text_of(&app), "hello");
+        app.handle(ctrl('z'), Instant::now());
+        assert_eq!(text_of(&app), "");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn bracketed_paste_inserts_at_the_caret() {
         let dir = temp_dir("bracketed");
         let mut app = app_with_text(&dir, "ab", KeyboardMode::Enhanced);
