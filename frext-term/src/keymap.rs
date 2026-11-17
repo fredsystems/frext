@@ -3,9 +3,8 @@
 //!
 //! It covers the tab, search and focus shortcuts, and, while the editor
 //! has focus, the editing keys: typing, deleting, caret motion (Shift
-//! extends the selection), clipboard, and undo/redo. Shift+F10, F22 and
-//! the Menu key (plain or shifted) open the editor's context menu at the
-//! caret.
+//! extends the selection), clipboard, and undo/redo. Shift+F10, or F22 /
+//! Menu plain or with Shift, open the editor's context menu at the caret.
 //!
 //! While the find bar is open, Alt+C / Alt+W / Alt+R / Alt+L toggle
 //! match case, whole word, regex and in-selection, whatever has focus.
@@ -118,8 +117,9 @@ pub fn action_for(key: KeyEvent, ctx: KeyContext) -> Option<Action> {
 
 /// Whether `code` with `mods` is a context-menu key: Shift+F10, or
 /// F22 / Menu with no modifiers or exactly Shift (some terminals report
-/// Shift+F10 as F22). The file tree binds the same keys.
-fn is_menu_key(code: KeyCode, mods: KeyModifiers) -> bool {
+/// Shift+F10 as F22). The file tree uses it too, so both open their menu
+/// on the same keys.
+pub(crate) fn is_menu_key(code: KeyCode, mods: KeyModifiers) -> bool {
     let shifted = mods == KeyModifiers::SHIFT;
     match code {
         KeyCode::F(10) => shifted,
@@ -913,6 +913,17 @@ mod tests {
             assert_eq!(action_for(k, ctx()), Some(Action::OpenEditorMenu), "{k:?}");
             assert_eq!(
                 action_for(k, searching()),
+                Some(Action::OpenEditorMenu),
+                "{k:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn menu_keys_open_the_editor_menu_in_legacy_mode() {
+        for k in menu_keys() {
+            assert_eq!(
+                action_for(k, legacy()),
                 Some(Action::OpenEditorMenu),
                 "{k:?}"
             );

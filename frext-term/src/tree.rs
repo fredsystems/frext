@@ -299,12 +299,17 @@ impl FileTree {
     ///
     /// Up / Down / PageUp / PageDown / Home / End move the selection;
     /// Right and Left expand, collapse or walk the folders; Enter toggles
-    /// a folder or opens a file; Shift+F10, `F(22)` and Menu open the
-    /// context menu; `<` and `>` narrow and widen the sidebar. Any key
-    /// with Ctrl or Alt, and any release, is [`TreeReply::Ignored`].
+    /// a folder or opens a file; the editor's menu keys
+    /// ([`crate::keymap::is_menu_key`]: Shift+F10, or F22 / Menu plain or
+    /// with Shift) open the context menu; `<` and `>` narrow and widen
+    /// the sidebar. Any key with Ctrl, Alt, Super, Hyper or Meta, and any
+    /// release, is [`TreeReply::Ignored`].
     pub fn handle_key(&mut self, key: KeyEvent) -> TreeReply {
         if key.kind == KeyEventKind::Release || key.modifiers.intersects(BLOCKING_MODIFIERS) {
             return TreeReply::Ignored;
+        }
+        if crate::keymap::is_menu_key(key.code, key.modifiers) {
+            return self.open_menu();
         }
         let plain = key.modifiers.is_empty();
         let shifted = key.modifiers == KeyModifiers::SHIFT;
@@ -318,8 +323,6 @@ impl FileTree {
             KeyCode::Right if plain => self.right(),
             KeyCode::Left if plain => self.left(),
             KeyCode::Enter if plain => self.enter(),
-            KeyCode::F(10) if shifted => self.open_menu(),
-            KeyCode::F(22) | KeyCode::Menu if plain || shifted => self.open_menu(),
             KeyCode::Char('<') if plain || shifted => {
                 self.width = clamp_width(self.width.saturating_sub(1), self.total);
                 TreeReply::Resized
@@ -1426,6 +1429,31 @@ mod tests {
             }
         }
         assert_eq!(tree.handle_key(key(KeyCode::F(10))), TreeReply::Ignored);
+    }
+
+    #[test]
+    fn menu_keys_with_other_modifiers_do_not_open_the_menu() {
+        let (_dir, _, _, mut tree) = keyed("menu-modifiers", SIDEBAR);
+        tree.select(2);
+        for event in [
+            key_with(KeyCode::F(10), KeyModifiers::CONTROL | KeyModifiers::SHIFT),
+            key_with(KeyCode::F(10), KeyModifiers::ALT),
+            key_with(KeyCode::Menu, KeyModifiers::ALT),
+            key_with(KeyCode::Menu, KeyModifiers::CONTROL),
+            key_with(KeyCode::F(22), KeyModifiers::ALT | KeyModifiers::SHIFT),
+        ] {
+            assert_eq!(tree.handle_key(event), TreeReply::Ignored, "{event:?}");
+        }
+        for event in [
+            key_with(KeyCode::F(10), KeyModifiers::SHIFT),
+            key(KeyCode::F(22)),
+            key(KeyCode::Menu),
+        ] {
+            assert!(
+                matches!(tree.handle_key(event), TreeReply::OpenMenu { .. }),
+                "{event:?}"
+            );
+        }
     }
 
     #[test]

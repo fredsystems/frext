@@ -2,11 +2,15 @@
 //!
 //! [`entries`] mirrors the GUI's `editor_context_menu` in `frext`: the
 //! same items, labels and order. With a proofreading diagnostic under
-//! the click, the menu leads with its message, its fixes, "Add to
-//! dictionary" (spelling only) and "Ignore", then the editing items.
+//! the click or the caret, the menu leads with its message, its fixes,
+//! "Add to dictionary" (spelling only) and "Ignore", then the editing
+//! items.
+
+use std::borrow::Cow;
 
 use frext_core::editor::{Command, SearchBar};
 use frext_core::proofread::{Diagnostic, DiagnosticKind};
+use unicode_width::UnicodeWidthStr;
 
 use crate::menu::{Enablement, MenuEntry};
 use crate::popup;
@@ -30,11 +34,14 @@ pub fn entries(selection: Enablement, diagnostic: Option<&Diagnostic>) -> Vec<Me
 
 /// The proofreading items for `diagnostic`, ending with a separator.
 fn diagnostic_entries(diagnostic: &Diagnostic) -> Vec<MenuEntry<Command>> {
+    let flagged = shorten(&diagnostic.flagged);
     let mut entries: Vec<MenuEntry<Command>> = popup::wrap(&diagnostic.message, MESSAGE_WIDTH)
         .into_iter()
         .map(MenuEntry::Note)
         .collect();
     if diagnostic.suggestions.is_empty() {
+        // The item is disabled, so its value is never sent; any command
+        // would do, and `Ignore` is a harmless one.
         entries.push(item(
             "No suggestions",
             Enablement::Disabled,
@@ -43,7 +50,7 @@ fn diagnostic_entries(diagnostic: &Diagnostic) -> Vec<MenuEntry<Command>> {
     } else {
         entries.extend(diagnostic.suggestions.iter().map(|suggestion| {
             let label = if suggestion.is_empty() {
-                format!("Remove \u{201c}{}\u{201d}", diagnostic.flagged)
+                format!("Remove \u{201c}{flagged}\u{201d}")
             } else {
                 suggestion.clone()
             };
@@ -61,7 +68,7 @@ fn diagnostic_entries(diagnostic: &Diagnostic) -> Vec<MenuEntry<Command>> {
     entries.push(MenuEntry::Separator);
     if diagnostic.kind == DiagnosticKind::Spelling {
         entries.push(item(
-            &format!("Add \u{201c}{}\u{201d} to dictionary", diagnostic.flagged),
+            &format!("Add \u{201c}{flagged}\u{201d} to dictionary"),
             Enablement::Enabled,
             Command::AddToDictionary(diagnostic.flagged.clone()),
         ));
@@ -100,6 +107,32 @@ fn editing_entries(selection: Enablement) -> Vec<MenuEntry<Command>> {
     ]
 }
 
+/// `flagged` as shown in a label: unchanged when it is at most
+/// [`MESSAGE_WIDTH`] display columns, else cut on a char boundary to at
+/// most `MESSAGE_WIDTH - 1` columns and ended with `…`, so it is never
+/// wider than [`MESSAGE_WIDTH`].
+fn shorten(flagged: &str) -> Cow<'_, str> {
+    if flagged.width() <= MESSAGE_WIDTH {
+        return Cow::Borrowed(flagged);
+    }
+    let budget = MESSAGE_WIDTH.saturating_sub(1);
+    let mut end = 0;
+    for (start, c) in flagged.char_indices() {
+        let next = start + c.len_utf8();
+        if flagged
+            .get(..next)
+            .map_or(usize::MAX, UnicodeWidthStr::width)
+            > budget
+        {
+            break;
+        }
+        end = next;
+    }
+    let mut short = flagged.get(..end).unwrap_or_default().to_owned();
+    short.push('\u{2026}');
+    Cow::Owned(short)
+}
+
 /// A menu item labelled `label`.
 fn item(label: &str, enabled: Enablement, value: Command) -> MenuEntry<Command> {
     MenuEntry::Item {
@@ -111,7 +144,9 @@ fn item(label: &str, enabled: Enablement, value: Command) -> MenuEntry<Command> 
 
 #[cfg(test)]
 mod tests {
-    use unicode_width::UnicodeWidthStr;
+    // `unwrap` is acceptable in test code: a panic on a missing item is
+    // exactly the failure signal we want from a test.
+    #![allow(clippy::unwrap_used)]
 
     use super::*;
 
@@ -300,6 +335,143 @@ mod tests {
             entries[..notes.len()]
                 .iter()
                 .all(|entry| matches!(entry, MenuEntry::Note(_)))
+        );
+    }
+
+    fn flagged_as(kind: DiagnosticKind, flagged: &str, suggestions: &[&str]) -> Diagnostic {
+        Diagnostic {
+            flagged: flagged.to_owned(),
+            ..diagnostic(kind, "Odd.", suggestions)
+        }
+    }
+
+    /// The label of the item whose value is `value`.
+    fn label_of<'a>(entries: &'a [MenuEntry<Command>], value: &Command) -> &'a str {
+        items(entries)
+            .into_iter()
+            .find(|(_, _, v)| *v == value)
+            .map(|(label, ..)| label)
+            .unwrap()
+    }
+
+    #[test]
+    fn a_long_flagged_word_is_shortened_in_labels_only() {
+        let word = "x".repeat(200);
+        let d = flagged_as(DiagnosticKind::Spelling, &word, &[""]);
+        let entries = entries(Enablement::Enabled, Some(&d));
+
+        let add = Command::AddToDictionary(word.clone());
+        let add_label = label_of(&entries, &add);
+        assert!(
+            add_label.ends_with("\u{2026}\u{201d} to dictionary"),
+            "{add_label}"
+        );
+        let fixed = "Add \u{201c}\u{201d} to dictionary".width();
+        assert!(add_label.width() <= MESSAGE_WIDTH + fixed, "{add_label}");
+        assert_eq!(
+            add_label,
+            format!(
+                "Add \u{201c}{}\u{2026}\u{201d} to dictionary",
+                "x".repeat(39)
+            )
+        );
+
+        let remove = apply(&d, "");
+        let remove_label = label_of(&entries, &remove);
+        assert!(remove_label.ends_with("\u{2026}\u{201d}"), "{remove_label}");
+        let fixed = "Remove \u{201c}\u{201d}".width();
+        assert!(
+            remove_label.width() <= MESSAGE_WIDTH + fixed,
+            "{remove_label}"
+        );
+        assert!(matches!(
+            &remove,
+            Command::ApplySuggestion { flagged, .. } if *flagged == word
+        ));
+    }
+
+    #[test]
+    fn a_flagged_word_of_exactly_message_width_is_kept() {
+        let word = "y".repeat(MESSAGE_WIDTH);
+        assert_eq!(shorten(&word), word);
+        let d = flagged_as(DiagnosticKind::Spelling, &word, &[]);
+        let entries = entries(Enablement::Enabled, Some(&d));
+        assert_eq!(
+            label_of(&entries, &Command::AddToDictionary(word.clone())),
+            format!("Add \u{201c}{word}\u{201d} to dictionary")
+        );
+        let longer = "y".repeat(MESSAGE_WIDTH + 1);
+        assert_eq!(shorten(&longer).width(), MESSAGE_WIDTH);
+    }
+
+    #[test]
+    fn a_wide_flagged_word_is_shortened_by_width() {
+        // Each char is two columns: 19 fit in 39 columns, a 20th would not.
+        let word = "\u{6f22}".repeat(30);
+        assert_eq!(word.width(), 60);
+        let short = shorten(&word);
+        assert_eq!(short, format!("{}\u{2026}", "\u{6f22}".repeat(19)));
+        assert!(short.width() <= MESSAGE_WIDTH);
+    }
+
+    #[test]
+    fn a_grammar_diagnostic_gives_the_exact_entries() {
+        let d = diagnostic(DiagnosticKind::Grammar, "Odd phrasing.", &["the", ""]);
+        let mut want = vec![
+            MenuEntry::Note("Odd phrasing.".to_owned()),
+            test_item("the", Enablement::Enabled, apply(&d, "the")),
+            test_item(
+                "Remove \u{201c}wrrod\u{201d}",
+                Enablement::Enabled,
+                apply(&d, ""),
+            ),
+            MenuEntry::Separator,
+            test_item(
+                "Ignore",
+                Enablement::Enabled,
+                Command::Ignore(d.ignore_key()),
+            ),
+            MenuEntry::Separator,
+        ];
+        want.extend(expected(Enablement::Enabled));
+        assert_eq!(entries(Enablement::Enabled, Some(&d)), want);
+    }
+
+    #[test]
+    fn no_suggestions_gives_the_exact_entries() {
+        let d = diagnostic(DiagnosticKind::Spelling, "Unknown word.", &[]);
+        let mut want = vec![
+            MenuEntry::Note("Unknown word.".to_owned()),
+            test_item(
+                "No suggestions",
+                Enablement::Disabled,
+                Command::Ignore(d.ignore_key()),
+            ),
+            MenuEntry::Separator,
+            test_item(
+                "Add \u{201c}wrrod\u{201d} to dictionary",
+                Enablement::Enabled,
+                Command::AddToDictionary("wrrod".to_owned()),
+            ),
+            test_item(
+                "Ignore",
+                Enablement::Enabled,
+                Command::Ignore(d.ignore_key()),
+            ),
+            MenuEntry::Separator,
+        ];
+        want.extend(expected(Enablement::Disabled));
+        assert_eq!(entries(Enablement::Disabled, Some(&d)), want);
+    }
+
+    #[test]
+    fn an_empty_message_gives_no_notes() {
+        let d = diagnostic(DiagnosticKind::Grammar, "", &["the"]);
+        let entries = entries(Enablement::Enabled, Some(&d));
+        assert!(notes(&entries).is_empty());
+        assert_eq!(
+            entries.first(),
+            Some(&test_item("the", Enablement::Enabled, apply(&d, "the")))
         );
     }
 }
