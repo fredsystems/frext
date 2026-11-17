@@ -42,8 +42,8 @@ That boundary is what keeps the two front ends honest.
 | 03  | [TUI buffer view (editor widget)](03-term-buffer-view.md)         | complete      | 02         |
 | 04  | [TUI find and replace](04-term-find-replace.md)                   | complete      | 03         |
 | 05  | [TUI file-tree sidebar](05-term-file-tree.md)                     | complete      | 02         |
-| 06  | [Terminal capabilities and undercurl](06-term-capabilities.md)    | pending merge | 02         |
-| 07  | [TUI proofreading](07-term-proofreading.md)                       | stub          | 03, 06     |
+| 06  | [Terminal capabilities and undercurl](06-term-capabilities.md)    | complete      | 02         |
+| 07  | [TUI proofreading](07-term-proofreading.md)                       | active        | 03, 06     |
 | 08  | [TUI file icons (kitty images, Nerd Font)](08-term-file-icons.md) | stub          | 05, 06     |
 | 09  | [`frext-term` packaging and docs](09-term-packaging.md)           | stub          | 02         |
 

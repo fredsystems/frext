@@ -1,6 +1,6 @@
 # 06 -- Terminal capabilities and undercurl
 
-- **Status:** pending merge
+- **Status:** complete
 - **Depends on:** 02
 - **Branch:** `feat/frext-term-capabilities` (one branch, one commit per
   subtask, one PR)
