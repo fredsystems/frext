@@ -6,4 +6,5 @@
 //! restore) stays in [`crate::terminal`].
 
 pub mod caps;
+pub mod probe;
 pub mod tmux;
