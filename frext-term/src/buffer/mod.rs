@@ -18,7 +18,7 @@
 //! matches painted, proofreading diagnostics underlined). Its read-only
 //! queries ([`BufferView::grapheme_at_cell`], [`BufferView::caret_cell`],
 //! [`BufferView::rect`]) answer from the last render's rect without
-//! moving anything.
+//! moving anything; [`BufferView::caret_span`] needs no render at all.
 
 pub mod cells;
 pub mod cursor;
@@ -417,15 +417,16 @@ impl BufferView {
         fresh.then_some((view, layout))
     }
 
-    /// The first char of the grapheme of `tab` drawn in the absolute cell
-    /// (`column`, `row`). Moves nothing.
+    /// The char range of the grapheme of `tab` drawn in the absolute cell
+    /// (`column`, `row`), from its first char to just past its last. Moves
+    /// nothing.
     ///
     /// `None` past a row's content, below the last row, outside the editor
     /// rect of the last render, or without a fresh layout (the view does
     /// not know `tab`, `tab` changed since, or the layout is for another
     /// width).
     #[must_use]
-    pub fn grapheme_at_cell(&self, tab: &Tab, column: u16, row: u16) -> Option<usize> {
+    pub fn grapheme_at_cell(&self, tab: &Tab, column: u16, row: u16) -> Option<Range<usize>> {
         if !self.rect.contains(Position { x: column, y: row }) {
             return None;
         }
@@ -433,6 +434,20 @@ impl BufferView {
         let visual_row =
             top_row(layout, view.top).saturating_add(usize::from(row.saturating_sub(self.rect.y)));
         layout.grapheme_at(&tab.text, visual_row, column.saturating_sub(self.rect.x))
+    }
+
+    /// The chars of the graphemes either side of `tab`'s caret: from the
+    /// first char of the grapheme ending at the caret (or the caret itself
+    /// at the start of the text) to the end of the grapheme starting there
+    /// (or the caret itself at the end). The caret is first clamped to the
+    /// text. Needs no layout, so it is current even before a render.
+    ///
+    /// `None` when the view does not know `tab`.
+    #[must_use]
+    pub fn caret_span(&self, tab: &Tab) -> Option<Range<usize>> {
+        let view = self.tabs.get(&tab.id)?;
+        let caret = view.cursor.caret().min(tab.text.chars().count());
+        Some(cursor::previous_grapheme(&tab.text, caret)..cursor::next_grapheme(&tab.text, caret))
     }
 
     /// The screen cell of `tab`'s caret, computed as [`Self::render`]
@@ -1339,7 +1354,7 @@ mod tests {
         draw(&mut view, Some(&tab), 12, 4);
         view.set_selection(&tab, 1..3);
         let (column, row) = (GUTTER + 2, 1);
-        assert_eq!(view.grapheme_at_cell(&tab, column, row), Some(9));
+        assert_eq!(view.grapheme_at_cell(&tab, column, row), Some(9..10));
         assert_eq!(view.selection(1), Some(1..3));
         assert_eq!(view.caret(1), Some(3));
         assert!(!view.is_dragging());
@@ -1355,11 +1370,11 @@ mod tests {
         let tab = tab(1, "hi\nthere");
         let mut view = BufferView::default();
         draw(&mut view, Some(&tab), 12, 4);
-        assert_eq!(view.grapheme_at_cell(&tab, GUTTER + 1, 0), Some(1));
+        assert_eq!(view.grapheme_at_cell(&tab, GUTTER + 1, 0), Some(1..2));
         // Right of "hi", where a click would put the caret at its end.
         assert_eq!(view.grapheme_at_cell(&tab, GUTTER + 2, 0), None);
         assert_eq!(view.grapheme_at_cell(&tab, GUTTER + 5, 0), None);
-        assert_eq!(view.grapheme_at_cell(&tab, GUTTER + 4, 1), Some(7));
+        assert_eq!(view.grapheme_at_cell(&tab, GUTTER + 4, 1), Some(7..8));
         // Inside the editor, below the last row.
         assert_eq!(view.grapheme_at_cell(&tab, GUTTER, 2), None);
     }
@@ -1372,14 +1387,14 @@ mod tests {
         let mut view = BufferView::default();
         draw(&mut view, Some(&full), 12, 3);
         let last = view.rect().right() - 1;
-        assert_eq!(view.grapheme_at_cell(&full, last - 1, 0), Some(6));
+        assert_eq!(view.grapheme_at_cell(&full, last - 1, 0), Some(6..7));
         assert_eq!(view.grapheme_at_cell(&full, last, 0), None);
         // A grapheme wider than the wrap width overflows into it.
         let wide = tab(2, "\tx");
         draw(&mut view, Some(&wide), GUTTER + 4, 3);
         let last = view.rect().right() - 1;
-        assert_eq!(view.grapheme_at_cell(&wide, last, 0), Some(0));
-        assert_eq!(view.grapheme_at_cell(&wide, GUTTER, 1), Some(1));
+        assert_eq!(view.grapheme_at_cell(&wide, last, 0), Some(0..1));
+        assert_eq!(view.grapheme_at_cell(&wide, GUTTER, 1), Some(1..2));
     }
 
     #[test]
@@ -1388,7 +1403,7 @@ mod tests {
         let mut view = BufferView::default();
         assert_eq!(view.grapheme_at_cell(&tab, GUTTER, 0), None);
         draw(&mut view, Some(&tab), 12, 3);
-        assert_eq!(view.grapheme_at_cell(&tab, GUTTER, 0), Some(0));
+        assert_eq!(view.grapheme_at_cell(&tab, GUTTER, 0), Some(0..1));
         // In the gutter, left of the editor.
         assert_eq!(view.grapheme_at_cell(&tab, GUTTER - 1, 0), None);
         // Below and right of the editor.
@@ -1407,11 +1422,56 @@ mod tests {
     }
 
     #[test]
+    fn grapheme_at_cell_spans_a_combining_sequence() {
+        let tab = tab(1, "cafe\u{301} x");
+        let mut view = BufferView::default();
+        draw(&mut view, Some(&tab), 20, 2);
+        assert_eq!(view.grapheme_at_cell(&tab, GUTTER + 3, 0), Some(3..5));
+        assert_eq!(view.grapheme_at_cell(&tab, GUTTER + 4, 0), Some(5..6));
+    }
+
+    /// The caret span of `text` with the caret placed at `caret`.
+    fn span_at(text: &str, caret: usize) -> Option<Range<usize>> {
+        let tab = tab(1, text);
+        let mut view = BufferView::default();
+        view.set_selection(&tab, caret..caret);
+        view.caret_span(&tab)
+    }
+
+    #[test]
+    fn caret_span_covers_the_graphemes_either_side() {
+        assert_eq!(span_at("abc", 0), Some(0..1));
+        assert_eq!(span_at("abc", 2), Some(1..3));
+        assert_eq!(span_at("abc", 3), Some(2..3));
+        assert_eq!(span_at("", 0), Some(0..0));
+    }
+
+    #[test]
+    fn caret_span_spans_a_combining_sequence() {
+        let text = "cafe\u{301} x";
+        assert_eq!(span_at(text, 3), Some(2..5));
+        assert_eq!(span_at(text, 5), Some(3..6));
+    }
+
+    #[test]
+    fn caret_span_needs_a_known_tab_but_no_render() {
+        let tab = tab(1, "abc");
+        let mut view = BufferView::default();
+        assert_eq!(view.caret_span(&tab), None);
+        view.set_selection(&tab, 1..1);
+        assert_eq!(view.caret_span(&tab), Some(0..2));
+        // A text shrunk under the view clamps the caret.
+        let mut shrunk = tab.clone();
+        shrunk.text = String::new();
+        assert_eq!(view.caret_span(&shrunk), Some(0..0));
+    }
+
+    #[test]
     fn queries_are_none_after_a_render_at_another_width() {
         let tab = tab(1, "hello");
         let mut view = BufferView::default();
         draw(&mut view, Some(&tab), 12, 3);
-        assert_eq!(view.grapheme_at_cell(&tab, GUTTER, 0), Some(0));
+        assert_eq!(view.grapheme_at_cell(&tab, GUTTER, 0), Some(0..1));
         assert!(view.caret_cell(&tab).is_some());
         draw(&mut view, None, 20, 3);
         assert_eq!(view.grapheme_at_cell(&tab, GUTTER, 0), None);

@@ -20,7 +20,7 @@ use frext_core::editor::{
 };
 use frext_core::lines::line_count;
 use frext_core::proofread::Diagnostic;
-use frext_core::proofread::state::{Probe, diagnostic_in};
+use frext_core::proofread::state::diagnostic_in;
 use frext_core::syntax::language_from_path;
 use frext_core::workspace::RowKind;
 use ratatui::Frame;
@@ -337,9 +337,9 @@ impl TermApp {
         let Some(tab) = self.editor.active_tab() else {
             return;
         };
-        let diagnostic = self.buffer.caret(tab.id).and_then(|caret| {
+        let diagnostic = self.buffer.caret_span(tab).and_then(|span| {
             let diagnostics = self.editor.proofread().diagnostics(tab.id, &tab.text);
-            diagnostic_in(&diagnostics, caret, Probe::Caret).cloned()
+            diagnostic_in(&diagnostics, span).cloned()
         });
         let anchor = self.buffer.caret_cell(tab).map_or_else(
             || {
@@ -550,11 +550,11 @@ impl TermApp {
                         // The caret stays put: the cell only picks the
                         // diagnostic the menu shows.
                         let diagnostic = self.editor.active_tab().and_then(|tab| {
-                            let char_idx =
+                            let chars =
                                 self.buffer.grapheme_at_cell(tab, mouse.column, mouse.row)?;
                             let diagnostics =
                                 self.editor.proofread().diagnostics(tab.id, &tab.text);
-                            diagnostic_in(&diagnostics, char_idx, Probe::Cell).cloned()
+                            diagnostic_in(&diagnostics, chars).cloned()
                         });
                         self.open_editor_menu(diagnostic, MenuAnchor::At(at));
                     }
@@ -850,9 +850,9 @@ impl TermApp {
                 // message only describes it while the editor has focus.
                 let message = self
                     .buffer
-                    .caret(tab.id)
+                    .caret_span(tab)
                     .filter(|_| self.focus == Focus::Editor)
-                    .and_then(|caret| diagnostic_in(&diagnostics, caret, Probe::Caret))
+                    .and_then(|span| diagnostic_in(&diagnostics, span))
                     .and_then(|diagnostic| status_text(&diagnostic.message));
                 let left = message.unwrap_or_else(|| {
                     tab.path.as_deref().map_or_else(

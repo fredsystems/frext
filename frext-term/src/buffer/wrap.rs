@@ -230,24 +230,26 @@ impl WrapLayout {
         self.row_end(text, row)
     }
 
-    /// The first char index of the grapheme drawn in the cell at `column`
-    /// on visual row `row`: the grapheme whose cells contain `column`.
+    /// The char range of the grapheme drawn in the cell at `column` on
+    /// visual row `row`: the grapheme whose cells contain `column`, from its
+    /// first char to just past its last.
     ///
     /// `None` when `column` is at or past the end of the row's content,
     /// or `row` is past the last row (unlike [`Self::char_at`], which
     /// falls back to the last row).
     #[must_use]
-    pub fn grapheme_at(&self, text: &str, row: usize, column: u16) -> Option<usize> {
+    pub fn grapheme_at(&self, text: &str, row: usize, column: u16) -> Option<Range<usize>> {
         let visual = self.rows.get(row)?;
         let mut pos = visual.chars.start;
         let mut start_column: u16 = 0;
         for grapheme in row_content(text, visual).graphemes(true) {
             let end_column = start_column.saturating_add(cells::width(grapheme));
+            let end = pos.saturating_add(grapheme.chars().count());
             if column < end_column {
-                return Some(pos);
+                return Some(pos..end);
             }
             start_column = end_column;
-            pos = pos.saturating_add(grapheme.chars().count());
+            pos = end;
         }
         None
     }
@@ -500,19 +502,23 @@ mod tests {
         // A wide char's second cell is the wide char.
         let wide = "a漢b";
         let layout = WrapLayout::new(wide, 10);
-        assert_eq!(layout.grapheme_at(wide, 0, 1), Some(1));
-        assert_eq!(layout.grapheme_at(wide, 0, 2), Some(1));
-        assert_eq!(layout.grapheme_at(wide, 0, 3), Some(2));
+        assert_eq!(layout.grapheme_at(wide, 0, 1), Some(1..2));
+        assert_eq!(layout.grapheme_at(wide, 0, 2), Some(1..2));
+        assert_eq!(layout.grapheme_at(wide, 0, 3), Some(2..3));
         // A tab's last (4th) cell is the tab.
         let tab = "a\tb";
         let layout = WrapLayout::new(tab, 10);
-        assert_eq!(layout.grapheme_at(tab, 0, 4), Some(1));
-        assert_eq!(layout.grapheme_at(tab, 0, 5), Some(2));
-        // A combining sequence is found by its first char.
+        assert_eq!(layout.grapheme_at(tab, 0, 4), Some(1..2));
+        assert_eq!(layout.grapheme_at(tab, 0, 5), Some(2..3));
+        // A combining sequence spans all of its chars.
         let combining = "e\u{301}x";
         let layout = WrapLayout::new(combining, 10);
-        assert_eq!(layout.grapheme_at(combining, 0, 0), Some(0));
-        assert_eq!(layout.grapheme_at(combining, 0, 1), Some(2));
+        assert_eq!(layout.grapheme_at(combining, 0, 0), Some(0..2));
+        assert_eq!(layout.grapheme_at(combining, 0, 1), Some(2..3));
+        let cafe = "cafe\u{301} x";
+        let layout = WrapLayout::new(cafe, 10);
+        assert_eq!(layout.grapheme_at(cafe, 0, 3), Some(3..5));
+        assert_eq!(layout.grapheme_at(cafe, 0, 4), Some(5..6));
     }
 
     #[test]
@@ -520,13 +526,13 @@ mod tests {
         let text = "hello world\nab";
         let layout = WrapLayout::new(text, 8);
         // Row 0 "hello " is soft-wrapped: its trailing space is a cell.
-        assert_eq!(layout.grapheme_at(text, 0, 5), Some(5));
+        assert_eq!(layout.grapheme_at(text, 0, 5), Some(5..6));
         assert_eq!(layout.grapheme_at(text, 0, 6), None);
         // Row 1 "world": at and after its end.
-        assert_eq!(layout.grapheme_at(text, 1, 4), Some(10));
+        assert_eq!(layout.grapheme_at(text, 1, 4), Some(10..11));
         assert_eq!(layout.grapheme_at(text, 1, 5), None);
         assert_eq!(layout.grapheme_at(text, 1, 50), None);
-        assert_eq!(layout.grapheme_at(text, 2, 0), Some(12));
+        assert_eq!(layout.grapheme_at(text, 2, 0), Some(12..13));
         assert_eq!(layout.grapheme_at(text, 2, 2), None);
         // A row past the last row is not the last row.
         assert_eq!(layout.grapheme_at(text, 3, 0), None);
