@@ -46,10 +46,9 @@ where
 /// Runs `app` on `terminal` until it asks to quit or `events` runs dry.
 ///
 /// Each frame applies queued effects, draws with [`draw`], and ends the
-/// frame; then it
-/// blocks for the next batch of events and routes each one, stamped with
-/// `now()`. Quitting is checked after the draw, so the last frame is
-/// shown.
+/// frame; then it blocks for the next batch of events and routes each
+/// one, stamped with `now()`. Quitting is checked after the draw, so the
+/// last frame is shown.
 ///
 /// # Errors
 ///
@@ -97,7 +96,8 @@ mod tests {
     use frext_core::clipboard::MemoryClipboard;
     use frext_core::editor::Editor;
     use frext_core::persistence::Store;
-    use ratatui::layout::Rect;
+    use ratatui::backend::TestBackend;
+    use ratatui::layout::{Position, Rect};
     use ratatui::{TerminalOptions, Viewport};
 
     use super::*;
@@ -224,6 +224,13 @@ mod tests {
         let upload = find(output, b"\x1b_Ga=T").unwrap();
         let placeholder = find(output, PLACEHOLDER_CELLS[0].as_bytes()).unwrap();
         assert!(upload < placeholder, "{upload} >= {placeholder}");
+        // Seed 0's first id is 1, the foreground the placeholder carries;
+        // its colour SGR precedes the symbol.
+        let id_colour = find(output, b"\x1b[38;2;0;0;1;").unwrap();
+        assert!(
+            upload < id_colour && id_colour <= placeholder,
+            "{upload} {id_colour} {placeholder}"
+        );
 
         terminal.backend_mut().writer_mut().clear();
         draw(&mut app, &mut terminal).unwrap();
@@ -248,6 +255,48 @@ mod tests {
 
         assert!(!ours.backend().writer().is_empty());
         assert_eq!(ours.backend().writer(), theirs.backend().writer());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Where `app` puts the terminal cursor, read from a [`TestBackend`].
+    fn caret(app: &mut TermApp) -> Position {
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        assert!(terminal.backend().cursor_visible());
+        terminal.backend().cursor_position()
+    }
+
+    #[test]
+    fn draw_shows_the_cursor_for_the_editor_and_hides_it_for_the_sidebar() {
+        Colored::set_ansi_color_disabled(false);
+        let dir = temp_dir("cursor");
+        let mut drawn = workspace_app(&dir, "state-a");
+        let mut expected = workspace_app(&dir, "state-b");
+        let mut probe = workspace_app(&dir, "state-c");
+        let mut ours = terminal();
+        let mut theirs = terminal();
+
+        let Position { x, y } = caret(&mut probe);
+        let move_to = format!("\x1b[{};{}H", y + 1, x + 1);
+        draw(&mut drawn, &mut ours).unwrap();
+        theirs.draw(|frame| expected.render(frame)).unwrap();
+        let output = ours.backend().writer();
+        assert_eq!(output, theirs.backend().writer());
+        assert!(find(output, b"\x1b[?25h").is_some());
+        // The caret's move is the last thing the frame writes.
+        assert!(output.ends_with(move_to.as_bytes()), "{move_to:?}");
+
+        let now = Instant::now();
+        drawn.handle(ctrl('e'), now);
+        expected.handle(ctrl('e'), now);
+        ours.backend_mut().writer_mut().clear();
+        theirs.backend_mut().writer_mut().clear();
+        draw(&mut drawn, &mut ours).unwrap();
+        theirs.draw(|frame| expected.render(frame)).unwrap();
+        let output = ours.backend().writer();
+        assert_eq!(output, theirs.backend().writer());
+        assert!(find(output, b"\x1b[?25l").is_some());
+        assert_eq!(find(output, b"\x1b[?25h"), None);
         fs::remove_dir_all(&dir).unwrap();
     }
 }

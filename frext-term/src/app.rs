@@ -804,6 +804,9 @@ impl TermApp {
     }
 
     /// Uses `icons` for the sidebar's file-tree icons.
+    ///
+    /// Call it before the first draw: replacing a provider drops its
+    /// images without deleting them from the terminal.
     pub fn set_icons(&mut self, icons: Box<dyn IconProvider>) {
         self.tree.set_icons(icons);
     }
@@ -821,6 +824,10 @@ impl TermApp {
     }
 
     /// Draws the whole screen into `frame`, rebuilding the hit map.
+    ///
+    /// It draws but never writes graphics: icon uploads it queues are only
+    /// written by [`crate::run::draw`], so the binary must draw through
+    /// that.
     pub fn render(&mut self, frame: &mut Frame) {
         if let Some(position) = self.render_frame(frame) {
             frame.set_cursor_position(position);

@@ -105,6 +105,11 @@ fn main() -> ExitCode {
     }
 
     let result = run::run(&mut app, &mut terminal, &events, Instant::now);
+    app.shutdown();
+    // Icon images are deleted here, while still in the alternate screen.
+    // On a panic the hook restores the terminal without the app, so they
+    // are not deleted then (bounded by the terminal's image quota; see
+    // plan 08's review fixes).
     let release = app.release_graphics();
     if !release.is_empty() {
         let backend = terminal.backend_mut();
@@ -112,7 +117,6 @@ fn main() -> ExitCode {
             log::warn!("failed to release the icon images: {err}");
         }
     }
-    app.shutdown();
     drop(terminal);
     drop(guard);
 

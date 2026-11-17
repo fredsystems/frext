@@ -121,9 +121,13 @@ pub enum AnsiColours {
 
 impl AnsiColours {
     /// What crossterm will do with colours, as decided by `NO_COLOR`.
+    ///
+    /// Uses crossterm's memoized check
+    /// (`Colored::ansi_color_disabled_memoized`), the same one its own
+    /// colour output uses, so the two always agree.
     #[must_use]
     pub fn from_env() -> Self {
-        if crossterm::style::Colored::ansi_color_disabled() {
+        if crossterm::style::Colored::ansi_color_disabled_memoized() {
             Self::Disabled
         } else {
             Self::Enabled
@@ -270,15 +274,6 @@ mod tests {
             assert!(provider_name(IconChoice::Ascii, colours).starts_with("AsciiIcons"));
             assert!(provider_name(IconChoice::None, colours).starts_with("NoIcons"));
         }
-    }
-
-    #[test]
-    fn ansi_colours_from_env_is_callable() {
-        let colours = AnsiColours::from_env();
-        assert!(matches!(
-            colours,
-            AnsiColours::Enabled | AnsiColours::Disabled
-        ));
     }
 
     /// The `(glyph, colour)` the Nerd table has for `stem`.
