@@ -64,6 +64,12 @@ impl SearchState {
         &self.query
     }
 
+    /// The replacement text for find/replace.
+    #[must_use]
+    pub fn replacement(&self) -> &str {
+        &self.replacement
+    }
+
     /// The match byte ranges in the active buffer, in order.
     #[must_use]
     pub fn matches(&self) -> &[Range<usize>] {
@@ -383,6 +389,16 @@ mod tests {
     fn editor_with_files(dir: &Path, files: &[PathBuf]) -> Editor {
         let store = Store::at(dir.join("state")).unwrap();
         Editor::open(store, Box::new(MemoryClipboard::default()), files, None)
+    }
+
+    #[test]
+    fn replacement_reads_back_what_was_written() {
+        let dir = temp_dir("replacement-getter");
+        let mut editor = editor_with_files(&dir, &[]);
+        assert_eq!(editor.search().replacement(), "");
+        "bye".clone_into(editor.search_replacement_mut());
+        assert_eq!(editor.search().replacement(), "bye");
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     /// An editor with two file-backed tabs with distinct contents, focused on

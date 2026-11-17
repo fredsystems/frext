@@ -384,10 +384,15 @@ Stop: report and await review.
 
 ### 04.5 -- Find bar: height and rendering
 
-Scope: `frext-term/src/find_bar.rs` (new), `frext-term/src/lib.rs`.
+Scope: `frext-term/src/find_bar.rs` (new), `frext-term/src/lib.rs`,
+`frext-core/src/editor/search.rs` (one getter, added during 04.5).
 
 What:
 
+- `frext-core`: `#[must_use] pub fn replacement(&self) -> &str` on
+  `SearchState`, with a test. Rendering takes `&Editor`, and the
+  replacement was readable only through `search_replacement_mut`.
+  This was found during 04.5 and is an accessor, not search logic.
 - `lib.rs`: `pub mod find_bar;`. The module doc describes the bar and
   the split of ownership (core owns the text, the bar owns cursors).
 - `#[derive(Debug, Clone, Copy, PartialEq, Eq)] pub enum FindField {
