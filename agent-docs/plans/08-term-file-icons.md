@@ -701,7 +701,8 @@ Decisions:
   `b = seed % 16383`, first `b * 1024 + 1`, last `b * 1024 + 1024` (so
   at most `0xFF_FC00`); `main` seeds it with `std::process::id()`, and
   `KittyIcons` stops (falls back to Nerd) at the block's end. 1024 ids
-  exceed the 623 stems.
+  exceed the 623 stems. Blocks are probabilistic: pids equal modulo
+  16383 share one (cleanup 08.18).
 - **Raster size cap.** `KittyIcons` refuses a raster side above
   `MAX_RASTER_SIDE = 512` pixels (Nerd fallback), so an absurd cell-size
   reply cannot allocate gigabytes.
@@ -810,6 +811,27 @@ tests, then regenerate the Nerd table (its votes change). Verification:
 `.prettierrc`, `.nvmrc`, `.alexrc.js` and `yarn.lock` resolve to their
 stems; every existing lookup test passes. Scheduling: its own change
 after this plan, before plan 09.
+
+### 08.18 -- Cleanup: terminal-assigned image ids
+
+Surface point: CodeRabbit on PR #46 (`term/kitty.rs`, `id_block`).
+Impact: blocks are chosen by `seed % ID_BLOCKS` with the process id as
+the seed, so two concurrent instances whose pids are equal modulo 16383
+(about 1 in 16383 pairs, e.g. pids 1000 and 17383) share a block in one
+terminal's id namespace: the second upload of an id replaces the first
+instance's image, and either instance's exit deletes the other's icons.
+Cosmetic only (wrong or blank icons), and documented on `id_block`.
+Scope of fix: upload with kitty image numbers (`I=<n>`) so the terminal
+picks a free id and replies `i=<id>,I=<n>;OK`; that needs replies
+enabled for uploads (`q=1`: errors suppressed, OK delivered), the reply
+parsed out of the input stream mid-session (the late-reply filter in
+`term/late_replies.rs` drops everything after the probe today), a
+number-to-id map in `KittyIcons`, and placeholders drawn only once the
+reply has arrived (one extra frame per new icon). Verification: byte
+tests for the `I=` upload; a parser test for the reply; a provider test
+that an icon is `Image` only after its reply, with the assigned id.
+Scheduling: a later plan, together with 08.16 (both touch the input
+path and re-uploads).
 
 ## Manual smoke checklist
 

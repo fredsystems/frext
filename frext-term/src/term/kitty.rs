@@ -95,9 +95,13 @@ pub const ID_BLOCKS: u32 = 16383;
 /// Image ids live in one namespace per terminal: two frext-term
 /// instances (or another image client) under one tmux would overwrite
 /// and delete each other's images if both counted from 1. Each process
-/// seeds this with its process id, so concurrent instances almost
-/// always get disjoint blocks. Block `b = seed % ID_BLOCKS` runs from
-/// `b * ID_BLOCK + 1` to `b * ID_BLOCK + ID_BLOCK`.
+/// seeds this with its process id, so concurrent instances usually get
+/// disjoint blocks; two whose seeds are equal modulo `ID_BLOCKS` (about
+/// 1 in 16383 pairs, e.g. pids 1000 and 17383) share a block and can
+/// show or delete each other's icons. Terminal-assigned ids (kitty
+/// image numbers, `I=`) would rule that out; see plan 08 cleanup
+/// 08.18. Block `b = seed % ID_BLOCKS` runs from `b * ID_BLOCK + 1` to
+/// `b * ID_BLOCK + ID_BLOCK`.
 #[must_use]
 pub const fn id_block(seed: u32) -> (ImageId, ImageId) {
     // `b < ID_BLOCKS`, so `b * ID_BLOCK + ID_BLOCK <= 0xFF_FC00`: no
