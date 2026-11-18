@@ -24,9 +24,16 @@ Home Manager module, CI coverage, and user documentation.
   (including fallbacks for terminals without the kitty keyboard
   protocol), the `[term]` config keys, icon and undercurl detection,
   and the tmux settings (`allow-passthrough on`, `usstyle`).
-- `agents.md`: add `frext-term` to the workspace layout and
-  architecture, and add the terminal-safety rule (always restore the
-  terminal, including from the panic hook).
+- `agents.md`: add `frext-term` and `xtask` (plan 08's Nerd table
+  generator, `cargo xtask nerd-icons`) to the workspace layout and
+  architecture, add the terminal-safety rule (always restore the
+  terminal, including from the panic hook), and make the verification
+  ritual's clippy `cargo clippy --workspace ...` (with
+  `default-members` set, a plain `cargo clippy` skips `xtask`).
+- The README's tmux section also covers kitty icons: `allow-passthrough
+  all` (with `on`, uploads from a hidden pane are lost; plan 08.16) and
+  a `terminal-features` entry giving the outer terminal `RGB` (the
+  image id travels in a 24-bit colour).
 
 ## Durable decisions
 

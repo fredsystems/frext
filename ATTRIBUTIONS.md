@@ -1,8 +1,9 @@
 # Attributions
 
 frext is licensed under the [MIT License](LICENSE). It also bundles a font
-asset and contains source code adapted from third parties whose licenses require
-attribution. Those components and their licenses are listed below.
+asset and file-icon artwork, and contains icon data and source code adapted from
+third parties whose licenses require attribution. Those components and their
+licenses are listed below.
 
 This document is the single source of truth for attribution: the README points
 here rather than duplicating license text.
@@ -29,6 +30,37 @@ synthesises slant and weight, so dedicated bold/italic faces are not embedded.
 The `Cove`/Code variant is used because it carries the coding ligatures
 (`->`, `=>`, `!=`, …) that frext's editor relies on; the `CaskaydiaMono` variant
 strips them.
+
+## Icon data
+
+The following file-type icon artwork and icon mapping data are bundled with or
+derived into frext. The full upstream license texts are bundled alongside the
+icons under [`assets/file-icons/`](assets/file-icons/) and under
+[`assets/licenses/`](assets/licenses/).
+
+### Catppuccin file icons
+
+- **Upstream:** Catppuccin Icons for Zed —
+  <https://github.com/catppuccin/zed-icons> (Mocha flavour), vendored at commit `6d953c8c7566b9e721d15b54e802dd77ae26fa9c`
+- **License:** MIT License; copyright (c) 2021 Catppuccin.
+- **License text:**
+  [`assets/file-icons/catppuccin-icons-LICENSE.md`](assets/file-icons/catppuccin-icons-LICENSE.md)
+- **Files:** `assets/file-icons/mocha/` — the SVGs are embedded in both the
+  `frext` and `frext-term` binaries via `frext-core/src/file_icon_bytes.rs`; the
+  lookup tables in `frext-core/src/file_icon_table.rs` are generated from the
+  upstream icon-theme manifest at the same commit.
+
+### nvim-web-devicons
+
+- **Upstream:** nvim-web-devicons —
+  <https://github.com/nvim-tree/nvim-web-devicons>, at commit `0dc0cfb0c6858041174a53c7aa4adaf65e994b3c`
+- **License:** MIT License; copyright (c) 2023 nvim-tree.
+- **License text:**
+  [`assets/licenses/nvim-web-devicons-LICENSE`](assets/licenses/nvim-web-devicons-LICENSE)
+- **Files:** `frext-term/src/icons/nerd_table.rs` — the Nerd Font glyph for each
+  icon stem is derived from the upstream extension and filename tables by
+  `cargo xtask nerd-icons`. The glyph colours come from the Catppuccin SVGs, not
+  from nvim-web-devicons.
 
 ## Adapted source code
 

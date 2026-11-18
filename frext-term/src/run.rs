@@ -1,6 +1,6 @@
 //! The UI loop: draw, wait for a batch of events, route them, repeat.
 
-use std::io;
+use std::io::{self, Write};
 use std::time::Instant;
 
 use ratatui::Terminal;
@@ -9,12 +9,46 @@ use ratatui::backend::Backend;
 use crate::app::TermApp;
 use crate::events::EventLoop;
 
+/// Draws one frame of `app` on `terminal`, writing the app's queued
+/// graphics (icon uploads) between filling the buffer and writing its
+/// diff.
+///
+/// This replaces [`Terminal::draw`]: an upload must precede, in the byte
+/// stream, the first frame that shows its placeholders, and
+/// `Terminal::draw` offers no point between filling the buffer and
+/// writing the diff. The app returns its cursor from
+/// [`TermApp::render_frame`] because a `Frame`'s cursor is private.
+///
+/// # Errors
+///
+/// Returns the backend's error, converted to an [`io::Error`], or the
+/// error writing the graphics.
+pub fn draw<B>(app: &mut TermApp, terminal: &mut Terminal<B>) -> io::Result<()>
+where
+    B: Backend + Write,
+    B::Error: Send + Sync + 'static,
+{
+    terminal.autoresize().map_err(io::Error::other)?;
+    let cursor = {
+        let mut frame = terminal.get_frame();
+        app.render_frame(&mut frame)
+    };
+    let graphics = app.take_graphics();
+    if !graphics.is_empty() {
+        terminal.backend_mut().write_all(&graphics)?;
+    }
+    terminal
+        .apply_buffer_with_cursor(cursor)
+        .map_err(io::Error::other)?;
+    Ok(())
+}
+
 /// Runs `app` on `terminal` until it asks to quit or `events` runs dry.
 ///
-/// Each frame applies queued effects, draws, and ends the frame; then it
-/// blocks for the next batch of events and routes each one, stamped with
-/// `now()`. Quitting is checked after the draw, so the last frame is
-/// shown.
+/// Each frame applies queued effects, draws with [`draw`], and ends the
+/// frame; then it blocks for the next batch of events and routes each
+/// one, stamped with `now()`. Quitting is checked after the draw, so the
+/// last frame is shown.
 ///
 /// # Errors
 ///
@@ -26,15 +60,13 @@ pub fn run<B>(
     now: impl Fn() -> Instant,
 ) -> io::Result<()>
 where
-    B: Backend,
+    B: Backend + Write,
     B::Error: Send + Sync + 'static,
 {
     app.begin_frame(events.waker());
     loop {
         app.apply_effects();
-        terminal
-            .draw(|frame| app.render(frame))
-            .map_err(io::Error::other)?;
+        draw(app, terminal)?;
         app.end_frame();
         if app.should_quit() {
             break;
@@ -60,14 +92,23 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+    use crossterm::style::Colored;
     use frext_core::clipboard::MemoryClipboard;
     use frext_core::editor::Editor;
     use frext_core::persistence::Store;
     use ratatui::backend::TestBackend;
+    use ratatui::layout::{Position, Rect};
+    use ratatui::{TerminalOptions, Viewport};
 
     use super::*;
     use crate::events::AppEvent;
+    use crate::icons::kitty::KittyIcons;
+    use crate::term::backend::FrextBackend;
+    use crate::term::caps::{CellPx, Multiplexer, UnderlineStyle};
+    use crate::term::kitty::PLACEHOLDER_CELLS;
     use crate::terminal::KeyboardMode;
+
+    type TestTerminal = Terminal<FrextBackend<Vec<u8>>>;
 
     fn temp_dir(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
@@ -81,6 +122,18 @@ mod tests {
         dir
     }
 
+    /// An 80 x 24 terminal writing to memory; a fixed viewport never asks
+    /// the backend for its size.
+    fn terminal() -> TestTerminal {
+        Terminal::with_options(
+            FrextBackend::new(Vec::new(), UnderlineStyle::Straight),
+            TerminalOptions {
+                viewport: Viewport::Fixed(Rect::new(0, 0, 80, 24)),
+            },
+        )
+        .unwrap()
+    }
+
     fn app(dir: &Path) -> TermApp {
         let editor = Editor::open(
             Store::at(dir.join("state")).unwrap(),
@@ -91,6 +144,21 @@ mod tests {
         TermApp::new(editor, KeyboardMode::Enhanced, dir.to_path_buf(), None)
     }
 
+    /// An app with the workspace `dir/ws`, which holds `main.rs`, and
+    /// its state in `dir/<state>`.
+    fn workspace_app(dir: &Path, state: &str) -> TermApp {
+        let ws = dir.join("ws");
+        fs::create_dir_all(&ws).unwrap();
+        fs::write(ws.join("main.rs"), "fn main() {}\n").unwrap();
+        let editor = Editor::open(
+            Store::at(dir.join(state)).unwrap(),
+            Box::new(MemoryClipboard::default()),
+            &[],
+            Some(&ws),
+        );
+        TermApp::new(editor, KeyboardMode::Enhanced, ws, None)
+    }
+
     fn ctrl(c: char) -> AppEvent {
         AppEvent::Input(Event::Key(KeyEvent::new(
             KeyCode::Char(c),
@@ -98,11 +166,17 @@ mod tests {
         )))
     }
 
+    fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+        haystack
+            .windows(needle.len())
+            .position(|window| window == needle)
+    }
+
     #[test]
     fn run_routes_queued_events_until_quit() {
         let dir = temp_dir("quit");
         let mut app = app(&dir);
-        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        let mut terminal = terminal();
         let events = EventLoop::new();
         let tx = events.sender();
         tx.send(ctrl('n')).unwrap();
@@ -112,13 +186,14 @@ mod tests {
 
         assert!(app.should_quit());
         assert_eq!(app.editor().tabs().len(), 2);
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
     fn run_stops_when_input_closes() {
         let dir = temp_dir("closed");
         let mut app = app(&dir);
-        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        let mut terminal = terminal();
         let events = EventLoop::new();
         events.sender().send(AppEvent::InputClosed).unwrap();
 
@@ -126,5 +201,102 @@ mod tests {
 
         assert!(app.should_quit());
         assert_eq!(app.editor().tabs().len(), 1);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn draw_writes_uploads_before_the_frame_that_shows_them() {
+        Colored::set_ansi_color_disabled(false);
+        let dir = temp_dir("uploads");
+        let mut app = workspace_app(&dir, "state");
+        app.set_icons(Box::new(KittyIcons::new(
+            CellPx {
+                width: 10,
+                height: 20,
+            },
+            Multiplexer::None,
+            0,
+        )));
+        let mut terminal = terminal();
+
+        draw(&mut app, &mut terminal).unwrap();
+        let output = terminal.backend().writer();
+        let upload = find(output, b"\x1b_Ga=T").unwrap();
+        let placeholder = find(output, PLACEHOLDER_CELLS[0].as_bytes()).unwrap();
+        assert!(upload < placeholder, "{upload} >= {placeholder}");
+        // Seed 0's first id is 1, the foreground the placeholder carries;
+        // its colour SGR precedes the symbol.
+        let id_colour = find(output, b"\x1b[38;2;0;0;1;").unwrap();
+        assert!(
+            upload < id_colour && id_colour <= placeholder,
+            "{upload} {id_colour} {placeholder}"
+        );
+
+        terminal.backend_mut().writer_mut().clear();
+        draw(&mut app, &mut terminal).unwrap();
+        assert_eq!(find(terminal.backend().writer(), b"\x1b_G"), None);
+
+        let release = String::from_utf8(app.release_graphics()).unwrap();
+        assert!(release.contains("a=d,d=I,i=1,q=2"), "{release:?}");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn draw_without_graphics_matches_terminal_draw() {
+        Colored::set_ansi_color_disabled(false);
+        let dir = temp_dir("plain");
+        let mut drawn = workspace_app(&dir, "state-a");
+        let mut expected = workspace_app(&dir, "state-b");
+        let mut ours = terminal();
+        let mut theirs = terminal();
+
+        draw(&mut drawn, &mut ours).unwrap();
+        theirs.draw(|frame| expected.render(frame)).unwrap();
+
+        assert!(!ours.backend().writer().is_empty());
+        assert_eq!(ours.backend().writer(), theirs.backend().writer());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Where `app` puts the terminal cursor, read from a [`TestBackend`].
+    fn caret(app: &mut TermApp) -> Position {
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        assert!(terminal.backend().cursor_visible());
+        terminal.backend().cursor_position()
+    }
+
+    #[test]
+    fn draw_shows_the_cursor_for_the_editor_and_hides_it_for_the_sidebar() {
+        Colored::set_ansi_color_disabled(false);
+        let dir = temp_dir("cursor");
+        let mut drawn = workspace_app(&dir, "state-a");
+        let mut expected = workspace_app(&dir, "state-b");
+        let mut probe = workspace_app(&dir, "state-c");
+        let mut ours = terminal();
+        let mut theirs = terminal();
+
+        let Position { x, y } = caret(&mut probe);
+        let move_to = format!("\x1b[{};{}H", y + 1, x + 1);
+        draw(&mut drawn, &mut ours).unwrap();
+        theirs.draw(|frame| expected.render(frame)).unwrap();
+        let output = ours.backend().writer();
+        assert_eq!(output, theirs.backend().writer());
+        assert!(find(output, b"\x1b[?25h").is_some());
+        // The caret's move is the last thing the frame writes.
+        assert!(output.ends_with(move_to.as_bytes()), "{move_to:?}");
+
+        let now = Instant::now();
+        drawn.handle(ctrl('e'), now);
+        expected.handle(ctrl('e'), now);
+        ours.backend_mut().writer_mut().clear();
+        theirs.backend_mut().writer_mut().clear();
+        draw(&mut drawn, &mut ours).unwrap();
+        theirs.draw(|frame| expected.render(frame)).unwrap();
+        let output = ours.backend().writer();
+        assert_eq!(output, theirs.backend().writer());
+        assert!(find(output, b"\x1b[?25l").is_some());
+        assert_eq!(find(output, b"\x1b[?25h"), None);
+        fs::remove_dir_all(&dir).unwrap();
     }
 }

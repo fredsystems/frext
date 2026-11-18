@@ -71,6 +71,13 @@ pub fn icon_bytes(stem: &str) -> Option<&'static [u8]> {
         .map(|index| ICON_BYTES[index].1)
 }
 
+/// Every bundled icon stem, in ascending sorted order.
+///
+/// Each yielded stem resolves to embedded bytes via [`icon_bytes`].
+pub fn stems() -> impl Iterator<Item = &'static str> {
+    ICON_BYTES.iter().map(|&(stem, _)| stem)
+}
+
 /// Look up `key` in a sorted `(key, value)` table by binary search.
 fn lookup(table: &[(&str, &'static str)], key: &str) -> Option<&'static str> {
     table
@@ -240,5 +247,37 @@ mod tests {
         let lower = icon_for_dir(".github", false);
         let upper = icon_for_dir(".GITHUB", false);
         assert_eq!(lower, upper);
+    }
+
+    #[test]
+    fn stems_lists_every_bundled_icon_in_sorted_order() {
+        let all: Vec<&str> = stems().collect();
+        assert_eq!(all.len(), 623);
+        assert!(
+            all.windows(2).all(|w| w[0] < w[1]),
+            "stems must be strictly increasing"
+        );
+        for stem in &all {
+            assert!(icon_bytes(stem).is_some(), "unresolvable stem: {stem}");
+        }
+        for expected in ["_file", "_folder", "_folder_open"] {
+            assert!(all.contains(&expected), "missing stem: {expected}");
+        }
+    }
+
+    #[test]
+    fn stems_covers_resolved_file_and_dir_icons() {
+        let all: Vec<&str> = stems().collect();
+        let mut resolved: Vec<&str> = ["main.rs", "Cargo.toml", "README.md", "x.unknown"]
+            .into_iter()
+            .map(icon_for_file)
+            .collect();
+        for dir in ["src", ".cargo"] {
+            resolved.push(icon_for_dir(dir, true));
+            resolved.push(icon_for_dir(dir, false));
+        }
+        for stem in resolved {
+            assert!(all.contains(&stem), "resolved stem not listed: {stem}");
+        }
     }
 }

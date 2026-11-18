@@ -33,6 +33,7 @@ use crate::editor_menu;
 use crate::events::AppEvent;
 use crate::find_bar::{self, FindBar, FindField, FindReply};
 use crate::hit::{HitMap, Target};
+use crate::icons::IconProvider;
 use crate::keymap::{self, Action, Focus, KeyContext};
 use crate::layout;
 use crate::menu::{ContextMenu, Enablement, MenuAnchor, MenuReply};
@@ -802,8 +803,45 @@ impl TermApp {
             .forget(self.editor.tabs().iter().map(|tab| tab.id));
     }
 
+    /// Uses `icons` for the sidebar's file-tree icons.
+    ///
+    /// Call it before the first draw: replacing a provider drops its
+    /// images without deleting them from the terminal.
+    pub fn set_icons(&mut self, icons: Box<dyn IconProvider>) {
+        self.tree.set_icons(icons);
+    }
+
+    /// The graphics bytes (icon uploads) queued since the last call, to
+    /// be written to the terminal before the frame that shows them.
+    pub fn take_graphics(&mut self) -> Vec<u8> {
+        self.tree.take_uploads()
+    }
+
+    /// The graphics bytes that delete every uploaded icon image, to be
+    /// written to the terminal before it is restored on exit.
+    pub fn release_graphics(&mut self) -> Vec<u8> {
+        self.tree.release_icons()
+    }
+
     /// Draws the whole screen into `frame`, rebuilding the hit map.
+    ///
+    /// It draws but never writes graphics: icon uploads it queues are only
+    /// written by [`crate::run::draw`], so the binary must draw through
+    /// that.
     pub fn render(&mut self, frame: &mut Frame) {
+        if let Some(position) = self.render_frame(frame) {
+            frame.set_cursor_position(position);
+        }
+    }
+
+    /// Draws the whole screen into `frame`, rebuilding the hit map, and
+    /// returns where the terminal cursor belongs (`None` hides it).
+    ///
+    /// [`TermApp::render`] sets this position on the frame; a caller that
+    /// drives the terminal itself passes it on, since a `Frame`'s cursor
+    /// cannot be read back.
+    #[must_use]
+    pub fn render_frame(&mut self, frame: &mut Frame) -> Option<Position> {
         self.hits.clear();
         let area = frame.area();
         let gutter_width = self
@@ -921,9 +959,7 @@ impl TermApp {
         let unobscured = self.menu.is_none() && !self.prompt.is_open(&self.editor);
         let editor_cursor = caret.filter(|_| self.focus == Focus::Editor && unobscured);
         let find_cursor = find_cursor.filter(|_| unobscured);
-        if let Some(position) = prompt_cursor.or(editor_cursor).or(find_cursor) {
-            frame.set_cursor_position(position);
-        }
+        prompt_cursor.or(editor_cursor).or(find_cursor)
     }
 }
 
@@ -1749,6 +1785,71 @@ mod tests {
             .backend()
             .cursor_visible()
             .then(|| terminal.backend().cursor_position())
+    }
+
+    /// Draws `app` through [`TermApp::render_frame`] and returns its cursor.
+    fn render_frame_cursor(app: &mut TermApp) -> Option<Position> {
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        let mut cursor = None;
+        terminal
+            .draw(|frame| cursor = app.render_frame(frame))
+            .unwrap();
+        cursor
+    }
+
+    #[test]
+    fn render_frame_returns_the_cursor_render_sets() {
+        let dir = temp_dir("render-frame-cursor");
+        let ws = dir.join("ws");
+        fs::create_dir_all(&ws).unwrap();
+        let editor = open_editor(&dir, &[], Some(&ws));
+        let mut app = TermApp::new(editor, KeyboardMode::Enhanced, ws.clone(), None);
+        app.handle(ctrl('b'), Instant::now());
+        draw(&mut app);
+        type_text(&mut app, "hi");
+        let expected = Some(Position { x: 5, y: 1 });
+        assert_eq!(frame_cursor(&mut app), expected);
+        assert_eq!(render_frame_cursor(&mut app), expected);
+
+        // A hidden cursor is `None` both ways.
+        app.handle(ctrl('b'), Instant::now());
+        app.handle(ctrl('e'), Instant::now());
+        assert_eq!(app.focus, Focus::Sidebar);
+        assert_eq!(frame_cursor(&mut app), None);
+        assert_eq!(render_frame_cursor(&mut app), None);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn graphics_pass_through_to_the_tree_icons() {
+        use crate::icons::kitty::KittyIcons;
+        use crate::term::caps::{CellPx, Multiplexer};
+
+        let dir = temp_dir("graphics");
+        let ws = dir.join("ws");
+        fs::create_dir_all(&ws).unwrap();
+        fs::write(ws.join("main.rs"), "fn main() {}\n").unwrap();
+        let editor = open_editor(&dir, &[], Some(&ws));
+        let mut app = TermApp::new(editor, KeyboardMode::Enhanced, ws.clone(), None);
+        assert!(app.take_graphics().is_empty());
+
+        app.set_icons(Box::new(KittyIcons::new(
+            CellPx {
+                width: 10,
+                height: 20,
+            },
+            Multiplexer::None,
+            0,
+        )));
+        draw(&mut app);
+        let uploads = String::from_utf8(app.take_graphics()).unwrap();
+        assert!(uploads.contains("\x1b_Ga=T"), "{uploads:?}");
+        assert!(app.take_graphics().is_empty());
+
+        let release = String::from_utf8(app.release_graphics()).unwrap();
+        assert!(release.contains("a=d,d=I,i=1,q=2"), "{release:?}");
+        assert!(app.release_graphics().is_empty());
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

@@ -1,7 +1,9 @@
 # 08 -- TUI file icons (kitty images, Nerd Font)
 
-- **Status:** stub
+- **Status:** pending merge
 - **Depends on:** 05, 06
+- **Branch:** `feat/frext-term-file-icons` (one branch, one commit per
+  subtask, one PR)
 
 ## Goal
 
@@ -17,13 +19,13 @@ by `TerminalCaps` and the `icons` override from plan 06.
     `frext_core::file_icon` lookup as the GUI) rasterised and drawn as a
     kitty image in a 2x1-cell slot.
   - `NerdIcons`: a Nerd Font glyph plus a Catppuccin colour per stem.
-  - `AsciiIcons` (already shipped in 05) and `None`.
+  - `AsciiIcons` (already shipped in 05) and `NoIcons`.
 - Selection: `icons = auto` -> `KittyIcons` when
   `TerminalCaps::images == KittyPlaceholders`, otherwise `NerdIcons`.
   Forced modes come from plan 06's config and CLI.
-- A generated `nerd_icon_table.rs` keyed by the same icon stems as
-  `file_icon_table.rs` (about 620), mapping to `(glyph, Rgb)`, with a
-  generic fallback glyph for unmapped stems, and its generator.
+- A generated `nerd_table.rs` keyed by the same icon stems as
+  `file_icon_table.rs` (623), mapping to `(glyph, Rgb)`, and its
+  generator.
 
 ## Durable decisions
 
@@ -79,22 +81,782 @@ unit-testable against byte output) rather than using ratatui-image's:
 - Glyphs are monochrome, so the colour comes from the table (Catppuccin
   Mocha colours, matching the SVG artwork's hue where practical).
 
-## Decide at activation
+## Decided at activation
 
-- Source data for the Nerd Font table: map from `nvim-web-devicons`
-  (extension/filename -> glyph + colour; Catppuccin publishes palette
-  overrides for it) onto frext's stems, or hand-curate per stem. Also
-  where the generator lives (`xtask` or a script) and how it is run.
-- Where `nerd_icon_table.rs` lives: `frext-term` (only consumer,
-  proposed) or `frext-core`.
-- Behaviour when the cell size changes mid-session (font zoom):
-  re-rasterise and re-upload on resize, or keep the stale size.
-- Whether to also show icons on tabs (the GUI does not today, so the
-  default is no).
+- **Nerd table source and generator.** A new `xtask` workspace crate,
+  run as `cargo xtask nerd-icons <nvim-web-devicons checkout>`. Each
+  stem's glyph comes from `nvim-tree/nvim-web-devicons`' extension and
+  filename glyphs, mapped onto frext's stems through
+  `frext_core::file_icon`'s own lookups (the voting rules are in 08.2,
+  as amended by 08.3 and 08.12); its colour is the dominant accent
+  colour of that stem's vendored Catppuccin Mocha SVG, so it matches
+  the artwork exactly. Folder stems get the open / closed folder
+  glyphs; an unvoted stem tries a devicons entry named like it, else a
+  generic file glyph. The generated header records the devicons commit.
+- **Table location**: `frext-term/src/icons/nerd_table.rs`. `frext-term`
+  is the only consumer.
+- **Cell size changes mid-session** (font zoom): keep the startup size.
+  The terminal scales each image to its 2x1 placeholder slot, so icons
+  stay placed correctly, only slightly soft or sharp. There is no
+  mid-session probe: a `CSI 16 t` reply would arrive as garbage input.
+- **Tabs**: no icons, matching the GUI.
+- **`icons = "none"`**: the 2-cell slot stays, blank, so the layout,
+  hit regions and menu anchors are the same in every mode.
 
-## Follow-up outside this repo
+## Further decisions (orchestrator)
+
+These come from reading the current code: `frext-term`'s `icons.rs`,
+`tree.rs` (`FileTree`, `render`, `draw_row`), `app.rs` (`TermApp::new`,
+`render`, `shutdown`), `run.rs`, `main.rs`, `terminal.rs`,
+`term/{caps,backend,tmux}.rs`; `frext-core`'s `file_icon.rs`,
+`file_icon_table.rs`, `file_icon_bytes.rs` and `palette.rs`; the GUI's
+SVG loading; ratatui-core 0.1.2's `Terminal::try_draw`; crossterm
+0.29's `Colored`; `Cargo.lock`; `flake.nix`; and nvim-web-devicons'
+`icons_by_file_extension.lua` / `icons_by_filename.lua`.
+
+- **Facts from the audit.**
+  - A stem is a `&'static str` (the SVG file name without `.svg`).
+    `file_icon` exposes only `icon_for_file(name)`,
+    `icon_for_dir(name, expanded: bool)` and `icon_bytes(stem)`; the
+    tables are private. `ICON_BYTES` is sorted by stem and holds 623
+    stems. The defaults are `_file`, `_folder` and `_folder_open`;
+    every folder stem is `_folder`, `_folder_open`, or starts with
+    `folder_` (open variants end in `_open`).
+  - The existing file-icon tables have **no generator in the repo**.
+  - `resvg` 0.45.1 (with `usvg` 0.45.1, `tiny-skia` 0.11.4) is pulled
+    in only by `egui_extras` 0.37.0, with `default-features = false`.
+    `base64` 0.22.1 is already in `Cargo.lock` (via crossterm and
+    usvg). Neither is a workspace dependency yet.
+  - `IconProvider::icon` takes `&self` and returns `IconCell`, which
+    has only `Text`. `FileTree` owns `icons: Box<dyn IconProvider>`
+    (always `AsciiIcons`); `draw_row` destructures `IconCell::Text`.
+    `main.rs` computes `IconChoice::select(settings.icons,
+    guard.caps())` and only logs it.
+  - `Terminal::draw` gives no point between filling the buffer and
+    writing the diff. ratatui-core 0.1.2 exposes the pieces:
+    `autoresize()`, `get_frame()`, `backend_mut()` and
+    `apply_buffer_with_cursor(Option<Position>)`. `Frame`'s cursor
+    field is `pub(crate)`, so the app must return its cursor itself.
+  - `FrextBackend<W>` implements `Write`; `TestBackend` does not.
+    `Terminal::with_options(.., Viewport::Fixed(rect))` never calls
+    `Backend::size`, so a `FrextBackend<Vec<u8>>` terminal works in
+    tests.
+  - crossterm drops every colour when `NO_COLOR` is set
+    (`Colored::ansi_color_disabled()`), which would erase the image id
+    carried in the placeholder's foreground.
+  - nvim-web-devicons' data files are one entry per line:
+    `["rs"] = { icon = "", color = "#DEA584", cterm_color = "216",
+    name = "Rs" },`.
+- **The provider seam.**
+
+  ```rust
+  pub trait IconProvider: std::fmt::Debug {
+      fn icon(&mut self, name: &str, kind: IconKind) -> IconCell;
+      fn take_uploads(&mut self) -> Vec<u8> { Vec::new() }
+      fn release(&mut self) -> Vec<u8> { Vec::new() }
+  }
+  ```
+
+  `icon` takes `&mut self` so `KittyIcons` can allocate ids and queue
+  uploads without interior mutability (`FileTree::render` borrows
+  `self.rows` and `self.icons` disjointly). `take_uploads` returns the
+  bytes queued by `icon` since the last call; `release` returns the
+  bytes that delete everything uploaded and forgets it.
+  `IconCell::Image { id: ImageId }` is the new variant.
+- **Kitty bytes** (`term/kitty.rs`), with `ESC _ G` ... `ESC \` around
+  each command:
+  - one chunk: `a=T,U=1,f=32,t=d,s=<w>,v=<h>,i=<id>,c=2,r=1,q=2;<b64>`
+    (no `m` key);
+  - several chunks (base64 split every 4096 bytes): the first is the
+    same keys plus `,m=1`, then `m=1,q=2;<b64>` for each middle chunk
+    and `m=0,q=2;<b64>` for the last;
+  - delete: `a=d,d=I,i=<id>,q=2` (with `q=2`, like every command, so no
+    reply reaches the input stream);
+  - every command is wrapped separately with `tmux::wrap_for`.
+- **Placeholder cells**: column 0 is `"\u{10EEEE}\u{305}\u{305}"`,
+  column 1 is `"\u{10EEEE}\u{305}\u{30D}"` (row 0; columns 0 and 1 of
+  kitty's diacritics table). Foreground
+  `Color::Rgb(id >> 16, (id >> 8) & 0xff, id & 0xff)`. Ids run
+  `1..=0xFF_FFFF`.
+- **Rasterising**: the SVG is drawn into a `2 * cell_w` x `cell_h`
+  transparent canvas, scaled to fit a centred square whose side is the
+  smaller of the two, and returned as straight (not premultiplied)
+  RGBA, which is what `f=32` means. A stem whose SVG does not parse is
+  drawn with the Nerd glyph instead.
+- **Drawing order.** `run::draw` replaces `terminal.draw`:
+  `autoresize`, `get_frame`, `app.render_frame(&mut frame)` (which
+  returns the cursor), `app.take_graphics()` written with
+  `terminal.backend_mut().write_all`, then
+  `apply_buffer_with_cursor(cursor)`. So every upload precedes, in the
+  byte stream, the first frame that shows its placeholders. On exit
+  `main` writes `app.release_graphics()` through the backend and
+  flushes before the terminal is dropped.
+- **`NO_COLOR`**: a `Kitty` choice with ANSI colours disabled builds
+  `NerdIcons` instead, with a `log::warn!`.
+- **Nerd fallbacks**: closed folder `U+E5FF`, open folder `U+E5FE`,
+  file `U+F15B`.
+- **Default members.** The workspace gains
+  `default-members = ["frext-core", "frext", "frext-term"]`, so a plain
+  `cargo build` (and the Nix package build) never builds or installs
+  the xtask. `cargo test --all` still covers it.
+
+## Execution model
+
+All subtasks run **strictly in sequence** on
+`feat/frext-term-file-icons`. Each subtask is one commit and leaves the
+suite green (`commit-discipline`). The orchestrator reviews the full
+diff of each subtask before committing it. Implementers do not commit,
+merge or push.
+
+Each subtask's verification includes the standard ritual, run inside
+`nix develop`:
+
+```sh
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo test --all
+cargo machete
+```
+
+`--workspace` is needed from 08.2 on: with `default-members` set, a
+plain `cargo clippy` skips `xtask` (the pre-commit clippy hook already
+passes `--workspace`).
+
+All code follows the workspace rules:
+
+- no `unwrap` / `expect` outside tests
+- no `unsafe`
+- no indexing that can panic (use `get`, or ranges proven in bounds)
+- every public item tested
+- doc comments on every public item
+- no bare `bool` parameters or fields for states (`state-representation`)
+- no dependency beyond those this plan names
+
+Benchmarks: no subtask touches a benchmarked path (`benches/buffer.rs`
+and `benches/wrap.rs` cover the buffer view only).
+
+Tests that check escape bytes call crossterm's
+`Colored::set_ansi_color_disabled(false)` first, as
+`term/backend.rs`'s tests do, so `NO_COLOR` in the environment cannot
+break them.
+
+## Subtasks
+
+### 08.1 -- Core: list every icon stem
+
+Scope: `frext-core/src/file_icon.rs`.
+
+What: `pub fn stems() -> impl Iterator<Item = &'static str>` (no
+`#[must_use]`: clippy's `double_must_use` rejects it on a returned
+iterator, which is already must-use), documented: every bundled icon stem, sorted, each resolvable by
+`icon_bytes`. It iterates `ICON_BYTES`.
+
+Deliverable: tests: `stems()` yields 623 stems, strictly increasing;
+each has `icon_bytes(stem).is_some()`; it contains `_file`, `_folder`
+and `_folder_open`; every stem `icon_for_file` / `icon_for_dir` returns
+for a sample of names (`main.rs`, `Cargo.toml`, `README.md`, `x.unknown`,
+`src` open and closed, `.cargo` open and closed) is among them.
+
+Verification: the standard ritual.
+
+Prohibitions: do NOT touch the generated tables or any other file;
+do NOT proceed to 08.2.
+
+Stop: report files changed and verification; await review.
+
+### 08.2 -- xtask: the Nerd table generator
+
+Scope: `Cargo.toml` (workspace `members`, new `default-members`),
+`.cargo/config.toml` (new), `xtask/Cargo.toml` (new),
+`xtask/src/main.rs` (new), `xtask/src/nerd_icons.rs` (new),
+`Cargo.lock`, and `.gitignore` (`!.cargo/config.toml`, since a bare
+`config.toml` pattern ignored it).
+
+What:
+
+- Workspace: `members` gains `"xtask"`;
+  `default-members = ["frext-core", "frext", "frext-term"]`.
+- `.cargo/config.toml`: `[alias] xtask = "run --package xtask --"`.
+- `xtask/Cargo.toml`: `name = "xtask"`, `publish = false`, the same
+  `*.workspace = true` package fields and `[lints] workspace = true` as
+  `frext-term/Cargo.toml`; dependencies `frext-core`, `regex`,
+  `thiserror` (all `workspace = true`), alphabetical.
+- `xtask/src/main.rs`: parses `nerd-icons <devicons-dir> [<out>]`;
+  `<out>` defaults to `frext-term/src/icons/nerd_table.rs` under the
+  workspace root (`CARGO_MANIFEST_DIR`'s parent). Reads
+  `<devicons-dir>/lua/nvim-web-devicons/default/icons_by_file_extension.lua`
+  and `icons_by_filename.lua`, gets the commit with
+  `git -C <devicons-dir> rev-parse HEAD`, writes the table, and prints
+  a usage message and exits non-zero on a bad command line or any
+  error. Errors are a `thiserror` enum; no `unwrap` / `expect`.
+- `xtask/src/nerd_icons.rs`, pure and unit-tested (as first built;
+  08.3 changed the entry type to `DevIcon { key, glyph, name }`, the
+  colour rule and the fallback, and 08.12 the vote):
+  - `pub fn parse_devicons(lua: &str) -> Vec<(String, String)>`: every
+    `["<key>"] = { icon = "<glyph>", ...` line as `(key, glyph)`;
+    entries whose glyph is not exactly one `char` are skipped.
+  - `pub fn votes(extensions, filenames) -> BTreeMap<&'static str,
+    String>`: each extension key `k` votes its glyph for
+    `icon_for_file(&format!("x.{k}"))`, each filename key for
+    `icon_for_file(k)`; votes for `_file` are dropped. A stem's glyph
+    is the one with the most votes, ties broken by the smallest glyph.
+  - `pub fn dominant_colour(svg: &str) -> Rgb`: the most frequent
+    `#rrggbb` or `#rgb` colour (case-insensitive, `#rgb` expanded),
+    ties broken by first occurrence; `palette::TEXT` when there is
+    none.
+  - `pub fn render_table(commit: &str, entries: &[(&str, char, Rgb)])
+    -> String`: the file below, one entry per stem in `stems()` order,
+    each glyph written as a `\u{..}` escape (lowercase hex) and each
+    colour as `Rgb::new(0x.., 0x.., 0x..)`.
+  - `pub fn entries(...)`: for every stem of `file_icon::stems()`:
+    `_folder` and closed `folder_*` stems get `U+E5FF`, `_folder_open`
+    and `folder_*_open` stems `U+E5FE`; others their vote, else
+    `U+F15B`; the colour is `dominant_colour` of the stem's SVG
+    (`icon_bytes`, as UTF-8).
+
+  The generated file:
+
+  ```rust
+  //! Generated Nerd Font icon table: icon stem to glyph and colour.
+  //!
+  //! Glyphs from `nvim-tree/nvim-web-devicons` commit `<sha>`,
+  //! mapped onto frext's icon stems; colours from each stem's Catppuccin
+  //! Mocha SVG. Generated by `cargo xtask nerd-icons <checkout>`; do
+  //! not edit by hand.
+
+  use frext_core::palette::Rgb;
+
+  /// Every icon stem as `(stem, glyph, colour)`, sorted by stem.
+  pub const NERD_ICONS: &[(&str, &str, Rgb)] = &[
+      ("3d", "\u{f01a7}", Rgb::new(0xa6, 0xe3, 0xa1)),
+  ];
+  ```
+
+  An entry whose three fields are wider than 60 characters (rustfmt's
+  `fn_call_width`) is written one field per line, as rustfmt lays it
+  out, so the generated file is `cargo fmt` clean as written.
+
+Deliverable: unit tests: parsing two real-format lines plus a comment
+and a `return {` line; a multi-char glyph skipped; a majority and a
+tie; `_file` votes dropped; `rs` reaching the `rust` stem;
+`dominant_colour` on `#rgb`, mixed case, a tie and no colour; folder
+stem glyphs; `render_table` output for two entries exactly; every
+rendered line at most 100 characters; argument parsing (missing dir,
+unknown command, default out path).
+
+Verification: the standard ritual; `cargo build` at the root does not
+build `xtask` (check `cargo build -v` lists no `xtask` unit, or
+`cargo metadata` default members).
+
+Prohibitions: do NOT generate the table or create
+`frext-term/src/icons/` (08.3); do NOT touch `frext-term` or
+`flake.nix`; do NOT proceed to 08.3.
+
+Stop: report files changed and verification; await review.
+
+### 08.3 -- Icons: module split and the generated table
+
+Scope: `frext-term/src/icons.rs` moved (`git mv`) to
+`frext-term/src/icons/mod.rs`, `frext-term/src/icons/nerd_table.rs`
+(new, generated), `flake.nix` (`extraExcludes` only).
+
+What:
+
+- Clone `https://github.com/nvim-tree/nvim-web-devicons` into
+  `/tmp/opencode/nvim-web-devicons` and check out
+  `0dc0cfb0c6858041174a53c7aa4adaf65e994b3c`. Run
+  `cargo xtask nerd-icons /tmp/opencode/nvim-web-devicons`. The table
+  is committed exactly as generated.
+- `icons/mod.rs`: `pub mod nerd_table;` and nothing else new.
+- `flake.nix`: add `"^frext-term/src/icons/nerd_table\\.rs$"` to
+  `extraExcludes` beside the file-icon tables, under their comment
+  (generated, so not ours to lint).
+
+Review of the first generated table (rework inside 08.3, scope adds
+`xtask/src/nerd_icons.rs` and `xtask/src/main.rs`):
+
+- **Accent colours win.** 259 of 623 stems came out Mocha Text,
+  because most artwork pairs a neutral outline with one accent and the
+  outline is counted as often or first. `dominant_colour` now picks the
+  most frequent colour that is not a Mocha neutral (Text, Subtext 1/0,
+  Overlay 2/1/0, Surface 2/1/0, Base, Mantle, Crust); only an SVG with
+  no accent at all takes its most frequent neutral; no colour at all is
+  still `TEXT`.
+- **Stem-name fallback.** A stem with no vote (and not a folder) tries,
+  in order, the stem, the stem with `-` and `_` removed, and the stem up
+  to its first `-` or `_`, each lowercased, against devicons' keys
+  (extensions, then filenames, lowercased) and then against devicons'
+  `name` fields (lowercased). The first hit's glyph is used, else
+  `U+F15B`. This recovers about 41 stems (`astro-config`, `go-mod`,
+  `package-json`, `lua-*`, ...). `parse_devicons` therefore returns the
+  `name` too.
+
+Deliverable: tests in `icons/mod.rs`: `NERD_ICONS` stems equal
+`file_icon::stems()` exactly and in order; every glyph is one `char`;
+`rust`, `_folder`, `_folder_open` and `_file` have the expected glyphs
+(`_folder` is `U+E5FF`, `_folder_open` `U+E5FE`, `_file` `U+F15B`).
+
+Verification: the standard ritual; `nix flake check` evaluation is not
+required, but `nixfmt --check flake.nix` and `statix check` must pass.
+
+Prohibitions: do NOT hand-edit the generated table; do NOT add
+providers (08.6); do NOT proceed to 08.4.
+
+Stop: report files changed, the devicons commit used, verification;
+await review.
+
+### 08.4 -- Term: kitty graphics encoding
+
+Scope: `frext-term/src/term/kitty.rs` (new), `frext-term/src/term/mod.rs`,
+`Cargo.toml` (workspace `base64 = "0.22.1"`), `frext-term/Cargo.toml`,
+`Cargo.lock`.
+
+What:
+
+- `#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)] pub struct
+  ImageId(u32)` with `pub const fn new(id: u32) -> Option<Self>`
+  (`None` outside `1..=0xFF_FFFF`), `pub const fn get(self) -> u32`,
+  `pub const fn next(self) -> Option<Self>`, and `#[must_use] pub const
+  fn color(self) -> ratatui::style::Color` as decided.
+- `pub const PLACEHOLDER_CELLS: [&str; 2]` as decided, documented.
+- `pub const CHUNK: usize = 4096;`
+- `#[must_use] pub fn upload(id: ImageId, width: u32, height: u32,
+  rgba: &[u8], multiplexer: Multiplexer) -> Vec<u8>` and
+  `#[must_use] pub fn delete(id: ImageId, multiplexer: Multiplexer) ->
+  Vec<u8>`, producing the bytes decided under "Kitty bytes".
+- `term/mod.rs`: `pub mod kitty;` and a module-doc mention.
+
+Deliverable: tests: exact bytes of a 1x1 upload; a payload of exactly
+4096 base64 bytes is one chunk; one byte more is two (`m=1` with all
+keys, then `m=0,q=2`); three chunks have a middle `m=1,q=2`; each chunk
+is wrapped separately under tmux; exact delete bytes, plain and tmux;
+`ImageId` bounds, `next` at the top, and `color` for `0x123456`; each
+placeholder cell is 8 bytes and `unicode_width` 1.
+
+Verification: the standard ritual.
+
+Prohibitions: do NOT touch icons or the tree; do NOT proceed to 08.5.
+
+Stop: report files changed and verification; await review.
+
+### 08.5 -- Icons: SVG rasteriser
+
+Scope: `frext-term/src/icons/raster.rs` (new),
+`frext-term/src/icons/mod.rs` (`pub mod raster;` only), `Cargo.toml`
+(workspace `resvg = { version = "0.45.1", default-features = false }`),
+`frext-term/Cargo.toml`, `Cargo.lock`.
+
+What: `#[must_use] pub fn rasterize(svg: &[u8], width: u32, height:
+u32) -> Option<Vec<u8>>`, documented: straight RGBA, `width * height *
+4` bytes, the icon fitted to the centred square as decided; `None` when
+either side is zero or above `u16::MAX` (so sizes convert to `f32`
+losslessly), the SVG does not parse, or the pixmap cannot be created. Uses `resvg::usvg` and
+`resvg::tiny_skia` (no separate dependency); demultiplies with
+`PremultipliedColorU8::demultiply`. `Cargo.lock` must still hold a
+single `resvg`, `usvg` and `tiny-skia`.
+
+Deliverable: tests: the `rust` icon at 20x20 has the right length,
+transparent corners and an opaque pixel of `#fab387`; at 40x20 the
+left and right 10 columns are fully transparent; a synthetic SVG with a
+`#ff0000` rect at `fill-opacity="0.5"` gives `(255, 0, 0, ~128)`
+(straight alpha); garbage bytes and a zero side give `None`.
+
+Verification: the standard ritual; `grep -c 'name = "resvg"'
+Cargo.lock` is 1.
+
+Prohibitions: do NOT add providers; do NOT proceed to 08.6.
+
+Stop: report files changed and verification; await review.
+
+### 08.6 -- Icons: the seam, `NerdIcons`, `NoIcons`, image drawing
+
+Scope: `frext-term/src/icons/mod.rs`, `frext-term/src/icons/nerd.rs`
+(new), `frext-term/src/tree.rs`.
+
+What:
+
+- `icons/mod.rs`: the trait as decided under "The provider seam";
+  `IconCell::Image { id: ImageId }` (documented: drawn as
+  `PLACEHOLDER_CELLS` across the slot); `#[derive(Debug, Clone, Copy,
+  Default)] pub struct NoIcons;` (empty text in `palette::TEXT` for
+  every kind); `AsciiIcons` adapted to `&mut self`. The module doc
+  lists the four providers, and the "plan 08 adds / extends" wording
+  in it and on `IconCell` goes. `pub mod nerd;`.
+- `icons/nerd.rs`: `#[derive(Debug, Clone, Copy, Default)] pub struct
+  NerdIcons;` looking up `icon_for_file(name)` or
+  `icon_for_dir(name, state == Expanded)` in `NERD_ICONS` by binary
+  search, giving `Text { text: glyph, color }`; an unlisted stem gets the
+  decided fallbacks in `palette::TEXT` (file) or `palette::BLUE`
+  (folders). `#[must_use] pub fn nerd_icon(stem: &str, kind: IconKind)
+  -> IconCell` is the shared lookup, and `#[must_use] pub fn
+  stem_for(name: &str, kind: IconKind) -> &'static str` the shared stem
+  choice (08.7 reuses both).
+- `tree.rs`: `draw_row` takes `&mut dyn IconProvider`; for `Image {
+  id }` it writes `PLACEHOLDER_CELLS[i]` into each slot cell `i` that
+  fits (`Buffer::cell_mut`, no indexing), styled `style.fg(id.color())`
+  so the row background stays. `FileTree` gains `pub fn
+  set_icons(&mut self, icons: Box<dyn IconProvider>)`, `pub fn
+  take_uploads(&mut self) -> Vec<u8>` and `pub fn release_icons(&mut
+  self) -> Vec<u8>`, each documented.
+
+Deliverable: tests: `NerdIcons` for `main.rs`, `Cargo.toml`, a closed
+and an open folder, and an unknown name (`_file`'s glyph); `nerd_icon`
+for a stem not in the table; `NoIcons` for every kind; the existing
+`AsciiIcons` tests; a tree test with a fake provider returning
+`Image { id }` for `0x010203`: both slot cells hold the placeholder
+symbols, fg `Rgb(1, 2, 3)`, and the selected row keeps its background;
+with the sidebar one cell too narrow only the first placeholder is
+drawn; `take_uploads` / `release_icons` pass through the provider's
+bytes.
+
+Verification: the standard ritual.
+
+Prohibitions: do NOT add `KittyIcons` or change app / run / main; do
+NOT proceed to 08.7.
+
+Stop: report files changed and verification; await review.
+
+### 08.7 -- Icons: `KittyIcons`
+
+Scope: `frext-term/src/icons/kitty.rs` (new),
+`frext-term/src/icons/mod.rs` (`pub mod kitty;` only).
+
+What: `#[derive(Debug)] pub struct KittyIcons` holding the cell size,
+the multiplexer, the uploaded stems
+(`HashMap<&'static str, Upload>` with a private `enum Upload {
+Image(ImageId), Failed }`), the next id, the queued bytes and a
+`Rasterizer` (`pub(crate) type Rasterizer = fn(&[u8], u32, u32) ->
+Option<Vec<u8>>`).
+
+- `#[must_use] pub fn new(cell_px: CellPx, multiplexer: Multiplexer)
+  -> Self` uses `raster::rasterize`; `pub(crate) fn with_rasterizer(..)`
+  takes one, for tests.
+- `icon`: the stem as `NerdIcons` finds it; a known `Image` gives
+  `IconCell::Image`; `Failed` gives `nerd_icon(stem, kind)`; an unseen
+  stem is rasterised at `2 * width` x `height` and, on success, given
+  the next id with its `kitty::upload` bytes queued; on failure (or ids
+  exhausted, or no bytes for the stem) it is marked `Failed` with one
+  `log::warn!`.
+- `take_uploads`: drains the queue. `release`: `kitty::delete` for
+  every uploaded id in id order, then forgets every stem and empties
+  the queue.
+
+Deliverable: tests (decoding nothing; assert on the bytes'
+structure): the first `main.rs` queues one upload with `i=1`, `s=20`,
+`v=20` for a 10x20 cell; a second `main.rs` and `lib.rs` (same stem)
+queue nothing; `Cargo.toml` gets `i=2`; `take_uploads` then returns
+empty; under tmux the upload is wrapped; a failing rasterizer gives
+the Nerd glyph, warns once and never queues; `release` deletes `i=1`
+then `i=2`, a second `release` is empty, and after it the same stem is
+uploaded again with a fresh id.
+
+Verification: the standard ritual.
+
+Prohibitions: do NOT wire the provider into the app; do NOT proceed
+to 08.8.
+
+Stop: report files changed and verification; await review.
+
+### 08.8 -- Wiring: choose the provider, write uploads before the frame
+
+Scope: `frext-term/src/icons/mod.rs`, `frext-term/src/app.rs`,
+`frext-term/src/run.rs`, `frext-term/src/main.rs`.
+
+What:
+
+- `icons/mod.rs`: `#[derive(Debug, Clone, Copy, PartialEq, Eq)] pub
+  enum AnsiColours { Enabled, Disabled }` with `#[must_use] pub fn
+  from_env() -> Self` (crossterm's `Colored::ansi_color_disabled()`),
+  and `#[must_use] pub fn provider(choice: IconChoice, multiplexer:
+  Multiplexer, colours: AnsiColours) -> Box<dyn IconProvider>`:
+  `Kitty` gives `KittyIcons`, or `NerdIcons` with a `log::warn!` under
+  `Disabled`; `Nerd`, `Ascii` and `None` give `NerdIcons`,
+  `AsciiIcons` and `NoIcons`.
+- `app.rs`: `pub fn render_frame(&mut self, frame: &mut Frame) ->
+  Option<Position>` is today's `render` returning the cursor instead
+  of setting it; `render` calls it and sets the cursor (unchanged for
+  callers). `pub fn set_icons`, `pub fn take_graphics(&mut self) ->
+  Vec<u8>` and `pub fn release_graphics(&mut self) -> Vec<u8>` pass
+  through to the tree.
+- `run.rs`: `pub fn draw<B: Backend + Write>(app: &mut TermApp,
+  terminal: &mut Terminal<B>) -> io::Result<()>` as decided under
+  "Drawing order"; `run` takes `B: Backend + Write` and calls it.
+  `run`'s tests move to `Terminal::with_options(FrextBackend::new(Vec::new(),
+  UnderlineStyle::Straight), TerminalOptions { viewport:
+  Viewport::Fixed(Rect::new(0, 0, 80, 24)) })`.
+- `main.rs`: builds the provider from `IconChoice::select(..)`,
+  `guard.caps().multiplexer` and `AnsiColours::from_env()`, logs the
+  choice as today, calls `app.set_icons`; after `run`, writes
+  `app.release_graphics()` and flushes through `terminal.backend_mut()`
+  (an error is logged, not returned) before dropping the terminal.
+
+Deliverable: tests: `provider` for each choice (its `Debug` output
+names the type) and the `Disabled` kitty fallback; `render_frame`
+returns the cursor `render` sets; `draw` with a workspace holding
+`main.rs` and `KittyIcons`: the upload's bytes come before the first
+placeholder's bytes in the backend's output, a second `draw` uploads
+nothing, and `release_graphics` then holds the delete for `i=1`; with
+`AsciiIcons` `draw`'s output equals `terminal.draw`'s for the same
+frame; the existing `run` tests pass on the new backend.
+
+Verification: the standard ritual.
+
+Prohibitions: do NOT change the probe, caps or `IconChoice::select`; do
+NOT touch the tab bar; do NOT proceed to 08.9.
+
+Stop: report files changed and verification; await review.
+
+### 08.9 -- Docs: attributions
+
+Scope: `ATTRIBUTIONS.md`, `assets/licenses/nvim-web-devicons-LICENSE`
+(new).
+
+What:
+
+- An "Icon data" section: the Nerd Font glyph mapping in
+  `frext-term/src/icons/nerd_table.rs` is derived from
+  nvim-web-devicons (MIT, copyright and URL as upstream states them),
+  with the licence text copied verbatim from upstream at the pinned
+  commit into `assets/licenses/nvim-web-devicons-LICENSE`.
+- The same section lists the Catppuccin file icons
+  (`assets/file-icons/mocha/`, licence already at
+  `assets/file-icons/catppuccin-icons-LICENSE.md`), which
+  `ATTRIBUTIONS.md` never listed (cleanup 08.10).
+
+Deliverable: the doc, markdownlint-clean.
+
+Verification: the standard ritual; `markdownlint-cli2 ATTRIBUTIONS.md`.
+
+Prohibitions: do NOT edit README or `agents.md` (plan 09); do NOT
+proceed further.
+
+Stop: report files changed and verification; await review.
+
+### 08.10 -- Cleanup: Catppuccin icons missing from `ATTRIBUTIONS.md`
+
+Surface point: the 08 activation audit. Impact: the vendored
+Catppuccin file icons (embedded in both binaries) are not listed in
+`ATTRIBUTIONS.md`, which calls itself the single source of truth for
+attribution, though their licence file is bundled. Scope of fix: one
+section of `ATTRIBUTIONS.md`. Resolution: resolved in 08.9 (`5c74a4b`).
+
+### 08.11 -- Follow-up outside this repo: freminal placeholder inheritance
 
 File a cleanup entry in freminal: unicode-placeholder inheritance
 should resolve from the cell to the left (same row), per the kitty
 spec, rather than from the last processed placeholder, and a CR/LF
 should reset it. frext does not depend on this fix.
+
+Resolution: freminal already owned the defect (its Task 136 stub listed
+"the inheritance state is not cleared on cursor motion"), so by
+freminal's convention the stub bullet was extended rather than a new
+cleanup number allocated: `Documents/PLAN_VERSION_130.md`, commit
+`f6883b18` on freminal's local branch `docs/placeholder-inheritance`
+(not pushed).
+
+### 08.12 -- 08.15: Review fixes (adversarial branch review)
+
+Three read-only reviewers (kitty bytes and rendering; wiring and the run
+loop; generator, spec and process) reviewed the branch. Accepted
+findings, grouped into subtasks below.
+
+Not fixed here, by decision:
+
+- **Images on a panic.** The panic hook restores the terminal without
+  the `TermApp`, so uploaded images are not deleted. They are a few
+  hundred small images at most, bounded by the terminal's image quota,
+  and plain kitty drops them with the alternate screen; under tmux they
+  live until tmux exits or evicts them. Documented in `main.rs` (08.15).
+- **A forced `--icons kitty` falling back to Nerd** already warns, in
+  `caps::resolve_images`, so no new warning is added.
+- **tmux deployment requirements** (passthrough for hidden panes, RGB
+  colour) are documented by plan 09 and in the smoke checklist; the
+  hidden-pane re-upload is cleanup 08.16.
+- **Pre-existing**: the `frext-core` leading-dot lookup, cleanup 08.17.
+
+Decisions:
+
+- **Votes: extensions first.** A file-name entry votes for whatever stem
+  `icon_for_file` gives, and for tool configs that is often the
+  language's generic stem (`.prettierrc.js` voting the Prettier logo
+  onto `javascript`, `taskfile.yml` onto `yaml`, `hyprland.conf` onto
+  `properties`, `xmonad.hs` onto `haskell`). A stem's glyph is now the
+  extension vote when it has any, and the file-name vote only for a
+  stem with no extension vote. A tie on count (in either tier) is
+  broken, in order, by: a glyph with a voting entry whose key or `name`
+  (lowercased) equals one of the stem's `name_glyph` candidates (`html`
+  over `.htm`'s glyph); then one with a voting entry whose lowercased
+  key is a prefix of the stem (`coffee` for `coffeescript`, over
+  `.cson`); then the one with the shortest voting key (`rb` over `erb`
+  for `ruby`); then the smallest glyph, as before. Checked against the
+  pinned devicons data for `ruby`, `html`, `coffeescript`,
+  `javascript`, `yaml`, `properties`, `haskell` and `text`.
+- **Generator failures are loud.** A regex that fails to compile, or a
+  data file yielding no entries, is an `XtaskError`, not an all-default
+  table.
+- **Image ids in a block per process.** Ids live in one global namespace
+  per terminal, so two frext-term instances (or another image client)
+  under one tmux would overwrite and delete each other's icons.
+  `kitty::id_block(seed: u32) -> (ImageId, ImageId)`: block
+  `b = seed % 16383`, first `b * 1024 + 1`, last `b * 1024 + 1024` (so
+  at most `0xFF_FC00`); `main` seeds it with `std::process::id()`, and
+  `KittyIcons` stops (falls back to Nerd) at the block's end. 1024 ids
+  exceed the 623 stems. Blocks are probabilistic: pids equal modulo
+  16383 share one (cleanup 08.18).
+- **Raster size cap.** `KittyIcons` refuses a raster side above
+  `MAX_RASTER_SIDE = 512` pixels (Nerd fallback), so an absurd cell-size
+  reply cannot allocate gigabytes.
+- **`C=1` on uploads** (do not move the cursor), so a terminal that moves
+  it after a virtual placement cannot scroll the screen under ratatui.
+- **Checked uploads.** `KittyIcons` checks the id is free before
+  rasterising, and that the RGBA length is `width * height * 4`
+  (otherwise `Failed`).
+- **Placeholder cells carry only fg and bg.** Other attributes are
+  reserved by the kitty spec, so the placeholder style drops every
+  modifier and resets the underline colour; the row background stays.
+  A row whose icon slot has no room does not ask the provider at all.
+- **Release after shutdown.** `main` writes the release after
+  `app.shutdown()` (still inside the alternate screen), so icons do not
+  vanish while the final flush runs.
+- **One colour check.** `AnsiColours::from_env` uses crossterm's
+  memoized check, the same one its colour output uses.
+
+#### 08.12 -- Generator: extension-first votes, loud failures, pinned glyphs
+
+Scope: `xtask/src/nerd_icons.rs`, `xtask/src/main.rs`, `xtask/Cargo.toml`
+(its own `description`; drop the inherited `readme`, `keywords` and
+`categories`), the regenerated `frext-term/src/icons/nerd_table.rs`,
+`frext-term/src/icons/mod.rs` (tests).
+
+Deliverable: xtask tests for the two-tier vote, the name-match tie-break
+and the error paths; pinned-glyph tests in `icons/mod.rs` for
+`javascript` `U+E60C`, `yaml` `U+E8EB`, `ruby` `U+E791`, `text`
+`U+F0219`, `properties` `U+E615`, `haskell` `U+E61F`, `html` `U+E736`,
+`coffeescript` `U+E61B`, and the
+regenerated values of `typescript`, `json`, `toml`, `nix` and `python`
+checked against devicons' own extension entries (`ts`, `json`, `toml`,
+`nix`, `py`). `markdown` is `U+E609`, devicons' `markdown` entry, which
+wins its tie with `md` (`U+F48A`) because its key equals the stem.
+Regeneration changed exactly the eight stems above (`coffeescript`,
+`haskell`, `html`, `javascript`, `properties`, `ruby`, `text`, `yaml`).
+
+#### 08.13 -- Kitty: id blocks, size cap, `C=1`, checked uploads
+
+Scope: `frext-term/src/term/kitty.rs`, `frext-term/src/icons/kitty.rs`,
+`frext-term/src/icons/mod.rs` (`provider` takes the seed),
+`frext-term/src/main.rs` (passes `std::process::id()`).
+
+Deliverable: tests: `id_block` for seeds 0, 16382 and 16383 (wraps to
+block 0); a provider seeded into a block starts at its first id and
+falls back to Nerd after its last; a 513-pixel side falls back without
+rasterising; the exact upload bytes include `C=1`; a short-returning
+rasterizer gives the Nerd glyph and queues nothing; a counting
+rasterizer is called once for a failing stem however often it is asked
+(the "warns once" structure) and not at all once ids are exhausted.
+
+#### 08.14 -- Tree: placeholder style, no request without room
+
+Scope: `frext-term/src/tree.rs`.
+
+Deliverable: tests: the active (bold) row's placeholder cells have no
+modifiers, underline colour `Reset`, the id fg and the row bg; a row
+whose slot has no room never calls the provider (a counting fake).
+
+#### 08.15 -- Wiring: release order, colour check, tests and docs
+
+Scope: `frext-term/src/main.rs`, `frext-term/src/icons/mod.rs`,
+`frext-term/src/run.rs`, `frext-term/src/app.rs`.
+
+What: the release-order and colour-check decisions; drop the vacuous
+`ansi_colours_from_env_is_callable` test; `render`'s doc says uploads
+are only written by `run::draw`, and `set_icons`' that it is called
+before the first draw; re-wrap `run`'s doc; the panic-leak note in
+`main.rs`.
+
+Deliverable: tests: `draw`'s output shows the cursor (`\x1b[?25h` and
+the caret's `MoveTo`) with the editor focused and hides it with the
+sidebar focused, matching `terminal.draw`; the ordering test also finds
+the id colour `\x1b[38;2;` for the first block id between the upload
+and the first placeholder.
+
+Every review-fix subtask: the standard ritual; do NOT touch files
+outside its scope; one commit each, reviewed before committing.
+
+### 08.16 -- Cleanup: re-upload icons after tmux drops them
+
+Surface point: the adversarial review of this branch. Impact: with
+`allow-passthrough on`, tmux drops passthrough from a pane that is not
+visible, and a re-attach from another terminal starts with no images;
+frext uploads each stem once, so such icons stay blank for the session.
+Scope of fix: keep each uploaded stem's bytes (or just the stem list)
+in `KittyIcons` and re-send them all on `FocusGained` (needs focus
+reporting enabled in `terminal.rs`) and after a resize, under
+`Multiplexer::Tmux` only. Verification: a provider test that a
+re-upload request queues every known stem again with the same ids, and
+an app test that `FocusGained` under tmux queues it. Scheduling: a
+later plan; until then plan 09 documents `allow-passthrough all`.
+
+### 08.17 -- Cleanup (pre-existing): leading-dot file names never match
+
+Surface point: the adversarial review of this branch; predates plan 08
+(it affects the GUI equally). Impact: 253 of `FILE_SUFFIXES`' keys
+start with `.` (`.prettierrc`, `.nvmrc`, `.alexrc.js`, ...), but
+`file_icon::suffix_candidates` strips the leading dot and `FILE_STEMS`
+holds only ten names, so those keys can never match: `.prettierrc`
+shows `_file` and `yarn.lock` `_file`, and about 200 stems are never
+drawn. The module doc's claim that `.alexrc` is "caught by the stem
+table" is false. Scope of fix: `frext-core/src/file_icon.rs` (try the
+whole name, with its leading dot, as a suffix key first) and its
+tests, then regenerate the Nerd table (its votes change). Verification:
+`.prettierrc`, `.nvmrc`, `.alexrc.js` and `yarn.lock` resolve to their
+stems; every existing lookup test passes. Scheduling: its own change
+after this plan, before plan 09.
+
+### 08.18 -- Cleanup: terminal-assigned image ids
+
+Surface point: CodeRabbit on PR #46 (`term/kitty.rs`, `id_block`).
+Impact: blocks are chosen by `seed % ID_BLOCKS` with the process id as
+the seed, so two concurrent instances whose pids are equal modulo 16383
+(about 1 in 16383 pairs, e.g. pids 1000 and 17383) share a block in one
+terminal's id namespace: the second upload of an id replaces the first
+instance's image, and either instance's exit deletes the other's icons.
+Cosmetic only (wrong or blank icons), and documented on `id_block`.
+Scope of fix: upload with kitty image numbers (`I=<n>`) so the terminal
+picks a free id and replies `i=<id>,I=<n>;OK`; that needs replies
+enabled for uploads (`q=1`: errors suppressed, OK delivered), the reply
+parsed out of the input stream mid-session (the late-reply filter in
+`term/late_replies.rs` drops everything after the probe today), a
+number-to-id map in `KittyIcons`, and placeholders drawn only once the
+reply has arrived (one extra frame per new icon). Verification: byte
+tests for the `I=` upload; a parser test for the reply; a provider test
+that an icon is `Image` only after its reply, with the assigned id.
+Scheduling: a later plan, together with 08.16 (both touch the input
+path and re-uploads).
+
+## Manual smoke checklist
+
+Run in kitty, freminal, a terminal without kitty graphics (foot or
+alacritty), and tmux with `allow-passthrough on`:
+
+1. `frext-term <dir>` in kitty / freminal: the sidebar shows the same
+   coloured icons as the GUI, sharp at the current font size.
+2. Selecting, hovering and the active-file row keep their background
+   behind the icon (transparency).
+3. A context menu or prompt covering half an icon leaves the other
+   half drawn correctly; closing it redraws the icon whole.
+4. Scrolling a long tree shows each icon type uploaded once
+   (`frext-term.log` at debug level shows no repeated uploads).
+5. Quitting leaves no images in the terminal (kitty: no memory growth
+   over repeated runs).
+6. In foot / alacritty: coloured Nerd Font glyphs; `--icons ascii`
+   gives the ASCII slash; `--icons none` a blank slot.
+7. `NO_COLOR=1 frext-term --icons kitty <dir>` in kitty: Nerd glyphs,
+   and a warning in the log.
+8. In tmux (`allow-passthrough on`, and `terminal-features` giving the
+   outer terminal `RGB`) inside kitty: kitty icons; with passthrough
+   off: Nerd glyphs. Without `RGB`, tmux downgrades the id colour and
+   icons break.
+9. Resizing the window keeps every icon (the resize clears the screen;
+   the images must survive it).
+10. Two frext-term instances in two panes of one tmux window show their
+    own icons, and quitting one leaves the other's icons intact.
